@@ -9,18 +9,19 @@ description = "AI-powered speech transcription and editing toolkit"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "PySide6>=6.6.0,<6.8.0",
-    "torch>=2.0.0,<2.5.0",
-    "torchaudio>=2.0.0,<2.5.0",
-    "openai-whisper>=20231117",
-    "pyannote.audio>=3.1.0,<3.3.0",
-    "llama-cpp-python>=0.2.0,<0.3.0",
-    "pydantic>=2.0.0,<3.0.0",
+    "PySide6>=6.5.0",
+    "torch>=2.0.0",
+    "ffmpeg-python>=0.2.0",
+    "pydantic>=2.0.0",
     "tqdm>=4.65.0",
-    "python-docx>=1.1.0",
-    "odfpy>=1.4.0",
-    "pyspellchecker>=0.7.0",
-    "nvidia-ml-py3>=7.352.0",
+    # ! ML dependencies will be added in Phase 2
+    # "openai-whisper>=20231117",
+    # "pyannote.audio>=3.1.0,<3.3.0",
+    # "llama-cpp-python>=0.2.0,<0.3.0",
+    # "python-docx>=1.1.0",
+    # "odfpy>=1.4.0",
+    # "pyspellchecker>=0.7.0",
+    # "nvidia-ml-py3>=7.352.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -118,6 +119,7 @@ module = [
     "docx.*",
     "odf.*",
     "spellchecker.*",
+    "ffmpeg.*",
 ]
 ignore_missing_imports = true
 

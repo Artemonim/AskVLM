@@ -121,3 +121,4 @@ The project follows a modular architecture:
 -   **Advanced Editing**: WYSIWYG editor with speaker management
 -   **Multiple Export Formats**: TXT, DOCX, ODT, SRT, VTT, Markdown
 -   **GPU Optimization**: Smart GPU memory management
+ 
