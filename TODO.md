@@ -6,9 +6,9 @@
     -   [x] Initialize `TODO.md`
     -   [ ] Create directory structure (`core`, `gui`, `editing`, `utils`, `tests`)
     -   [ ] Create empty Python files for each module
-    -   [ ] Setup `.gitignore`
+    -   [x] Setup `.gitignore`
     -   [ ] Create `main.py` entry point
-    -   [ ] Create basic `README.md`
+    -   [x] Create basic `README.md`
 -   [ ] **Core Modules - Local Processing**
     -   [ ] `core/ffmpeg.py`: Basic FFmpeg wrapper for audio extraction (WAV 16kHz mono).
     -   [ ] `core/audio_io.py`: Implement audio extraction and resampling using `ffmpeg.py`.
@@ -106,23 +106,24 @@
         -   [ ] Background download with `tqdm` progress in status bar.
         -   [ ] `models.json` for versioning.
         -   [ ] GUI for deleting/updating models (in Preferences).
--   [ ] **Testing**
-    -   [ ] `tests/`: Setup `pytest`.
+-   [x] **Testing**
+    -   [x] `tests/`: Setup `pytest`.
         -   [ ] Unit tests (mock Torch, mock SpeechKit).
         -   [ ] Integration tests (WAV -> JSON comparison).
         -   [ ] GUI autotests (`pyside-tester`, signal/slot checks).
+        -   [ ] **Enable code coverage requirements** (80% minimum coverage).
     -   [ ] `tools/benchmark.py` script.
--   [ ] **CI/CD (GitHub Actions)**
-    -   [ ] Linting (`ruff`).
-    -   [ ] Run tests.
+-   [x] **CI/CD (GitHub Actions)**
+    -   [x] Linting (`ruff`).
+    -   [x] Run tests.
     -   [ ] Build onefile-exe.
     -   [ ] Release: exe + models downloader script.
     -   [ ] Auto-versioning via git tags.
 -   [ ] **Documentation**
-    -   [ ] `README.md`: Installation, requirements, FAQ.
+    -   [x] `README.md`: Installation, requirements, FAQ.
     -   [ ] Wiki: "How to connect Yandex key", "Text formatting, hotkeys".
-    -   [ ] Docstrings (Google Style for Python).
-    -   [ ] Sphinx HTML documentation.
+    -   [x] Docstrings (Google Style for Python).
+    -   [x] Sphinx HTML documentation.
 -   [ ] **Packaging & Distribution**
     -   [ ] Finalize `PyInstaller` setup (`--onefile`, `--add-data`).
     -   [ ] Logic for first-run model download to `~/.mytranscriber/models` or `%APPDATA%`.

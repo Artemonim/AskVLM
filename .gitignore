@@ -142,3 +142,49 @@ models/
 0-OUTPUT-0/
 *.log
 logs/
+
+# ! Additional ignores for code quality tools
+.ruff_cache/
+bandit-report.json
+.secrets.baseline
+.pylint.d/
+
+# ! Models and large ML files
+*.gguf
+*.bin
+*.safetensors
+*.onnx
+*.pt
+*.pth
+
+# ! Audio and media files
+*.wav
+*.mp3
+*.mp4
+*.avi
+*.mkv
+*.flac
+*.m4a
+
+# ! Additional output directories
+output/
+exports/
+transcriptions/
+htmlcov/
+
+# ! Configuration files that may contain sensitive data
+config.json
+*.key
+*.pem
+.env.local
+.env.production
+
+# ! OS specific
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ! Additional Python caches
+.pytype/
+.pyre/
+.pytest_cache/

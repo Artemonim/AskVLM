@@ -1,1 +1,1 @@
-# Placeholder for diarization.py 
+# Placeholder for diarization.py

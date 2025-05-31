@@ -1,1 +1,1 @@
-# Placeholder for logging.py 
+# Placeholder for logging.py

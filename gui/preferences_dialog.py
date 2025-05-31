@@ -1,1 +1,1 @@
-# Placeholder for preferences_dialog.py 
+# Placeholder for preferences_dialog.py

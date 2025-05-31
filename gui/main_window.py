@@ -1,1 +1,1 @@
-# Placeholder for main_window.py 
+# Placeholder for main_window.py

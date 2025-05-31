@@ -1,1 +1,1 @@
-# Placeholder for speaker_sidebar.py 
+# Placeholder for speaker_sidebar.py

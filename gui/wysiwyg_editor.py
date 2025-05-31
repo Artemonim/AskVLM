@@ -1,1 +1,1 @@
-# Placeholder for wysiwyg_editor.py 
+# Placeholder for wysiwyg_editor.py

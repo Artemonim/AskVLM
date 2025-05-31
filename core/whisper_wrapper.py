@@ -1,1 +1,1 @@
-# Placeholder for whisper_wrapper.py 
+# Placeholder for whisper_wrapper.py

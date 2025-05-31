@@ -1,1 +1,1 @@
-# Placeholder for cloud_speechkit.py 
+# Placeholder for cloud_speechkit.py
