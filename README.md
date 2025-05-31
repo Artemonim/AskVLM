@@ -4,13 +4,22 @@ AI-powered speech transcription and editing toolkit with comprehensive code qual
 
 ## 🚀 Quick Start
 
+### Prerequisites
+
+**⚠️ Important:** This project requires **Python 3.11 or 3.12**. Python 3.13+ is not yet supported by ML libraries.
+
+Check your Python version:
+
+```bash
+python --version
+```
+
+If you need to switch Python versions, see [PYTHON_SETUP.md](PYTHON_SETUP.md) for detailed instructions.
+
 ### Development Setup
 
 ```bash
-# Install development dependencies
-pip install -r requirements-dev.txt
-
-# Setup pre-commit hooks (recommended)
+# Install development dependencies and setup environment
 make setup-dev
 
 # Run comprehensive code quality checks
@@ -50,6 +59,9 @@ python test.py --security
 # Run tests only
 python test.py --tests
 
+# Clean up cache and temporary files
+python test.py --clean
+
 # Install dev dependencies
 python test.py --install-deps
 ```
@@ -63,18 +75,20 @@ make check-all     # Run all quality checks
 make format        # Auto-format code
 make fix           # Auto-fix issues where possible
 make clean         # Clean up generated files
+make clean-all     # Deep clean including temp files
+make clean-verbose # Clean with detailed output
 ```
 
-#### 🔧 **Pre-commit Hooks**
+#### 🔧 **Automated Quality Checks**
 
-Automatically run quality checks before each commit:
+All quality checks are integrated into `test.py` - no need for separate pre-commit setup:
 
 ```bash
-# Install hooks
-pre-commit install
+# Run all checks with auto-formatting
+python test.py
 
-# Run on all files
-pre-commit run --all-files
+# Quick checks only
+python test.py --quick
 ```
 
 ## 📋 Code Quality Standards

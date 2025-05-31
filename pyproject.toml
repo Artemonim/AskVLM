@@ -7,21 +7,25 @@ name = "artemonims-speech-kit"
 version = "0.1.0"
 description = "AI-powered speech transcription and editing toolkit"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.11,<3.13"
 dependencies = [
-    "PySide6>=6.5.0",
-    "torch>=2.0.0",
-    "torchaudio>=2.0.0",
-    "whisper-openai>=20230314",
-    "pyannote.audio>=3.1.0",
-    "llama-cpp-python>=0.2.0",
-    "pydantic>=2.0.0",
+    "PySide6>=6.6.0,<6.8.0",
+    "torch>=2.0.0,<2.5.0",
+    "torchaudio>=2.0.0,<2.5.0",
+    "openai-whisper>=20231117",
+    "pyannote.audio>=3.1.0,<3.3.0",
+    "llama-cpp-python>=0.2.0,<0.3.0",
+    "pydantic>=2.0.0,<3.0.0",
     "tqdm>=4.65.0",
     "python-docx>=1.1.0",
     "odfpy>=1.4.0",
     "pyspellchecker>=0.7.0",
-    "nvidia-ml-py>=12.535.0",
+    "nvidia-ml-py3>=7.352.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["core*", "gui*", "editing*", "utils*"]
+exclude = ["tests*"]
 
 [project.optional-dependencies]
 dev = [
@@ -39,7 +43,7 @@ dev = [
 
 # ! Ruff configuration - comprehensive linting and formatting
 [tool.ruff]
-target-version = "py39"
+target-version = "py311"
 line-length = 88
 select = [
     "ALL",  # * Enable all rules for strictest checking
@@ -83,7 +87,7 @@ max-locals = 20
 
 # ! MyPy configuration - strict static type checking
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.11"
 strict = true
 warn_unreachable = true
 warn_unused_ignores = true
@@ -128,12 +132,12 @@ skips = ["*_test.py", "*/test_*.py", "tests/*"]
 # ! Pylint configuration - additional code quality checks
 [tool.pylint.main]
 load-plugins = ["pylint.extensions.docparams"]
-py-version = "3.9"
+py-version = "3.11"
 
 [tool.pylint.messages_control]
 disable = [
     "missing-module-docstring",
-    "missing-class-docstring", 
+    "missing-class-docstring",
     "missing-function-docstring",
     "too-few-public-methods",
     "duplicate-code",
@@ -155,7 +159,7 @@ max-statements = 60
 minversion = "7.0"
 addopts = [
     "--strict-markers",
-    "--strict-config", 
+    "--strict-config",
     "-ra",
     "--tb=short",
 ]
@@ -194,4 +198,4 @@ filterwarnings = [
 #     "if __name__ == .__main__.:",
 #     "class .*\\bProtocol\\):",
 #     "@(abc\\.)?abstractmethod",
-# ] 
+# ]

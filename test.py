@@ -12,6 +12,7 @@ Usage:
     python test.py --type-check     # * Only run mypy type checking
     python test.py --security       # * Only run security analysis
     python test.py --tests          # * Only run pytest
+    python test.py --clean          # * Clean up cache and temporary files
     python test.py --install-deps   # * Install development dependencies
 """
 
@@ -217,6 +218,11 @@ class CodeQualityChecker:
         cmd = ["python", "-m", "pip", "install", "-e", ".[dev]"]
         return self._run_command(cmd, "Install Dependencies")
 
+    def clean_cache(self) -> CheckResult:
+        """Clean up cache and temporary files."""
+        cmd = ["python", "utils/cleanup.py"]
+        return self._run_command(cmd, "Cache Cleanup")
+
     def print_summary(self) -> None:
         """Print a summary of all check results."""
         total_duration = sum(r.duration for r in self.results)
@@ -298,6 +304,9 @@ def main() -> int:
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Show detailed output"
     )
+    parser.add_argument(
+        "--clean", action="store_true", help="Clean up cache and temporary files"
+    )
 
     args = parser.parse_args()
 
@@ -339,7 +348,13 @@ def main() -> int:
         checker.print_summary()
         return 0 if result.success else 1
 
-        # * Run full analysis
+    if args.clean:
+        result = checker.clean_cache()
+        checker.results.append(result)
+        checker.print_summary()
+        return 0 if result.success else 1
+
+    # * Run full analysis
     print("Running comprehensive code quality checks...\n")
 
     # ! Phase 1: Auto-format code first (always)

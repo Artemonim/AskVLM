@@ -1,7 +1,7 @@
 # Makefile for Artemonim's Speech Kit
 # Provides convenient commands for development workflow
 
-.PHONY: help install install-dev clean test test-quick lint format type-check security check-all fix pre-commit setup-dev
+.PHONY: help install install-dev clean clean-all clean-verbose clean-deep-verbose test test-quick lint format type-check security check-all fix setup-dev
 
 # * Default target
 help:
@@ -23,24 +23,25 @@ help:
 	@echo "  check-all      Run comprehensive code quality checks"
 	@echo "  fix            Auto-fix code issues where possible"
 	@echo ""
-	@echo "Git Hooks:"
-	@echo "  pre-commit     Setup and run pre-commit hooks"
-	@echo ""
 	@echo "Utility Commands:"
-	@echo "  clean          Clean up generated files"
+	@echo "  clean          Clean up generated files and pip cache"
+	@echo "  clean-all      Deep clean including temp files"
+	@echo "  clean-verbose  Clean with detailed output"
+	@echo "  clean-deep-verbose  Deep clean with detailed output"
 
 # ! Installation commands
 install:
 	python -m pip install -e .
 
-install-dev:
+install-dev: clean
+	python.exe -m pip install --upgrade pip
 	python -m pip install -r requirements-dev.txt
 	python -m pip install -e .
 
 setup-dev: install-dev
-	pre-commit install
 	@echo "✅ Development environment setup complete!"
 	@echo "💡 Run 'make check-all' to verify everything is working"
+	@echo "⚠️  Note: This project requires Python 3.11 or 3.12 for ML libraries compatibility"
 
 # ! Code quality commands
 test:
@@ -69,19 +70,21 @@ fix:
 	python -m ruff check --fix .
 	python -m ruff format .
 
-# ! Git hooks
-pre-commit:
-	pre-commit install
-	pre-commit run --all-files
+# ! Code analysis (removed pre-commit - using test.py instead)
+# pre-commit functionality is integrated into test.py
 
 # ! Utility commands
 clean:
-	@echo "🧹 Cleaning up generated files..."
-	find . -type f -name "*.pyc" -delete
-	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
-	rm -rf .coverage htmlcov/ .pytest_cache/ .mypy_cache/ .ruff_cache/
-	@echo "✅ Cleanup complete!"
+	python utils/cleanup.py
+
+clean-all:
+	python utils/cleanup.py --deep
+
+clean-verbose:
+	python utils/cleanup.py --verbose
+
+clean-deep-verbose:
+	python utils/cleanup.py --deep --verbose
 
 # ! Advanced commands for CI/CD
 ci-test:
@@ -98,4 +101,4 @@ docs:
 	@echo "💡 Will use Sphinx when documentation is added"
 
 docs-serve:
-	@echo "📚 Documentation serving not yet implemented" 
+	@echo "📚 Documentation serving not yet implemented"
