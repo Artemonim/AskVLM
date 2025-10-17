@@ -51,6 +51,44 @@
 -   [ ] **Packaging (Initial Setup)**
     -   [ ] Basic `PyInstaller` spec file considerations.
 
+## Phase 1.5: Migration & Cleanup
+
+-   [ ] **Licensing & Dependencies**
+    -   [ ] Use WhisperX strictly as a dependency (BSD-2-Clause, no code copying).
+    -   [ ] Add attribution/acknowledgments for WhisperX and referenced models.
+    -   [ ] Integrate Faster-Whisper backend option for FP16/INT8 on 8GB VRAM.
+    -   [ ] Integrate `pyannote.audio` (community pipeline); manage HF token via ENV.
+-   [ ] **Speach Kit Backend Integration**
+    -   [ ] Add `core/whisperx_wrapper.py` with load/transcribe/align API.
+    -   [ ] Implement `core/diarization.py` using `pyannote/speaker-diarization-community-1`.
+    -   [ ] Implement `core/llm_formatter.py` (llama-cpp, 3B/7B GGUF) for dialog blocks.
+    -   [ ] Update `core/pipelines.py` to support engine switch (whisper/whisperx).
+    -   [ ] Add options: diarization on/off, dialog-blocks on/off, batch params.
+    -   [ ] Exporters: TXT, SRT, VTT, JSON (timestamps, speakers, text).
+-   [ ] **CLI for Batch Processing**
+    -   [ ] Add Typer-based CLI in Speach Kit for folders/files.
+    -   [ ] Support recursive mode, overwrite policy, language, device, formats.
+    -   [ ] Progress/ETA using existing utils patterns (no LittleTools dependency).
+-   [ ] **Decommission Whisper Repos**
+    -   [ ] Migrate only ideas (no code) from `G:\GitHub\Whisper`.
+    -   [ ] Migrate only ideas (no code) from `G:\GitHub\WhisperX`.
+    -   [ ] Remove `Whisper/` after feature parity validation.
+    -   [ ] Remove `WhisperX/` after feature parity validation.
+-   [ ] **LittleTools Cleanup**
+    -   [ ] Remove `littletools_speech` package from LittleTools.
+    -   [ ] Remove ML deps added only for Whisper from LittleTools.
+    -   [ ] Ensure `littletools_cli/menu.py` handles missing speech plugin.
+    -   [ ] Update LittleTools docs to reflect removal of speech plugin.
+-   [ ] **Secrets & Compliance**
+    -   [ ] Read HF token from ENV (`HF_TOKEN`), add `.env` to `.gitignore`.
+    -   [ ] Document gated model acceptance steps (pyannote models).
+-   [ ] **VRAM & Performance**
+    -   [ ] Compute type auto-select (FP16 ➜ fallback FP32) with INT8 option.
+    -   [ ] Batch size control and OOM handling guidance.
+-   [ ] **Testing**
+    -   [ ] Unit tests for wrappers (whisperx, diarization, formatter).
+    -   [ ] Integration test: WAV ➜ segments+speakers ➜ dialog blocks export.
+
 ## Phase 2: Advanced Editing and Cloud Integration
 
 -   [ ] **Advanced Editing Features**
