@@ -22,8 +22,8 @@ If you need to switch Python versions, see [PYTHON_SETUP.md](PYTHON_SETUP.md) fo
 # Install development dependencies and setup environment
 make setup-dev
 
-# Run comprehensive code quality checks
-python test.py
+# Run local CI (auto-fix + lint + type-check + tests)
+pwsh -NoProfile -ExecutionPolicy Bypass -File run.ps1
 ```
 
 ### Code Quality Tools
@@ -81,14 +81,26 @@ make clean-verbose # Clean with detailed output
 
 #### 🔧 **Automated Quality Checks**
 
-All quality checks are integrated into `test.py` - no need for separate pre-commit setup:
+All quality checks are integrated into `build.py` and PowerShell wrappers - no need for separate pre-commit setup:
 
 ```bash
 # Run all checks with auto-formatting
-python test.py
+pwsh -File run.ps1
 
-# Quick checks only
-python test.py --quick
+# Single tool example
+pwsh -File run.ps1 -- --tool ruff
+
+### CLI Usage
+
+```bash
+python -m pip install .[ml]
+python cli.py transcribe PATH_TO_MEDIA -o output --engine auto --export srt --recursive --overwrite --device auto --compute-type auto
+```
+
+Notes:
+- Set `HF_TOKEN` in your environment to access `pyannote` models (community pipeline preferred).
+- Set `LLM_GGUF_PATH` to a local llama.cpp GGUF file to enable LLM formatting.
+- On OOM, the engine automatically falls back (faster-whisper compute type / device or Whisper CPU).
 ```
 
 ## 📋 Code Quality Standards

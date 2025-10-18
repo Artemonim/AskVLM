@@ -142,6 +142,7 @@ models/
 0-OUTPUT-0/
 *.log
 logs/
+temporary/
 
 # ! Additional ignores for code quality tools
 .ruff_cache/

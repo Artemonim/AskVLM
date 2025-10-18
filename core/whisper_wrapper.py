@@ -1,7 +1,8 @@
 from pathlib import Path
-from typing import Optional, Any, Dict
-import whisper
+from typing import Any
+
 import torch
+import whisper
 
 
 # * Wrapper around OpenAI Whisper model for transcription
@@ -11,28 +12,36 @@ class WhisperWrapper:
     def __init__(
         self,
         model_name: str = "base",
-        model_root: Optional[Path] = None,
+        model_root: Path | None = None,
         device: str = "cuda",
     ) -> None:
         """Load Whisper model to specified device, downloading to model_root if provided."""
-        if model_root:
-            download_root = str(model_root)
-        else:
-            download_root = None
+        download_root = str(model_root) if model_root else None
         # * Load model on GPU or CPU
         self.device = device if torch.cuda.is_available() else "cpu"
-        self.model = whisper.load_model(
-            model_name,
-            download_root=download_root,
-            device=self.device,
-        )
+        try:
+            self.model = whisper.load_model(
+                model_name,
+                download_root=download_root,
+                device=self.device,
+            )
+        except Exception:
+            # * Fallback to CPU if GPU load fails (e.g., OOM)
+            self.device = "cpu"
+            self.model = whisper.load_model(
+                model_name,
+                download_root=download_root,
+                device=self.device,
+            )
 
     def transcribe(
         self,
         audio_path: Path,
-        **kwargs: Any,
+        **kwargs: object,
     ) -> str:
         """Transcribe audio file and return transcription text."""
-        result: Dict[str, Any] = self.model.transcribe(str(audio_path), **kwargs)
+        # * Cast kwargs to a concrete dict for the underlying API
+        kw: dict[str, object] = dict(kwargs)
+        result: dict[str, Any] = self.model.transcribe(str(audio_path), **kw)
         text: str = result.get("text", "")
         return text

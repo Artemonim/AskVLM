@@ -7,13 +7,14 @@ name = "artemonims-speech-kit"
 version = "0.1.0"
 description = "AI-powered speech transcription and editing toolkit"
 readme = "README.md"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.11,<3.12"
 dependencies = [
     "PySide6>=6.5.0",
     "torch>=2.0.0",
     "ffmpeg-python>=0.2.0",
     "pydantic>=2.0.0",
     "tqdm>=4.65.0",
+    "typer>=0.12.0",
     # ! ML dependencies will be added in Phase 2
     # "openai-whisper>=20231117",
     # "pyannote.audio>=3.1.0,<3.3.0",
@@ -40,21 +41,31 @@ dev = [
     "pytest-mock>=3.11.0",
     "types-tqdm>=4.66.0",
     "types-requests>=2.31.0",
+    "pip-audit>=2.6.0",
+]
+ml = [
+    "openai-whisper>=20231117",
+    "faster-whisper>=1.0.0",
+    "pyannote.audio>=3.1.0,<3.3.0",
+    "llama-cpp-python>=0.2.0,<0.3.0",
+    "python-docx>=1.1.0",
+    "odfpy>=1.4.0",
+    "nvidia-ml-py3>=7.352.0",
 ]
 
 # ! Ruff configuration - comprehensive linting and formatting
 [tool.ruff]
 target-version = "py311"
 line-length = 88
+
+[tool.ruff.lint]
 select = [
     "ALL",  # * Enable all rules for strictest checking
 ]
 ignore = [
     "D100",   # Missing docstring in public module
     "D104",   # Missing docstring in public package
-    "D107",   # Missing docstring in __init__
-    "ANN101", # Missing type annotation for self
-    "ANN102", # Missing type annotation for cls
+    "D107",   # Missing docstring in `__init__`
     "COM812", # Trailing comma missing (conflicts with formatter)
     "ISC001", # Implicitly concatenated string literals (conflicts with formatter)
     "FIX002", # Line contains TODO (we use TODO comments intentionally)
@@ -62,7 +73,7 @@ ignore = [
     "TD003",  # Missing issue link in TODO
 ]
 
-[tool.ruff.per-file-ignores]
+[tool.ruff.lint.per-file-ignores]
 "tests/*" = [
     "S101",   # Use of assert detected
     "ARG001", # Unused function argument
@@ -71,18 +82,21 @@ ignore = [
 "*/__init__.py" = [
     "F401",   # Imported but unused
 ]
+"utils/cleanup.py" = [
+    "S603",   # subprocess call: check for execution of untrusted input (false positive for list args)
+]
 
-[tool.ruff.flake8-quotes]
+[tool.ruff.lint.flake8-quotes]
 inline-quotes = "double"
 multiline-quotes = "double"
 
-[tool.ruff.flake8-type-checking]
+[tool.ruff.lint.flake8-type-checking]
 strict = true
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["core", "gui", "editing", "utils"]
 
-[tool.ruff.pylint]
+[tool.ruff.lint.pylint]
 max-args = 8
 max-locals = 20
 
@@ -147,7 +161,7 @@ disable = [
 ]
 
 [tool.pylint.format]
-max-line-length = 88
+max-line-length = 120
 
 [tool.pylint.design]
 max-args = 8

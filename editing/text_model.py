@@ -1,10 +1,11 @@
 from dataclasses import dataclass, field
-from typing import List
 
 
 # * Represent a segment of text with speaker and timing
 @dataclass
 class TextSegment:
+    """A single piece of text with speaker id and timestamps."""
+
     speaker_id: str
     start_time: float
     end_time: float
@@ -14,7 +15,9 @@ class TextSegment:
 # * Document composed of multiple text segments
 @dataclass
 class Document:
-    segments: List[TextSegment] = field(default_factory=list)
+    """A collection of `TextSegment` instances representing a transcript."""
+
+    segments: list[TextSegment] = field(default_factory=list)
 
     def add_segment(self, segment: TextSegment) -> None:
         """Add a text segment to the document."""

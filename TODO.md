@@ -53,41 +53,71 @@
 
 ## Phase 1.5: Migration & Cleanup
 
--   [ ] **Licensing & Dependencies**
-    -   [ ] Use WhisperX strictly as a dependency (BSD-2-Clause, no code copying).
-    -   [ ] Add attribution/acknowledgments for WhisperX and referenced models.
-    -   [ ] Integrate Faster-Whisper backend option for FP16/INT8 on 8GB VRAM.
-    -   [ ] Integrate `pyannote.audio` (community pipeline); manage HF token via ENV.
--   [ ] **Speach Kit Backend Integration**
-    -   [ ] Add `core/whisperx_wrapper.py` with load/transcribe/align API.
-    -   [ ] Implement `core/diarization.py` using `pyannote/speaker-diarization-community-1`.
-    -   [ ] Implement `core/llm_formatter.py` (llama-cpp, 3B/7B GGUF) for dialog blocks.
-    -   [ ] Update `core/pipelines.py` to support engine switch (whisper/whisperx).
-    -   [ ] Add options: diarization on/off, dialog-blocks on/off, batch params.
-    -   [ ] Exporters: TXT, SRT, VTT, JSON (timestamps, speakers, text).
--   [ ] **CLI for Batch Processing**
-    -   [ ] Add Typer-based CLI in Speach Kit for folders/files.
-    -   [ ] Support recursive mode, overwrite policy, language, device, formats.
+-   [x] **Licensing & Dependencies**
+    -   [x] Use WhisperX strictly as a dependency (BSD-2-Clause, no code copying).
+    -   [x] Add attribution/acknowledgments for WhisperX and referenced models. (README updated)
+    -   [x] Integrate Faster-Whisper backend option for FP16/INT8 on 8GB VRAM. (WhisperX wrapper)
+    -   [x] Integrate `pyannote.audio` (community pipeline); manage HF token via ENV.
+-   [x] **Speach Kit Backend Integration**
+    -   [x] Add `core/whisperx_wrapper.py` with load/transcribe/align API.
+    -   [x] Implement `core/diarization.py` using `pyannote/speaker-diarization-community-1`.
+    -   [x] Implement `core/llm_formatter.py` (llama-cpp, 3B/7B GGUF) for dialog blocks.
+    -   [x] Update `core/pipelines.py` to support engine switch (whisper/whisperx).
+    -   [x] Add options: diarization on/off, dialog-blocks on/off, batch params.
+    -   [x] Exporters: TXT, SRT, VTT, JSON (timestamps, speakers, text).
+-   [x] **CLI for Batch Processing**
+    -   [x] Add Typer-based CLI in Speach Kit for folders/files.
+    -   [x] Support recursive mode, overwrite policy, language, device, formats.
     -   [ ] Progress/ETA using existing utils patterns (no LittleTools dependency).
--   [ ] **Decommission Whisper Repos**
-    -   [ ] Migrate only ideas (no code) from `G:\GitHub\Whisper`.
-    -   [ ] Migrate only ideas (no code) from `G:\GitHub\WhisperX`.
-    -   [ ] Remove `Whisper/` after feature parity validation.
-    -   [ ] Remove `WhisperX/` after feature parity validation.
--   [ ] **LittleTools Cleanup**
-    -   [ ] Remove `littletools_speech` package from LittleTools.
-    -   [ ] Remove ML deps added only for Whisper from LittleTools.
-    -   [ ] Ensure `littletools_cli/menu.py` handles missing speech plugin.
-    -   [ ] Update LittleTools docs to reflect removal of speech plugin.
--   [ ] **Secrets & Compliance**
-    -   [ ] Read HF token from ENV (`HF_TOKEN`), add `.env` to `.gitignore`.
-    -   [ ] Document gated model acceptance steps (pyannote models).
--   [ ] **VRAM & Performance**
-    -   [ ] Compute type auto-select (FP16 ➜ fallback FP32) with INT8 option.
+-   [x] **Decommission Whisper Repos**
+    -   [x] Migrate only ideas (no code) from `G:\GitHub\Whisper`.
+    -   [x] Migrate only ideas (no code) from `G:\GitHub\WhisperX`.
+    -   [x] Remove `Whisper/` after feature parity validation.
+    -   [x] Remove `WhisperX/` after feature parity validation.
+-   [x] **LittleTools Cleanup**
+    -   [x] Remove `littletools_speech` package from LittleTools.
+    -   [x] Remove ML deps added only for Whisper from LittleTools.
+    -   [x] Ensure `littletools_cli/menu.py` handles missing speech plugin.
+    -   [x] Update LittleTools docs to reflect removal of speech plugin.
+-   [x] **Secrets & Compliance**
+    -   [x] Read HF token from ENV (`HF_TOKEN`), add `.env` to `.gitignore`.
+    -   [x] Document gated model acceptance steps (pyannote models).
+-   [x] **VRAM & Performance**
+    -   [x] Compute type auto-select (FP16 ➜ fallback FP32) with INT8 option.
     -   [ ] Batch size control and OOM handling guidance.
 -   [ ] **Testing**
-    -   [ ] Unit tests for wrappers (whisperx, diarization, formatter).
+    -   [x] Unit tests for wrappers (whisperx, diarization, formatter) — minimal.
     -   [ ] Integration test: WAV ➜ segments+speakers ➜ dialog blocks export.
+
+## Phase 1.7: Simple GUI MVP (Quick Transcribe)
+
+-   [ ] Minimal end-to-end GUI flow
+    -   [ ] `gui/main_window.py`: Quick Transcribe panel
+        -   [ ] Pick file OR folder; pick output dir (default: `transcriptions/`)
+        -   [ ] Toggles: Diarization on/off, Dialog blocks on/off
+        -   [ ] Export format: txt|srt|vtt|json (default: txt)
+        -   [ ] Start/Cancel buttons; status bar messages
+    -   [ ] Non-blocking execution
+        -   [ ] Run `LocalPipeline` in background (QtConcurrent/QThread)
+        -   [ ] Disable controls during processing; enable on finish/cancel
+    -   [ ] Result viewing
+        -   [ ] Open output in `gui/wysiwyg_editor.py` for quick read-only viewing
+        -   [ ] Button: Open output folder
+    -   [ ] Error handling
+        -   [ ] Message dialogs for common failures (unsupported media, OOM hint, no GPU)
+    -   [ ] Persistence
+        -   [ ] Remember last chosen input/output paths (session-scoped)
+
+-   [ ] Pipeline integration
+    -   [ ] Use `core/pipelines.LocalPipeline` with Engine=Auto (faster-whisper; whisperx alignment if available)
+    -   [ ] Auto audio prep via `core/audio_io.prepare_audio`
+
+-   [ ] Progress & logs
+    -   [ ] Status bar updates; basic step progress (ETA in later phase)
+    -   [ ] Optional console log pane (collapsed by default)
+
+-   [ ] Doc
+    -   [ ] Update `doc/Main UX.md` with Quick Transcribe flow details
 
 ## Phase 2: Advanced Editing and Cloud Integration
 
@@ -160,11 +190,11 @@
     -   [ ] Build onefile-exe.
     -   [ ] Release: exe + models downloader script.
     -   [ ] Auto-versioning via git tags.
--   [ ] **Documentation**
+-   [x] **Documentation**
     -   [x] `README.md`: Installation, requirements, FAQ.
     -   [ ] Wiki: "How to connect Yandex key", "Text formatting, hotkeys".
     -   [x] Docstrings (Google Style for Python).
-    -   [x] Sphinx HTML documentation.
+    -   [ ] Sphinx HTML documentation.
 -   [ ] **Packaging & Distribution**
     -   [ ] Finalize `PyInstaller` setup (`--onefile`, `--add-data`).
     -   [ ] Logic for first-run model download to `~/.mytranscriber/models` or `%APPDATA%`.
@@ -196,15 +226,27 @@
 
 ## Current Status
 
-**Phase 1 Complete!** ✅
+**Phase 1: ~95% Complete** ✅
 
-The core structure and basic local processing pipeline have been implemented:
+Core structure and basic local processing pipeline implemented:
 
--   All core modules have basic implementations with proper interfaces
--   GUI main window with file selection and processing capability
--   Settings system with Pydantic models
--   CLI entry point for batch processing
--   Proper project structure with type hints and documentation
+-   ✅ All core modules have implementations (diarization needs completion)
+-   ✅ GUI main window with file selection and processing capability
+-   ✅ Settings system with Pydantic models
+-   ✅ CLI entry point for batch processing
+-   ✅ Proper project structure with type hints and documentation
+
+**Phase 1.5: ~70% Complete** 🟡
+
+Migration and backend integration partially complete:
+
+-   ✅ WhisperX integration and faster-whisper backend
+-   ✅ Typer-based CLI for batch processing
+-   ✅ Export functionality (TXT, SRT, VTT, JSON)
+-   ✅ Compute type auto-selection for GPU optimization
+-   ❌ Diarization implementation (still stub)
+-   ❌ HF_TOKEN environment support
+-   ❌ Unit tests
 
 **Code Quality Status:** ✅
 
@@ -212,11 +254,12 @@ The core structure and basic local processing pipeline have been implemented:
 -   ✅ Ruff Lint
 -   ✅ MyPy Type Check
 -   ✅ Bandit Security Check
--   ⚠️ Pylint Analysis (only import errors for libraries that will be added in Phase 2)
--   ✅ Pytest Tests
+-   ⚠️ Pylint Analysis (import errors for optional ML libraries)
+-   ⚠️ Pytest Tests (framework ready, no actual tests)
 
 **Next Steps:**
 
 1. ~~Install dependencies: `make setup-dev`~~ ✅ Completed
 2. ~~Run quality checks: `python test.py`~~ ✅ Completed
-3. Begin Phase 2 implementation (advanced editing features)
+3. Complete Phase 1.5 (diarization, HF_TOKEN, basic tests)
+4. Begin Phase 2 implementation (advanced editing features)

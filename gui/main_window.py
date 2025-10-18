@@ -1,20 +1,18 @@
-from pathlib import Path
-import threading
 import sys
-from typing import Optional
+import threading
+from pathlib import Path
 
+from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
-    QMainWindow,
-    QWidget,
-    QVBoxLayout,
-    QPushButton,
-    QTextEdit,
-    QStatusBar,
-    QMenu,
     QFileDialog,
+    QMainWindow,
+    QPushButton,
+    QStatusBar,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
 )
-from PySide6.QtGui import QAction
 
 from core.pipelines import LocalPipeline
 
@@ -61,7 +59,7 @@ class MainWindow(QMainWindow):
 
         # * Pipeline instance
         self.pipeline = LocalPipeline()
-        self.input_path: Optional[Path] = None
+        self.input_path: Path | None = None
 
     def open_file(self) -> None:
         """Open file dialog to select media file."""
@@ -90,7 +88,7 @@ class MainWindow(QMainWindow):
                     self.status.showMessage("Processing complete.")
                 else:
                     self.status.showMessage("No file selected.")
-            except Exception as e:
+            except (OSError, ValueError, RuntimeError) as e:
                 self.status.showMessage(f"Error: {e}")
 
         thread = threading.Thread(target=task, daemon=True)
@@ -101,6 +99,7 @@ class MainWindow(QMainWindow):
 
 
 def main() -> None:
+    """Start the GUI application."""
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

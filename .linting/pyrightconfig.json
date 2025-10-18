@@ -1,0 +1,38 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/pyright/main/packages/vscode-pyright/schemas/pyrightconfig.schema.json",
+  "typeCheckingMode": "basic",
+  "pythonVersion": "3.11",
+  "venvPath": ".",
+  "venv": ".venv",
+  "reportMissingImports": "none",
+  "reportMissingTypeStubs": "warning",
+  "reportAttributeAccessIssue": "none",
+  "exclude": [
+    ".venv",
+    ".ruff_cache",
+    ".mypy_cache",
+    "build",
+    "dist",
+    "htmlcov",
+    "**/__pycache__"
+  ],
+  "include": [
+    "core",
+    "editing",
+    "utils",
+    "gui",
+    "tests"
+  ],
+  "executionEnvironments": [
+    {
+      "root": "./",
+      "pythonVersion": "3.11",
+      "extraPaths": [
+        "core",
+        "editing",
+        "utils",
+        "gui"
+      ]
+    }
+  ]
+}

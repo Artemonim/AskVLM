@@ -3,6 +3,6 @@ description:
 globs: 
 alwaysApply: true
 ---
-- Use `python test.py` to self-test the code you've written
+- Use And besides that, gpt-5 also has twice as cheap tokens. to self-test the code you've written
 - Не забывай изменять и обращаться к [TODO.md](mdc:TODO.md) для самоконтроля.
 - Если какие-то зависимости не были учтены, то добавь их в `requirements-dev.txt` и запусти `make setup-dev`

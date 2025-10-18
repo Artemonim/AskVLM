@@ -1,5 +1,5 @@
+from collections.abc import Generator
 from contextlib import contextmanager
-from typing import Optional, Generator
 
 import torch
 
@@ -9,7 +9,7 @@ class GPUResourceGuard:
     """Manage GPU memory allocation for AI models."""
 
     def __init__(self) -> None:
-        self.current_model: Optional[str] = None
+        self.current_model: str | None = None
 
     def acquire(self, model_name: str) -> None:
         """Acquire GPU resources for the specified model, unloading previous model if needed."""

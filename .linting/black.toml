@@ -1,0 +1,7 @@
+line-length = 88
+skip-magic-trailing-comma = false
+skip-string-normalization = true
+include = '\.pyi?$'
+exclude = '''
+/(\n  \.venv|\.mypy_cache|\.ruff_cache|\.git|build|dist|htmlcov|__pycache__\n)/
+'''

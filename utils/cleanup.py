@@ -1,67 +1,63 @@
 #!/usr/bin/env python3
-"""
-Cleanup utility for Artemonim's Speech Kit.
+"""Cleanup utility for Artemonim's Speech Kit.
 
 This script cleans up Python cache files, build artifacts, and temporary files
 to free up disk space and ensure clean development environment.
 """
 
 import argparse
-import glob
-import os
+import contextlib
 import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 
 def get_size_mb(path: str) -> float:
     """Get size of file or directory in MB."""
-    if os.path.isfile(path):
-        return os.path.getsize(path) / (1024 * 1024)
-    if os.path.isdir(path):
+    p = Path(path)
+    if p.is_file():
+        return p.stat().st_size / (1024 * 1024)
+    if p.is_dir():
         total = 0
-        for dirpath, _dirnames, filenames in os.walk(path):
-            for filename in filenames:
-                filepath = os.path.join(dirpath, filename)
-                try:
-                    total += os.path.getsize(filepath)
-                except (OSError, FileNotFoundError):
-                    pass
+        for child in p.rglob("*"):
+            with contextlib.suppress(OSError, FileNotFoundError):
+                if child.is_file():
+                    total += child.stat().st_size
         return total / (1024 * 1024)
     return 0.0
 
 
-def clean_python_cache(verbose: bool = False) -> float:
+def clean_python_cache(*, verbose: bool = False) -> float:
     """Clean Python cache files and return size freed in MB."""
     freed_size = 0.0
 
     # * Clean .pyc files
-    pyc_files = glob.glob("**/*.pyc", recursive=True)
+    pyc_files = list(Path().rglob("*.pyc"))
     for file in pyc_files:
         try:
-            freed_size += get_size_mb(file)
-            os.remove(file)
+            freed_size += get_size_mb(str(file))
+            file.unlink(missing_ok=True)
             if verbose:
-                print(f"  Removed: {file}")
+                pass
         except OSError:
             pass
 
     # * Clean __pycache__ directories
-    pycache_dirs = glob.glob("**/__pycache__", recursive=True)
-    for directory in pycache_dirs:
+    for directory in Path().rglob("__pycache__"):
         try:
-            freed_size += get_size_mb(directory)
+            freed_size += get_size_mb(str(directory))
             shutil.rmtree(directory, ignore_errors=True)
             if verbose:
-                print(f"  Removed: {directory}")
+                pass
         except OSError:
             pass
 
     return freed_size
 
 
-def clean_build_artifacts(verbose: bool = False) -> float:
+def clean_build_artifacts(*, verbose: bool = False) -> float:
     """Clean build artifacts and return size freed in MB."""
     freed_size = 0.0
 
@@ -81,30 +77,33 @@ def clean_build_artifacts(verbose: bool = False) -> float:
     for pattern in artifacts:
         if pattern.startswith(".") and not pattern.startswith("*"):
             # * Single directory
-            if os.path.exists(pattern):
+            d = Path(pattern)
+            if d.exists():
                 freed_size += get_size_mb(pattern)
-                shutil.rmtree(pattern, ignore_errors=True)
+                shutil.rmtree(d, ignore_errors=True)
                 if verbose:
-                    print(f"  Removed: {pattern}")
+                    pass
         else:
-            # * Glob pattern
-            matches = glob.glob(pattern, recursive=True)
-            for match in matches:
+            # * Glob pattern - use Path.rglob for all patterns
+            for match in Path().rglob(
+                pattern.replace("**/", "") if pattern.startswith("**/") else pattern
+            ):
                 try:
-                    freed_size += get_size_mb(match)
-                    if os.path.isdir(match):
-                        shutil.rmtree(match, ignore_errors=True)
+                    freed_size += get_size_mb(str(match))
+                    m = Path(match)
+                    if m.is_dir():
+                        shutil.rmtree(m, ignore_errors=True)
                     else:
-                        os.remove(match)
+                        m.unlink(missing_ok=True)
                     if verbose:
-                        print(f"  Removed: {match}")
+                        pass
                 except OSError:
                     pass
 
     return freed_size
 
 
-def clean_pip_cache(verbose: bool = False) -> float:
+def clean_pip_cache() -> float:
     """Clean pip cache and return size freed in MB."""
     try:
         # * Get pip cache size before cleaning
@@ -114,6 +113,7 @@ def clean_pip_cache(verbose: bool = False) -> float:
             text=True,
             timeout=30,
             check=False,
+            shell=False,
         )
 
         cache_size = 0.0
@@ -135,53 +135,47 @@ def clean_pip_cache(verbose: bool = False) -> float:
             text=True,
             timeout=30,
             check=False,
+            shell=False,
         )
 
         if result.returncode == 0:
-            if verbose:
-                print(f"  Pip cache purged (freed ~{cache_size:.1f} MB)")
             return cache_size
-        else:
-            if verbose:
-                print("  Pip cache purge not available")
-            return 0.0
 
     except (subprocess.TimeoutExpired, FileNotFoundError):
-        if verbose:
-            print("  Could not access pip cache")
-        return 0.0
+        pass
+
+    return 0.0
 
 
-def clean_temp_files(verbose: bool = False) -> float:
+def clean_temp_files(*, verbose: bool = False) -> float:
     """Clean temporary files and return size freed in MB."""
     freed_size = 0.0
-    temp_dir = tempfile.gettempdir()
+    temp_dir = Path(tempfile.gettempdir())
 
     temp_prefixes = ["pip-", "tmp", "pytest-", "mypy-", "ruff-", "bandit-"]
 
     try:
-        for item in os.listdir(temp_dir):
-            if any(item.startswith(prefix) for prefix in temp_prefixes):
-                item_path = os.path.join(temp_dir, item)
+        for item in temp_dir.iterdir():
+            if any(item.name.startswith(prefix) for prefix in temp_prefixes):
                 try:
-                    freed_size += get_size_mb(item_path)
-                    if os.path.isdir(item_path):
-                        shutil.rmtree(item_path, ignore_errors=True)
+                    freed_size += get_size_mb(str(item))
+                    if item.is_dir():
+                        shutil.rmtree(item, ignore_errors=True)
                     else:
-                        os.remove(item_path)
+                        item.unlink(missing_ok=True)
                     if verbose:
-                        print(f"  Removed temp: {item_path}")
+                        pass
                 except OSError:
                     pass
     except OSError:
         if verbose:
-            print("  Could not access temp directory")
+            pass
 
     return freed_size
 
 
 def main() -> int:
-    """Main entry point."""
+    """Run cleanup operations."""
     parser = argparse.ArgumentParser(
         description="Clean up Python cache and temporary files"
     )
@@ -194,44 +188,40 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    print("🧹 Cleaning up Python cache and build artifacts...")
-
     total_freed = 0.0
 
     # * Clean Python cache
     if args.verbose:
-        print("\n📁 Cleaning Python cache files...")
-    freed = clean_python_cache(args.verbose)
+        pass
+    freed = clean_python_cache(verbose=args.verbose)
     total_freed += freed
     if not args.verbose and freed > 0:
-        print(f"  Python cache: {freed:.1f} MB")
+        pass
 
     # * Clean build artifacts
     if args.verbose:
-        print("\n🔨 Cleaning build artifacts...")
-    freed = clean_build_artifacts(args.verbose)
+        pass
+    freed = clean_build_artifacts(verbose=args.verbose)
     total_freed += freed
     if not args.verbose and freed > 0:
-        print(f"  Build artifacts: {freed:.1f} MB")
+        pass
 
     # * Clean pip cache
     if args.verbose:
-        print("\n📦 Cleaning pip cache...")
-    freed = clean_pip_cache(args.verbose)
+        pass
+    freed = clean_pip_cache()
     total_freed += freed
     if not args.verbose and freed > 0:
-        print(f"  Pip cache: {freed:.1f} MB")
+        pass
 
     # * Deep clean temp files
     if args.deep:
         if args.verbose:
-            print("\n🗑️  Deep cleaning temporary files...")
-        freed = clean_temp_files(args.verbose)
+            pass
+        freed = clean_temp_files(verbose=args.verbose)
         total_freed += freed
         if not args.verbose and freed > 0:
-            print(f"  Temp files: {freed:.1f} MB")
-
-    print(f"\n✅ Cleanup complete! Freed {total_freed:.1f} MB of disk space.")
+            pass
 
     return 0
 

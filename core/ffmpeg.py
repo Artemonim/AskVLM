@@ -1,7 +1,6 @@
 # Placeholder for ffmpeg.py
 
 from pathlib import Path
-from typing import Union
 
 import ffmpeg
 
@@ -10,8 +9,8 @@ import ffmpeg
 
 
 def extract_audio(
-    input_file: Union[str, Path],
-    output_file: Union[str, Path],
+    input_file: str | Path,
+    output_file: str | Path,
     sample_rate: int = 16000,
     channels: int = 1,
 ) -> None:

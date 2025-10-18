@@ -1,47 +1,81 @@
 from pathlib import Path
-from typing import Optional
 
-from editing.text_model import TextSegment, Document
+from editing.text_model import Document, TextSegment
 
 from .audio_io import prepare_audio
-from .whisper_wrapper import WhisperWrapper
 from .diarization import DiarizationPipeline
 from .llm_formatter import LLMFormatter
+from .whisper_wrapper import WhisperWrapper
+from .whisperx_wrapper import WhisperXWrapper
 
 
 # * Orchestrate local speech-to-text processing pipeline
 class LocalPipeline:
-    """Pipeline for local processing: FFmpeg -> Whisper -> Pyannote -> LLM formatting."""
+    """Pipeline for local processing: FFmpeg -> STT (Whisper/WhisperX) -> Diarization -> LLM formatting."""
 
     def __init__(
         self,
-        model_root: Optional[Path] = None,
+        model_root: Path | None = None,
         whisper_model: str = "base",
         llm_model: str = "gguf-q4_0",
+        *,
+        engine: str = "whisper",  # whisper | whisperx
+        enable_diarization: bool = True,
+        enable_dialog_blocks: bool = False,
+        language: str | None = None,
+        device: str = "auto",
+        compute_type: str = "auto",
     ) -> None:
         """Initialize pipeline components."""
         self.model_root = model_root
-        self.whisper = WhisperWrapper(model_name=whisper_model, model_root=model_root)
+        self.engine = engine
+        self.language = language
+        self.device = device
+        self.compute_type = compute_type
+        # STT engines
+        w_device = (
+            "cuda" if device in {"auto", "cuda"} else "cpu"
+        )  # basic mapping for whisper
+        self.whisper = WhisperWrapper(
+            model_name=whisper_model, model_root=model_root, device=w_device
+        )
+        self.whisperx = WhisperXWrapper(
+            model_name=whisper_model, model_root=model_root, device=w_device, compute_type=compute_type
+        )
+        # Diarization & LLM
+        self.enable_diarization = enable_diarization
+        self.enable_dialog_blocks = enable_dialog_blocks
         self.diarizer = DiarizationPipeline()
         self.formatter = LLMFormatter(model_name=llm_model, model_path=None)
 
     def process(
         self,
         input_path: Path,
-        work_dir: Path = Path("."),
+        work_dir: Path = Path(),
     ) -> Document:
         """Process a media file through the pipeline and return a formatted document."""
         # * Step 1: Ensure audio is in WAV format
         audio_path = prepare_audio(input_path, work_dir)
 
         # * Step 2: Transcribe audio to raw text
-        raw_text = self.whisper.transcribe(audio_path)
+        if self.engine == "whisperx":
+            tx = self.whisperx.transcribe(audio_path, language=self.language)
+            raw_text = tx.get("text", "")
+            # * Alignment is optional; enable in later phase
+        else:
+            raw_text = self.whisper.transcribe(audio_path)
 
-        # * Step 3: Perform speaker diarization
-        diarization_segments = self.diarizer.diarize(str(audio_path))
+        # * Step 3: Perform speaker diarization (optional)
+        diarization_segments = (
+            self.diarizer.diarize(str(audio_path)) if self.enable_diarization else []
+        )
 
-        # * Step 4: Format text using LLM
-        formatted_text = self.formatter.format_text(raw_text)
+        # * Step 4: Format text using LLM (optional blocks)
+        formatted_text = (
+            self.formatter.format_text(raw_text)
+            if self.enable_dialog_blocks
+            else raw_text
+        )
 
         # * Build document (simple single-segment fallback)
         doc = Document()
