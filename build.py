@@ -12,6 +12,9 @@ Usage examples:
   python build.py --tool ruff
   python build.py --path core editing
   python build.py --json
+  # * Launch control:
+  #   --skip-launch  -> run checks/tests only (no app launch)
+  #   --fast-launch  -> launch app only (skip checks/tests)
 """
 
 from __future__ import annotations
@@ -536,7 +539,22 @@ def main() -> None:
     parser.add_argument("--verbose", "-v", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--no-fix", action="store_true", help="Disable auto-fix phase")
+    parser.add_argument("--skip-launch", action="store_true", help="Run checks/tests only; do not launch app")
+    parser.add_argument("--fast-launch", action="store_true", help="Launch the app only; skip checks/tests")
     args = parser.parse_args()
+
+    # * FastLaunch: only launch the application (GUI), skip any checks
+    if args.fast_launch:
+        try:
+            # * Launch GUI application in the foreground
+            code = subprocess.call([sys.executable, "-m", "gui.main_window"])  # noqa: S603
+            sys.exit(code)
+        except FileNotFoundError:
+            print("Error: Python interpreter not found.", file=sys.stderr)
+            sys.exit(127)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error launching application: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     targets = None
     if args.path:
@@ -553,6 +571,8 @@ def main() -> None:
     res = ci.run(only=args.tool, fix=(not args.no_fix))
     if args.json:
         print(json.dumps(res, indent=2))
+    # * SkipLaunch: explicitly do not launch anything after checks
+    #   Default behavior remains to not launch; this flag is for explicitness and future extensibility.
     sys.exit(0 if res["summary"]["overall_status"] == "PASS" else 1)
 
 

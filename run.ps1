@@ -5,14 +5,16 @@ param(
     [string[]]$Path,
     [switch]$Verbose,
     [switch]$Json,
-    [switch]$NoFix
+    [switch]$NoFix,
+    [switch]$SkipLaunch,
+    [switch]$FastLaunch
 )
 
 function Show-Help {
     Write-Host "Artemonim's Speech Kit runner" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage:"
-    Write-Host "  .\run.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-- <build.py args>]"
+    Write-Host "  .\run.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-- <build.py args>]"
     Write-Host ""
     Write-Host "Flags:"
     Write-Host "  -Tool <name>      Run only one tool: ruff-format, ruff, compile, mypy, pyright, pytest, bandit, pip-audit"
@@ -20,11 +22,15 @@ function Show-Help {
     Write-Host "  -Verbose          Verbose output"
     Write-Host "  -Json             JSON output"
     Write-Host "  -NoFix            Disable auto-fix phase"
+    Write-Host "  -SkipLaunch       Run checks/tests only; do not launch the app"
+    Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
     Write-Host "  -Help             Show this help"
     Write-Host ""
     Write-Host "Examples:"
     Write-Host "  .\run.ps1 -Tool ruff"
     Write-Host "  .\run.ps1 -Path core,editing"
+    Write-Host "  .\run.ps1 -FastLaunch"
+    Write-Host "  .\run.ps1 -SkipLaunch"
 }
 
 if ($Help) { Show-Help; exit 0 }
@@ -44,6 +50,9 @@ if ($Path) { $cmd = "{0} --path {1}" -f $cmd, ([string]::Join(' ', $Path)) }
 if ($Verbose) { $cmd += " --verbose" }
 if ($Json) { $cmd += " --json" }
 if ($NoFix) { $cmd += " --no-fix" }
+# * Launch control flags
+if ($SkipLaunch) { $cmd += " --skip-launch" }
+if ($FastLaunch) { $cmd += " --fast-launch" }
 # * Add forwarded arguments
 if ($forward.Count -gt 0) { $cmd = "{0} {1}" -f $cmd, ([string]::Join(' ', $forward)) }
 Invoke-Expression $cmd
