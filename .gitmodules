@@ -2,3 +2,7 @@
 	path = little-tools-dev
 	url = https://github.com/Artemonim/Artemonim-Little-Tools
 	branch = dev
+[submodule "whisperx-dev"]
+	path = whisperx-dev
+	url = https://github.com/Artemonim/whisperX
+	branch = dev
