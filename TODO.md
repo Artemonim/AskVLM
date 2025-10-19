@@ -120,6 +120,18 @@
 -   [ ] Doc
     -   [ ] Update `doc/Main UX.md` with Quick Transcribe flow details
 
+## Phase 1.8: AutoSubtitles & Resolve Workflow
+
+-   [x] Decision: Default artifact is sidecar SRT; burn-in is done in DaVinci Resolve.
+-   [ ] CLI: `subtitle` command (batch: files/folders) producing SRT with CPS/duration rules.
+-   [ ] Optional: watch-folder mode to auto-generate SRT on new exports from Resolve.
+-   [ ] GUI: quick action "Generate SRT for Resolve" (minimal controls).
+-   [x] Documentation: Add `doc/AutoSubtitles.md` (pipeline, RAM↔VRAM, Resolve flow).
+-   [ ] **VRAM & Performance**
+    -   [ ] RAM residency for Align/Diari via ModelRegistry (CPU-resident, migrate to CUDA).
+    -   [ ] Prefetch on idle (Align/Diari CPU load, OS cache warm-up for ASR weights).
+    -   [ ] Single heavy-model on GPU guarantee across pipeline (enforce via `gpu_guard`).
+
 ## Phase 2: Advanced Editing and Cloud Integration
 
 -   [ ] **Advanced Editing Features**
@@ -160,6 +172,7 @@
         -   [ ] Yandex Cloud settings (OAuth token, folder_id).
     -   [ ] Define Pydantic model for `settings.json`.
     -   [ ] Update `settings.json` Pydantic model.
+    -   [ ] Update `env.example` with SK_* variables (device, compute_type, prefetch, RAM residency, output, logs).
 -   [ ] **Export Functionality**
     -   [ ] `gui/export_dialog.py`: Dialog to choose format and options.
     -   [ ] Implement exporters:
@@ -196,6 +209,7 @@
     -   [ ] Wiki: "How to connect Yandex key", "Text formatting, hotkeys".
     -   [x] Docstrings (Google Style for Python).
     -   [ ] Sphinx HTML documentation.
+    -   [x] Add `doc/AutoSubtitles.md` (AutoSubtitles pipeline and Resolve workflow).
 -   [ ] **Packaging & Distribution**
     -   [ ] Finalize `PyInstaller` setup (`--onefile`, `--add-data`).
     -   [ ] Logic for first-run model download to `~/.mytranscriber/models` or `%APPDATA%`.
