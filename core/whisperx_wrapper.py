@@ -85,31 +85,20 @@ class WhisperXWrapper:
             ):
                 ct = "float16"
             else:
-                ct = "int8"
+                # * Enforce CUDA-only ML processing per requirement
+                msg = "CUDA is required for ML processing, but no compatible GPU is available."
+                raise RuntimeError(msg)
         # * Try primary load; if OOM, downgrade compute_type/device
-        try:
-            self._model = fw_whisper_cls(
-                self.model_name,
-                device=self.device,
-                compute_type=ct,
-                download_root=download_root,
-            )
-            return
-        except Exception as e:
-            # * OOM or invalid compute_type: fallback
-            err = str(e).lower()
-            fallback_device = "cpu" if self.device == "cuda" else self.device
-            fallback_ct = "int8" if ct in {"float16", "float32", "auto"} else ct
-            try:
-                self._model = fw_whisper_cls(
-                    self.model_name,
-                    device=fallback_device,
-                    compute_type=fallback_ct,
-                    download_root=download_root,
-                )
-                return
-            except Exception:
-                raise
+        if self.device != "cuda":
+            # * Enforce CUDA-only ML processing
+            msg = "CUDA is required for ML processing."
+            raise RuntimeError(msg)
+        self._model = fw_whisper_cls(
+            self.model_name,
+            device=self.device,
+            compute_type=ct,
+            download_root=download_root,
+        )
 
     def _load_align_model(self) -> None:
         if self._align_model is None and whisperx_mod is not None:

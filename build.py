@@ -571,8 +571,21 @@ def main() -> None:
     res = ci.run(only=args.tool, fix=(not args.no_fix))
     if args.json:
         print(json.dumps(res, indent=2))
-    # * SkipLaunch: explicitly do not launch anything after checks
-    #   Default behavior remains to not launch; this flag is for explicitness and future extensibility.
+
+    # * Launch GUI by default after successful checks (unless explicitly skipped)
+    if not args.skip_launch and res["summary"]["overall_status"] == "PASS":
+        try:
+            # * Launch GUI application in the foreground
+            print("Launching GUI application...")
+            code = subprocess.call([sys.executable, "-m", "gui.main_window"])  # noqa: S603
+            sys.exit(code)
+        except FileNotFoundError:
+            print("Error: Python interpreter not found.", file=sys.stderr)
+            sys.exit(127)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Error launching application: {exc}", file=sys.stderr)
+            sys.exit(1)
+
     sys.exit(0 if res["summary"]["overall_status"] == "PASS" else 1)
 
 

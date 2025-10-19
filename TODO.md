@@ -92,29 +92,29 @@
 ## Phase 1.7: Simple GUI MVP (Quick Transcribe)
 
 -   [x] Runner flags for launch control (SkipLaunch, FastLaunch)
--   [ ] Minimal end-to-end GUI flow
-    -   [ ] `gui/main_window.py`: Quick Transcribe panel
-        -   [ ] Pick file OR folder; pick output dir (default: `transcriptions/`)
-        -   [ ] Toggles: Diarization on/off, Dialog blocks on/off
-        -   [ ] Export format: txt|srt|vtt|json (default: txt)
-        -   [ ] Start/Cancel buttons; status bar messages
-    -   [ ] Non-blocking execution
-        -   [ ] Run `LocalPipeline` in background (QtConcurrent/QThread)
-        -   [ ] Disable controls during processing; enable on finish/cancel
-    -   [ ] Result viewing
-        -   [ ] Open output in `gui/wysiwyg_editor.py` for quick read-only viewing
-        -   [ ] Button: Open output folder
-    -   [ ] Error handling
-        -   [ ] Message dialogs for common failures (unsupported media, OOM hint, no GPU)
-    -   [ ] Persistence
-        -   [ ] Remember last chosen input/output paths (session-scoped)
+-   [x] Minimal end-to-end GUI flow
+    -   [x] `gui/main_window.py`: Quick Transcribe panel
+        -   [x] Pick file OR folder; pick output dir (default: `transcriptions/`)
+        -   [x] Toggles: Diarization on/off, Dialog blocks on/off
+        -   [x] Export format: txt|srt|vtt|json (default: txt)
+        -   [x] Start/Cancel buttons; status bar messages
+    -   [x] Non-blocking execution
+        -   [x] Run `LocalPipeline` in background (QtConcurrent/QThread)
+        -   [x] Disable controls during processing; enable on finish/cancel
+    -   [x] Result viewing
+        -   [x] Open output in `gui/wysiwyg_editor.py` for quick read-only viewing
+        -   [x] Button: Open output folder
+    -   [x] Error handling
+        -   [x] Message dialogs for common failures (unsupported media, OOM hint, no GPU)
+    -   [x] Persistence
+        -   [x] Remember last chosen input/output paths (session-scoped)
 
--   [ ] Pipeline integration
-    -   [ ] Use `core/pipelines.LocalPipeline` with Engine=Auto (faster-whisper; whisperx alignment if available)
-    -   [ ] Auto audio prep via `core/audio_io.prepare_audio`
+-   [x] Pipeline integration
+    -   [x] Use `core/pipelines.LocalPipeline` with Engine=Auto (faster-whisper; whisperx alignment if available)
+    -   [x] Auto audio prep via `core/audio_io.prepare_audio`
 
 -   [ ] Progress & logs
-    -   [ ] Status bar updates; basic step progress (ETA in later phase)
+    -   [x] Status bar updates; basic step progress (ETA in later phase)
     -   [ ] Optional console log pane (collapsed by default)
 
 -   [ ] Doc
@@ -236,6 +236,7 @@ Core structure and basic local processing pipeline implemented:
 -   ✅ Settings system with Pydantic models
 -   ✅ CLI entry point for batch processing
 -   ✅ Proper project structure with type hints and documentation
+-   ✅ **CUDA GPU Support Enabled** (PyTorch 2.5.1+cu121, RTX 3070)
 
 **Phase 1.5: ~70% Complete** 🟡
 

@@ -37,6 +37,7 @@ class DiarizationPipeline:
             model_name: Hugging Face model id for diarization pipeline.
             hf_token: Optional HF token (reads HF_TOKEN from env if not provided).
             device: Preferred device (auto/cuda/cpu).
+
         """
         self.model_name = model_name
         self.hf_token = hf_token or os.getenv("HF_TOKEN") or ""
@@ -54,8 +55,7 @@ class DiarizationPipeline:
             return
 
         try:
-            # pyannote >=3
-            Pipeline = getattr(pa, "Pipeline")
+            pipeline_cls = pa.Pipeline
         except AttributeError:
             # * Unknown API version; skip loading
             self._pipeline = None
@@ -66,8 +66,8 @@ class DiarizationPipeline:
         if self.hf_token:
             kwargs["use_auth_token"] = self.hf_token
         try:
-            pipe = Pipeline.from_pretrained(self.model_name, **kwargs)
-        except Exception:
+            pipe = pipeline_cls.from_pretrained(self.model_name, **kwargs)
+        except Exception:  # noqa: BLE001
             # ! If loading fails (e.g., gated model without token), skip diarization
             self._pipeline = None
             return
@@ -77,9 +77,11 @@ class DiarizationPipeline:
             if self.device == "cuda":
                 pipe.to("cuda")
             elif self.device == "cpu":
-                pipe.to("cpu")
-        except Exception:
-            # * Device move is best-effort
+                # * Enforce CUDA-only ML processing
+                msg = "CUDA is required for ML processing, but CPU was requested."
+                raise RuntimeError(msg)  # noqa: TRY301
+        except Exception:  # noqa: BLE001
+            # * Device move is best-effort; log minimal info
             pass
         self._pipeline = pipe
 
@@ -93,7 +95,7 @@ class DiarizationPipeline:
             return []
         try:
             annotation = pipe(audio_path)
-        except Exception:
+        except Exception:  # noqa: BLE001
             # ! Runtime failure (e.g., missing backends), return empty
             return []
 
@@ -109,8 +111,8 @@ class DiarizationPipeline:
                             end=float(getattr(turn, "end", 0.0) or 0.0),
                         )
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001,S112
                     continue
-        except Exception:
+        except Exception:  # noqa: BLE001
             return []
         return out

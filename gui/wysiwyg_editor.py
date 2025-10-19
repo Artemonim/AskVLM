@@ -8,3 +8,4 @@ class WysiwygEditor(QTextEdit):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         # ! Custom block userData for speaker_id, start_ts, end_ts will be added in Phase 2
+        self.setPlaceholderText("Result text will appear here…")

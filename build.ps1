@@ -7,7 +7,10 @@ param(
     [switch]$Json,
     [switch]$NoFix,
     [switch]$SkipLaunch,
-    [switch]$FastLaunch
+    [switch]$FastLaunch,
+    [switch]$RecreateVenv,
+    [switch]$EnsureML,
+    [switch]$EnsureCUDA
 )
 
 function Show-Help {
@@ -40,18 +43,129 @@ $forward = @()
 if ($dashdashIndex -ge 0) { $forward = $args[($dashdashIndex + 1)..($args.Length - 1)] }
 
 $activate = Join-Path -Path ".venv" -ChildPath "Scripts/Activate.ps1"
-if (-not (Test-Path $activate)) { python -m venv .venv }
+if ($RecreateVenv -and (Test-Path ".venv")) {
+    Write-Host "Recreating virtual environment..." -ForegroundColor Yellow
+    try { Remove-Item -Recurse -Force ".venv" } catch {}
+}
+if (-not (Test-Path $activate)) {
+    # Prefer Python 3.11 for this project
+    $pyok = $false
+    try { py -3.11 -V | Out-Null; if ($LASTEXITCODE -eq 0) { $pyok = $true } } catch {}
+    if ($pyok) {
+        py -3.11 -m venv .venv
+    } else {
+        if (Test-Path "venv/Scripts/python.exe") { & "venv/Scripts/python.exe" -m venv .venv }
+        elseif (Test-Path "venv/ScriptS/python.exe") { & "venv/ScriptS/python.exe" -m venv .venv }
+        else { python -m venv .venv }
+    }
+}
 & $activate
+
+# Ensure active venv Python is 3.11
+try {
+    $ver = & python -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>$null
+    if ($ver -ne '3.11') {
+        Write-Host "Active venv Python is $ver, recreating with Python 3.11..." -ForegroundColor Yellow
+        try { Remove-Item -Recurse -Force ".venv" } catch {}
+        if (Test-Path "venv/Scripts/python.exe") { & "venv/Scripts/python.exe" -m venv .venv }
+        elseif (Test-Path "venv/ScriptS/python.exe") { & "venv/ScriptS/python.exe" -m venv .venv }
+        elseif ($pyok) { py -3.11 -m venv .venv }
+        else { Write-Error "Python 3.11 not found. Install it or provide venv with 3.11."; exit 1 }
+        & $activate
+        $ver = & python -c "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')" 2>$null
+        if ($ver -ne '3.11') { Write-Error "Failed to activate Python 3.11 environment."; exit 1 }
+    }
+} catch {}
 
 # * Ensure core dev deps exist
 try {
-    python -c "import importlib.util,sys;mods=['ruff','mypy','pytest'];sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)" | Out-Null
+    python -c "import importlib.util,sys;mods=['ruff','mypy','pytest','pip_audit'];sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Installing dev dependencies..." -ForegroundColor Yellow
-        if (Test-Path "requirements-dev.txt") { pip install -r requirements-dev.txt | Out-Null }
-        if (Test-Path "requirements.txt") { pip install -r requirements.txt | Out-Null }
+        if (Test-Path "requirements-dev.txt") { python -m pip install -r requirements-dev.txt | Out-Null }
+        if (Test-Path "requirements.txt") { python -m pip install -r requirements.txt | Out-Null }
+        # Ensure pip-audit present if not via requirements
+        try { python -m pip install -q pip-audit | Out-Null } catch {}
     }
 } catch {}
+
+# * Helper: quick silent module existence check
+function Test-Module {
+    param([string]$Name)
+    python -c "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec('$Name') else 1)" | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+# * Helper: check numpy major version == 1
+function Test-NumpyV1 {
+    python -c "import sys;import numpy as np;sys.exit(0 if str(np.__version__).split('.')[0]=='1' else 1)" | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+# * Helper: check CUDA availability
+function Test-CUDA {
+    python -c "import sys; import torch; ok = bool(getattr(torch,'cuda',None) and torch.cuda.is_available()); print('[CUDA CHECK] available=' + str(ok)); sys.exit(0 if ok else 1)" | Out-Null
+    return $LASTEXITCODE -eq 0
+}
+
+# ! Function to check and fix CUDA support
+function Check-CUDA {
+    Write-Host "🔍 Checking CUDA availability..." -ForegroundColor Cyan
+    
+    $cudaCheck = & python -c "import torch; print('CUDA' if torch.cuda.is_available() else 'CPU')" 2>$null
+    
+    if ($cudaCheck -eq "CUDA") {
+        Write-Host "✅ CUDA is available in PyTorch" -ForegroundColor Green
+        return $true
+    }
+    else {
+        Write-Host "❌ PyTorch CPU-only version detected" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "ℹ️  Your system has CUDA, but PyTorch CPU-only version is installed." -ForegroundColor Yellow
+        Write-Host "To fix this, run:" -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  pip uninstall torch -y && pip install torch --index-url https://download.pytorch.org/whl/cu121" -ForegroundColor Green
+        Write-Host ""
+        Write-Host "Or for other CUDA versions, visit: https://pytorch.org/get-started/locally/" -ForegroundColor Cyan
+        Write-Host ""
+        return $false
+    }
+}
+
+# * Ensure ML deps exist (only when requested)
+if ($EnsureML) {
+    try {
+        $needMl = (-not (Test-Module numpy)) -or (-not (Test-Module torch)) -or (-not (Test-Module whisper)) -or (-not (Test-Module faster_whisper)) -or (-not (Test-Module whisperx)) -or (-not (Test-Module pyannote.audio))
+        if ($needMl) {
+            Write-Host "Installing ML dependencies (extras: ml)..." -ForegroundColor Yellow
+            try { python -m pip install -q -U pip wheel setuptools } catch {}
+            # * numpy<2 for pyannote compatibility (skip if unavailable)
+            try { python -m pip install -q --only-binary=:all: "numpy<2.0" } catch {}
+            python -m pip install -q -e .[ml]
+        }
+        # * Enforce numpy<2 even if extras upgraded it
+        if (-not (Test-NumpyV1)) {
+            try { python -m pip install -q --only-binary=:all: "numpy<2.0" } catch {}
+        }
+    } catch {}
+}
+
+# * Ensure CUDA-enabled torch; attempt known CUDA indices if unavailable
+if ($EnsureCUDA -and -not (Test-CUDA)) {
+    Write-Host "Attempting to install CUDA-enabled PyTorch wheels..." -ForegroundColor Yellow
+    $indexes = @(
+        "https://download.pytorch.org/whl/cu124",
+        "https://download.pytorch.org/whl/cu121",
+        "https://download.pytorch.org/whl/cu118"
+    )
+    foreach ($u in $indexes) {
+        try { python -m pip install -q --index-url $u --extra-index-url https://download.pypi.org/simple torch torchvision torchaudio } catch {}
+        if (Test-CUDA) { break }
+    }
+    if (-not (Test-CUDA)) {
+        Write-Error "CUDA is not available via PyTorch after installation attempts."
+    }
+}
 
 $cmd = "python build.py"
 # * Add flags from parameters
