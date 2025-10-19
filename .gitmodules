@@ -1,0 +1,4 @@
+[submodule "little-tools-dev"]
+	path = little-tools-dev
+	url = https://github.com/Artemonim/Artemonim-Little-Tools
+	branch = dev
