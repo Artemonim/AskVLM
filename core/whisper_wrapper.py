@@ -77,15 +77,34 @@ class WhisperWrapper:
         self,
         audio_path: Path,
         **kwargs: object,
-    ) -> str:
-        """Transcribe audio file and return transcription text."""
+    ) -> dict[str, Any]:
+        """Transcribe audio and return dict with text and coarse segments.
+
+        Returns a dict with keys: text, segments (list of {start,end,text}).
+        Applies word-level timestamps and line-width constraints so that
+        downstream subtitle rendering stays readable.
+        """
         self._ensure_model_loaded()
         model = self._model
         if model is None:
             msg = "Whisper model failed to load"
             raise RuntimeError(msg)
-        # * Cast kwargs to a concrete dict for the underlying API
-        kw: dict[str, object] = dict(kwargs)
+        # * Defaults for readability when word timestamps are enabled
+        kw: dict[str, object] = {
+            "word_timestamps": True,
+            "max_line_width": 42,
+            "max_line_count": 2,
+        }
+        kw.update(dict(kwargs))
         result: dict[str, Any] = model.transcribe(str(audio_path), **kw)
         text: str = result.get("text", "")
-        return text
+        segments_out: list[dict[str, Any]] = []
+        for seg in result.get("segments", []) or []:
+            try:
+                start = float(seg.get("start", 0.0))
+                end = float(seg.get("end", 0.0))
+                txt = str(seg.get("text", "")).strip()
+            except (TypeError, ValueError):
+                continue
+            segments_out.append({"start": start, "end": end, "text": txt})
+        return {"text": text, "segments": segments_out}

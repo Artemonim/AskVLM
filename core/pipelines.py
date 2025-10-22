@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, cast
 from editing.text_model import Document, TextSegment
 from utils.env import load_env_file
 
-from .audio_io import prepare_audio
+from .audio_io import cleanup_intermediate_audio, prepare_audio
 from .diarization import DiarizationPipeline
 from .llm_formatter import LLMFormatter
 from .settings import configure_ml_caches, get_project_cache_dir
@@ -104,14 +104,18 @@ class LocalPipeline:
                 transcript_segments = list(tx.get("segments", []) or [])
                 engine_to_use = "whisperx"
             except Exception:  # noqa: BLE001
-                raw_text = self.whisper.transcribe(audio_path)
+                tx2 = self.whisper.transcribe(audio_path)
+                raw_text = str(tx2.get("text", ""))
+                transcript_segments = list(tx2.get("segments", []) or [])
                 engine_to_use = "whisper"
         elif engine_to_use == "whisperx":
             tx = self.whisperx.transcribe(audio_path, language=self.language)
             raw_text = tx.get("text", "")
             transcript_segments = list(tx.get("segments", []) or [])
         else:
-            raw_text = self.whisper.transcribe(audio_path)
+            tx3 = self.whisper.transcribe(audio_path)
+            raw_text = str(tx3.get("text", ""))
+            transcript_segments = list(tx3.get("segments", []) or [])
         report(f"Transcription complete ({engine_to_use})", 0.6)
 
         # * Step 3: Perform speaker diarization (optional)
@@ -148,6 +152,8 @@ class LocalPipeline:
             format_text_fn=self.formatter.format_text,
         )
         report("Document built", 0.98)
+        # * Cleanup intermediates (_work WAV) after successful processing
+        cleanup_intermediate_audio(input_path, work_dir)
         return doc
 
 

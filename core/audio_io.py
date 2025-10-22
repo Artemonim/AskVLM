@@ -25,3 +25,17 @@ def prepare_audio(
     logger.info("Preparing audio: %s -> %s", input_path, output_wav)
     extract_audio(input_path, output_wav, sample_rate=sample_rate, channels=channels)
     return output_wav
+
+
+def cleanup_intermediate_audio(input_path: Path, work_dir: Path) -> None:
+    """Remove intermediate WAV and empty work directory (best effort)."""
+    try:
+        work_subdir = work_dir / "_work"
+        wav_path = work_subdir / f"{input_path.stem}.wav"
+        if wav_path.exists():
+            wav_path.unlink()
+        if work_subdir.exists() and not any(work_subdir.iterdir()):
+            work_subdir.rmdir()
+    except OSError as exc:
+        # * Best-effort cleanup: log and continue
+        logger.debug("Intermediate cleanup failed: %s", exc)

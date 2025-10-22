@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from core.pipelines import LocalPipeline
 from core.whisperx_wrapper import WhisperXWrapper
 from editing.text_model import Document, TextSegment
 from gui.main_window import MainWindow, PipelineWorker
+from utils.exporters import export_document
 
 
 def test_diarization_returns_list_without_pyannote() -> None:
@@ -106,8 +108,6 @@ def test_integration_transcribe_fixture_smoke(tmp_path: Path) -> None:
 
     Controlled by env SK_INTEGRATION=1 to avoid long runs by default.
     """
-    import os
-
     if os.getenv("SK_INTEGRATION") != "1":
         return
     fixture = Path("tests/fixtures/test_video_first.mp4")
@@ -121,8 +121,6 @@ def test_integration_transcribe_fixture_smoke(tmp_path: Path) -> None:
     text = doc.get_full_text()
     assert isinstance(text, str)
     # Export TXT and SRT
-    from utils.exporters import export_document
-
     txtp = out / f"{fixture.stem}.txt"
     srtp = out / f"{fixture.stem}.srt"
     export_document(doc, "txt", txtp)
@@ -131,3 +129,20 @@ def test_integration_transcribe_fixture_smoke(tmp_path: Path) -> None:
     assert txtp.stat().st_size >= 0
     assert srtp.exists()
     assert srtp.stat().st_size >= 0
+
+
+def test_time_parsing_populates_nonzero_times() -> None:
+    """Ensure that time parsing yields non-zero start/end in the first row."""
+    QApplication.instance() or QApplication([])
+    w = MainWindow()
+    sample = "1\n00:00:01,000 --> 00:00:03,500\nspeaker_1: Hello world\n\n"
+    w.on_finished([], view_text=sample)
+    ed = w.get_editor_at(0)
+    assert ed is not None
+    assert ed.rowCount() >= 1
+    # time (col 0) must not be the default zero string
+    time_item = ed.item(0, 0)
+    assert time_item is not None
+    time_str = time_item.text()
+    assert time_str.startswith("00:00:01")
+    assert "→" in time_str

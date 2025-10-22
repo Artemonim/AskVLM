@@ -1,17 +1,20 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from PySide6.QtCore import QObject, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, QUrl, Signal
+from PySide6.QtGui import QAction, QDesktopServices, QFontDatabase
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -27,7 +30,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from core.ffmpeg import burn_subtitles
+from core.audio_io import cleanup_intermediate_audio
+from core.ffmpeg import get_media_duration_seconds, start_burn_process
 from core.pipelines import LocalPipeline
 from gui.speaker_sidebar import SpeakerSidebar
 from gui.wysiwyg_editor import TableRow, WysiwygEditor
@@ -36,6 +40,13 @@ from utils.logging import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from subprocess import Popen
+
+    from PySide6.QtGui import QCloseEvent
+
+# * Constants for boolean UI states
+_UI_CHECKED = True
+_UI_UNCHECKED = False
 
 
 class CancelledByUserError(Exception):
@@ -96,43 +107,66 @@ class MainWindow(QMainWindow):
         self.out_dir_btn = QPushButton("Browse…")
         out_row.addWidget(self.out_dir_edit, 1)
         out_row.addWidget(self.out_dir_btn)
+        self.btn_open_out = QPushButton("Open...")
+        out_row.addWidget(self.btn_open_out)
         layout.addLayout(out_row)
 
         # * Options row: toggles and format
         opts_row = QHBoxLayout()
         self.chk_diar = QCheckBox("Diarization")
-        self.chk_diar.setChecked(False)
+        self.chk_diar.setChecked(_UI_UNCHECKED)
         self.chk_dialog = QCheckBox("Dialog blocks")
-        self.chk_dialog.setChecked(False)
-        self.chk_burn = QCheckBox("Burn-in subtitles")
-        self.chk_burn.setChecked(True)
+        self.chk_dialog.setChecked(_UI_UNCHECKED)
         self.chk_save_srt = QCheckBox("Also save .srt")
-        self.chk_save_srt.setChecked(True)
+        self.chk_save_srt.setChecked(_UI_CHECKED)
         opts_row.addWidget(self.chk_diar)
         opts_row.addWidget(self.chk_dialog)
-        opts_row.addWidget(self.chk_burn)
         opts_row.addWidget(self.chk_save_srt)
         opts_row.addWidget(QLabel("Format:"))
         self.format_combo = QComboBox()
-        self.format_combo.addItems(["txt", "srt", "vtt", "json"])
+        self.format_combo.addItems(["none", "txt", "srt", "vtt", "json"])
         self.format_combo.setCurrentText("srt")
         opts_row.addWidget(self.format_combo)
         opts_row.addStretch(1)
-        layout.addLayout(opts_row)
-
-        # * Action buttons row
-        actions_row = QHBoxLayout()
-        self.btn_quick_srt = QPushButton("Generate SRT")
+        # Start/Cancel moved to options row
         self.btn_start = QPushButton("Start")
         self.btn_cancel = QPushButton("Cancel")
-        self.btn_cancel.setEnabled(False)
-        self.btn_open_out = QPushButton("Open Output Folder")
-        actions_row.addWidget(self.btn_quick_srt)
-        actions_row.addWidget(self.btn_start)
-        actions_row.addWidget(self.btn_cancel)
-        actions_row.addStretch(1)
-        actions_row.addWidget(self.btn_open_out)
-        layout.addLayout(actions_row)
+        self.btn_cancel.setEnabled(_UI_UNCHECKED)
+        opts_row.addWidget(self.btn_start)
+        opts_row.addWidget(self.btn_cancel)
+        layout.addLayout(opts_row)
+
+        # * Burn-in row
+        burn_row = QHBoxLayout()
+        self.btn_burn = QPushButton("Burn")
+        self.chk_normalize = QCheckBox("Normalization")
+        self.chk_normalize.setChecked(_UI_CHECKED)
+        burn_row.addWidget(self.btn_burn)
+        burn_row.addWidget(self.chk_normalize)
+        burn_row.addWidget(QLabel("Font:"))
+        self.font_combo = QComboBox()
+        try:
+            families = QFontDatabase.families()
+            self.font_combo.addItems(families)
+            idx = self.font_combo.findText("Open Sans")
+            if idx >= 0:
+                self.font_combo.setCurrentIndex(idx)
+            else:
+                idx2 = self.font_combo.findText("Arial")
+                if idx2 >= 0:
+                    self.font_combo.setCurrentIndex(idx2)
+            # Enable type-to-filter with popup completer
+            self.font_combo.setEditable(_UI_CHECKED)
+            completer = QCompleter(self.font_combo.model(), self.font_combo)
+            completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+            completer.setFilterMode(Qt.MatchFlag.MatchContains)
+            completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+            self.font_combo.setCompleter(completer)
+        except Exception as exc:  # noqa: BLE001
+            get_logger(__name__).debug("Font families enumeration failed: %s", exc)
+        burn_row.addWidget(self.font_combo)
+        burn_row.addStretch(1)
+        layout.addLayout(burn_row)
 
         # * Speaker sidebar + tabbed viewers
         splitter = QSplitter()
@@ -161,6 +195,9 @@ class MainWindow(QMainWindow):
         self.last_output_dir: Path = Path(self.out_dir_edit.text()).resolve()
         self._thread: QThread | None = None
         self._worker: PipelineWorker | None = None
+        self._burn_thread: QThread | None = None
+        self._burn_worker: BurnWorker | None = None
+        self._has_transcript: bool = False
 
         # * Wire up signals
         self.btn_choose_file.clicked.connect(
@@ -177,13 +214,16 @@ class MainWindow(QMainWindow):
         self.btn_open_out.clicked.connect(
             self._log_wrap(self.open_output_folder, "Open Output Folder")
         )
-        self.btn_quick_srt.clicked.connect(
-            self._log_wrap(self.generate_srt_quick, "Generate SRT")
-        )
+        self.btn_burn.clicked.connect(self._log_wrap(self.start_burn, "Burn"))
 
         # * Ensure at least one empty tab is visible
         self._clear_tabs()
         self._add_tab("Document", "")
+
+        # * Load persisted settings
+        self._load_settings()
+        # Burn is disabled until transcript exists
+        self.btn_burn.setEnabled(_UI_UNCHECKED)
 
     def choose_file(self) -> None:
         """Choose a single media file for processing."""
@@ -232,11 +272,14 @@ class MainWindow(QMainWindow):
         self.out_dir_edit.setEnabled(enabled)
         self.chk_diar.setEnabled(enabled)
         self.chk_dialog.setEnabled(enabled)
-        self.chk_burn.setEnabled(enabled)
         self.chk_save_srt.setEnabled(enabled)
         self.format_combo.setEnabled(enabled)
         self.btn_start.setEnabled(enabled)
         self.btn_cancel.setEnabled(not enabled)
+        if self._burn_worker is None:
+            self.btn_burn.setEnabled(enabled)
+            self.chk_normalize.setEnabled(enabled)
+            self.font_combo.setEnabled(enabled)
 
     def start_processing(self) -> None:
         """Start pipeline processing in a background thread (QThread)."""
@@ -272,14 +315,16 @@ class MainWindow(QMainWindow):
             "enable_dialog_blocks": self.chk_dialog.isChecked(),
             "export_format": str(self.format_combo.currentText()),
             "single_view": self.input_mode == "file",
-            "burn_in": self.chk_burn.isChecked(),
             "save_srt": self.chk_save_srt.isChecked(),
         }
 
         # Spin up worker and thread
-        self._set_controls_enabled(False)  # noqa: FBT003
+        self._set_controls_enabled(enabled=False)
         self.progress.setValue(0)
         self.status.showMessage("Processing…")
+        # Reset transcript availability
+        self._has_transcript = False
+        self.btn_burn.setEnabled(_UI_UNCHECKED)
         # Ensure previous thread is fully stopped before creating new one
         if self._thread is not None:
             try:
@@ -312,7 +357,9 @@ class MainWindow(QMainWindow):
         if self._worker is not None:
             self._worker.request_cancel()
             self.status.showMessage("Cancel requested…")
-            self.btn_cancel.setEnabled(False)
+            self.btn_cancel.setEnabled(_UI_UNCHECKED)
+        if self._burn_worker is not None:
+            self._burn_worker.request_cancel()
 
     def on_progress(self, frac: float, msg: str) -> None:
         """Update progress bar and status message."""
@@ -325,14 +372,16 @@ class MainWindow(QMainWindow):
         # Minimal Phase 1.7: surface critical warnings in GUI
         if not line:
             return
-        if ("Burn-in failed" in line or "SRT export failed" in line) and self._can_show_modal():
+        if (
+            "Burn-in failed" in line or "SRT export failed" in line
+        ) and self._can_show_modal():
             QMessageBox.warning(self, "Processing warning", line)
         # Update status with last log line for visibility
         self.status.showMessage(line)
 
     def on_error(self, message: str) -> None:
         """Handle processing error."""
-        self._set_controls_enabled(True)  # noqa: FBT003
+        self._set_controls_enabled(enabled=True)
         self.progress.setValue(0)
         if self._can_show_modal():
             QMessageBox.critical(self, "Processing error", message)
@@ -340,13 +389,13 @@ class MainWindow(QMainWindow):
 
     def on_canceled(self) -> None:
         """Handle processing cancellation."""
-        self._set_controls_enabled(True)  # noqa: FBT003
+        self._set_controls_enabled(enabled=True)
         self.progress.setValue(0)
         self.status.showMessage("Canceled")
 
     def on_finished(self, _outputs: list[str], view_text: str) -> None:
         """Handle processing completion."""
-        self._set_controls_enabled(True)  # noqa: FBT003
+        self._set_controls_enabled(enabled=True)
         self.progress.setValue(100)
         self._clear_tabs()
         try:
@@ -368,7 +417,13 @@ class MainWindow(QMainWindow):
         self.status.showMessage("Done")
         # Explicit success toast (skip under pytest/CI)
         if self._can_show_modal():
-            QMessageBox.information(self, "Completed", "Processing finished successfully.")
+            QMessageBox.information(
+                self, "Completed", "Processing finished successfully."
+            )
+        # Enable burn if transcript artifacts exist
+        srt_exists = any(Path(x).suffix.lower() == ".srt" for x in _outputs)
+        self._has_transcript = bool(view_text.strip()) or srt_exists or bool(_outputs)
+        self.btn_burn.setEnabled(self._has_transcript)
 
     def open_output_folder(self) -> None:
         """Open the output directory in the system file manager."""
@@ -381,13 +436,116 @@ class MainWindow(QMainWindow):
 
         return _wrapped
 
-    def generate_srt_quick(self) -> None:
-        """Quick action: set format to SRT and start processing with current toggles."""
-        idx = self.format_combo.findText("srt")
+    def start_burn(self) -> None:
+        """Start burn-in process for selected inputs using burn settings."""
+        if not self.input_path or self.input_mode not in {"file", "folder"}:
+            QMessageBox.information(self, "No input", "Please choose a file or folder.")
+            return
+        if not self._has_transcript:
+            QMessageBox.information(self, "No transcript", "Please transcribe first.")
+            return
+        out_dir = Path(self.out_dir_edit.text()).resolve()
+        normalize = self.chk_normalize.isChecked()
+        font_name = self.font_combo.currentText().strip() or None
+        # Build inputs list (videos only)
+        if self.input_mode == "file":
+            inputs = (
+                [self.input_path]
+                if self.input_path.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}
+                else []
+            )
+        else:
+            patterns = ["*.mp4", "*.mov", "*.mkv", "*.avi"]
+            inputs = []
+            for pat in patterns:
+                inputs.extend(Path(self.input_path).glob(pat))
+        if not inputs:
+            QMessageBox.information(self, "No video", "No video files found to burn.")
+            return
+        # Start burn worker thread
+        if self._burn_thread is not None:
+            try:
+                self._burn_thread.quit()
+                self._burn_thread.wait(2000)
+            except Exception as exc:  # noqa: BLE001
+                get_logger(__name__).debug("Thread cleanup issue: %s", exc)
+            self._burn_thread = None
+        self._burn_thread = QThread(self)
+        self._burn_worker = BurnWorker(
+            inputs, out_dir, normalize=normalize, font_name=font_name
+        )
+        self._burn_worker.moveToThread(self._burn_thread)
+        self._burn_thread.started.connect(self._burn_worker.run)
+        self._burn_worker.progress.connect(self.on_progress)
+        self._burn_worker.log.connect(self.on_log)
+        self._burn_worker.error.connect(self.on_error)
+        self._burn_worker.canceled.connect(self.on_canceled)
+        self._burn_worker.finished.connect(lambda _o: self._on_burn_finished())
+        self._burn_worker.finished.connect(self._burn_thread.quit)
+        self._burn_worker.finished.connect(self._burn_worker.deleteLater)
+        self._burn_thread.finished.connect(self._burn_thread.deleteLater)
+        # Disable burn controls while running and enable global Cancel
+        _disable = False
+        _enable = True
+        self.btn_burn.setEnabled(_disable)
+        self.chk_normalize.setEnabled(_disable)
+        self.font_combo.setEnabled(_disable)
+        self.btn_cancel.setEnabled(_enable)
+        self.status.showMessage("Burning…")
+        self._burn_thread.start()
+
+    def _on_burn_finished(self) -> None:
+        self.btn_burn.setEnabled(_UI_CHECKED)
+        self.chk_normalize.setEnabled(_UI_CHECKED)
+        self.font_combo.setEnabled(_UI_CHECKED)
+        self.status.showMessage("Burn completed")
+
+    def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
+        """Ensure we cancel background tasks and persist settings on close."""
+        with contextlib.suppress(Exception):
+            self._save_settings()
+        # Trigger global cancel
+        with contextlib.suppress(Exception):
+            self.request_cancel()
+            # Give threads time to stop
+            if self._thread is not None and self._thread.isRunning():
+                self._thread.quit()
+                self._thread.wait(2000)
+            if self._burn_thread is not None and self._burn_thread.isRunning():
+                self._burn_thread.quit()
+                self._burn_thread.wait(2000)
+        event.accept()
+
+    # * Settings persistence
+    def _load_settings(self) -> None:
+        s = QSettings("Artemonim", "SpeechKit")
+        self.chk_diar.setChecked(bool(s.value("opts/diar", type=bool)))
+        self.chk_dialog.setChecked(bool(s.value("opts/dialog", type=bool)))
+        self.chk_save_srt.setChecked(bool(s.value("opts/save_srt", 1, type=bool)))
+        fmt = str(s.value("opts/format", "srt"))
+        idx = self.format_combo.findText(fmt)
         if idx >= 0:
             self.format_combo.setCurrentIndex(idx)
-        # Ensure defaults: save SRT always; burn per checkbox
-        self.start_processing()
+        out_dir = str(s.value("paths/out_dir", self.out_dir_edit.text()))
+        if out_dir:
+            self.out_dir_edit.setText(out_dir)
+            self.last_output_dir = Path(out_dir)
+        self.chk_normalize.setChecked(bool(s.value("burn/normalize", 1, type=bool)))
+        font = str(s.value("burn/font", ""))
+        if font:
+            fidx = self.font_combo.findText(font)
+            if fidx >= 0:
+                self.font_combo.setCurrentIndex(fidx)
+
+    def _save_settings(self) -> None:
+        s = QSettings("Artemonim", "SpeechKit")
+        s.setValue("opts/diar", self.chk_diar.isChecked())
+        s.setValue("opts/dialog", self.chk_dialog.isChecked())
+        s.setValue("opts/save_srt", self.chk_save_srt.isChecked())
+        s.setValue("opts/format", self.format_combo.currentText())
+        s.setValue("paths/out_dir", self.out_dir_edit.text())
+        s.setValue("burn/normalize", self.chk_normalize.isChecked())
+        s.setValue("burn/font", self.font_combo.currentText())
 
     # * Tabs helpers
     def _clear_tabs(self) -> None:
@@ -399,7 +557,7 @@ class MainWindow(QMainWindow):
         # Parse plain text into table rows: "[hh:mm:ss.mmm --> hh:mm:ss.mmm] speaker: text"
         # Regex for leading time range
         time_pat = re.compile(
-            r"^(\d\d:\d\d:\d\d\.\d\d\d)\s*[→\-\>]\s*(\d\d:\d\d:\d\d\.\d\d\d)"
+            r"^(\d\d:\d\d:\d\d[,.]\d{3})\s*(?:-->|→|-+>?)\s*(\d\d:\d\d:\d\d[,.]\d{3})"
         )
         rows: list[tuple[float, float, str, str]] = []
         for block in [x for x in (text or "").split("\n\n") if x.strip()]:
@@ -407,18 +565,24 @@ class MainWindow(QMainWindow):
             end = 0.0
             speaker = "speaker_1"
             content = block.strip()
-            # Try time range at start
-            m = time_pat.match(content)
+            lines = content.splitlines()
+            m = time_pat.match(lines[0]) if lines else None
+            second_line_index = 2  # * Index of the second line in block
+            text_start_idx = 1
+            if not m and len(lines) >= second_line_index:
+                m = time_pat.match(lines[1])
+                text_start_idx = second_line_index if m else 0
             if m:
 
                 def parse_time(s: str) -> float:
-                    h, m, rest = s.split(":")
-                    s2, ms = rest.split(".")
-                    return int(h) * 3600 + int(m) * 60 + int(s2) + int(ms) / 1000.0
+                    s2 = s.replace(",", ".")
+                    h, m2, rest = s2.split(":")
+                    s3, ms = rest.split(".")
+                    return int(h) * 3600 + int(m2) * 60 + int(s3) + int(ms) / 1000.0
 
                 start = parse_time(m.group(1))
                 end = parse_time(m.group(2))
-                content = content[m.end() :].strip()
+                content = "\n".join(lines[text_start_idx:]).strip()
             # Try speaker prefix
             if ":" in content and content.split(":", 1)[0].strip():
                 sp, txt = content.split(":", 1)
@@ -502,13 +666,15 @@ class PipelineWorker(QObject):
                 try:
                     doc = self._pipeline.process(media, self._out_dir, progress=cb)
                 except CancelledByUserError:
+                    # Best-effort cleanup of intermediate audio
+                    cleanup_intermediate_audio(media, self._out_dir)
                     self.canceled.emit()
                     return
                 fmt = str(self._opts.get("export_format", "txt"))
                 out_primary = self._export_primary(doc, media, fmt)
                 outputs.append(str(out_primary))
-                srt_path = self._maybe_export_srt(doc, media, fmt, outputs)
-                self._maybe_burn(media, srt_path, idx, total, prefix, outputs)
+                self._maybe_export_srt(doc, media, fmt, outputs)
+                # Burn removed from pipeline; handled by separate BurnWorker
                 if bool(self._opts.get("single_view", False)):
                     view_text = doc.get_full_text()
                 self._report(prefix + "Exported", min(0.99, (idx + 1) / total))
@@ -540,6 +706,9 @@ class PipelineWorker(QObject):
         )
 
     def _export_primary(self, doc: Any, media: Path, fmt: str) -> Path:  # noqa: ANN401
+        if fmt.lower() == "none":
+            # Skip exporting any primary text artifact
+            return self._out_dir / f"{media.stem}.skip"
         out_path = self._out_dir / f"{media.stem}.{fmt}"
         return export_document(doc, fmt, out_path)
 
@@ -552,7 +721,11 @@ class PipelineWorker(QObject):
     ) -> Path:
         srt_path = self._out_dir / f"{media.stem}.srt"
         save_srt = bool(self._opts.get("save_srt", True))
-        need_srt = (fmt.lower() != "srt" and save_srt) or (fmt.lower() == "srt")
+        # When fmt is 'none', use only the save_srt switch
+        if fmt.lower() == "none":
+            need_srt = save_srt
+        else:
+            need_srt = (fmt.lower() != "srt" and save_srt) or (fmt.lower() == "srt")
         if need_srt:
             try:
                 export_document(doc, "srt", srt_path)
@@ -562,40 +735,167 @@ class PipelineWorker(QObject):
                 self.log.emit(f"SRT export failed: {ex}")
         return srt_path
 
-    def _maybe_burn(
+
+class BurnWorker(QObject):
+    """Background worker for cancellable ffmpeg burn-in operations."""
+
+    progress = Signal(float, str)
+    log = Signal(str)
+    error = Signal(str)
+    canceled = Signal()
+    finished = Signal(list)  # output video paths
+
+    def __init__(
         self,
-        media: Path,
-        srt_path: Path,
-        idx: int,
-        total: int,
-        prefix: str,
-        outputs: list[str],
+        inputs: list[Path],
+        out_dir: Path,
+        *,
+        normalize: bool,
+        font_name: str | None,
     ) -> None:
-        burn = bool(self._opts.get("burn_in", True))
-        if (
-            burn
-            and srt_path.exists()
-            and media.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}
-        ):
-            burned_out = self._out_dir / f"{media.stem}_subbed.mp4"
+        super().__init__()
+        self._inputs = inputs
+        self._out_dir = out_dir
+        self._normalize = normalize
+        self._font_name = font_name
+        self._cancel = False
+        self._proc: Popen[bytes] | None = None
+        self._progress_file: Path | None = None
+
+    def request_cancel(self) -> None:
+        """Signal cancellation and attempt to terminate ffmpeg process."""
+        self._cancel = True
+        proc = self._proc
+        if proc is not None:
             try:
-                self._report(
-                    prefix + "Burning subtitles", min(0.99, (idx + 0.95) / total)
+                proc.terminate()
+            except OSError as exc:
+                get_logger(__name__).debug("Burn process terminate failed: %s", exc)
+
+    def _parse_progress(self) -> float:
+        """Parse ffmpeg -progress file; return out_time_ms if found else -1."""
+        pf = self._progress_file
+        if pf is None or not pf.exists():
+            return -1.0
+        try:
+            last = -1.0
+            for line in pf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if line.startswith("out_time_ms="):
+                    val = float(line.split("=", 1)[1])
+                    last = val
+            return last
+        except Exception:  # noqa: BLE001
+            return -1.0
+
+    def _wait_until_finished(
+        self,
+        proc: Popen[bytes],
+        *,
+        base_frac: float,
+        end_frac: float,
+        prefix: str,
+        total_duration_s: float,
+    ) -> int:
+        """Poll process until it finishes or cancellation is requested.
+
+        Computes progress from ffmpeg progress file if available, else interpolates.
+        Returns process return code; returns -1 when canceled.
+        """
+        burn_progress_cap = 0.995
+        poll_sleep_s = 0.25
+        shown = base_frac
+        while True:
+            if self._cancel:
+                with contextlib.suppress(OSError):
+                    proc.terminate()
+                return -1
+            ret = proc.poll()
+            if ret is not None:
+                return ret
+            # Real progress if possible
+            p_ms = self._parse_progress()
+            if p_ms >= 0 and total_duration_s > 0:
+                ratio = min(1.0, (p_ms / 1000.0) / total_duration_s)
+                shown = min(
+                    burn_progress_cap, base_frac + ratio * (end_frac - base_frac)
                 )
-                burn_subtitles(media, srt_path, burned_out)
-                outputs.append(str(burned_out))
-                self.log.emit(f"Burn-in succeeded: {burned_out}")
-                # Try cleanup of intermediate WAV created in _work
-                try:
-                    work_dir = self._out_dir / "_work"
-                    wav = work_dir / f"{media.stem}.wav"
-                    if wav.exists():
-                        wav.unlink()
-                except OSError:
-                    # Not critical; leave file if we cannot delete
-                    self.log.emit("Cleanup of intermediate WAV failed")
-            except Exception as ex:  # noqa: BLE001
-                self.log.emit(f"Burn-in failed: {ex}")
+            else:
+                # Interpolate progress towards cap
+                target = min(
+                    burn_progress_cap, end_frac - (end_frac - base_frac) * 0.02
+                )
+                shown = min(target, shown + 0.02)
+            self.progress.emit(shown, prefix + "Burning subtitles")
+            time.sleep(poll_sleep_s)
+
+    def run(self) -> None:  # noqa: C901
+        """Run burn-in sequentially for all inputs; supports cooperative cancel."""
+        try:
+            outputs: list[str] = []
+            total = max(1, len(self._inputs))
+            for idx, media in enumerate(self._inputs):
+                if self._cancel:
+                    self.canceled.emit()
+                    return
+                prefix = f"[{idx + 1}/{total}] " if total > 1 else ""
+                # Expect SRT with same stem in out_dir
+                srt_path = self._out_dir / f"{media.stem}.srt"
+                if not srt_path.exists():
+                    self.log.emit(f"SRT not found for burn: {srt_path}")
+                    continue
+                burned_out = self._out_dir / f"{media.stem}_subbed.mp4"
+                # Setup ffmpeg progress file and probe duration
+                prog_file = self._out_dir / f".{media.stem}.ffprogress"
+                with contextlib.suppress(Exception):
+                    if prog_file.exists():
+                        prog_file.unlink()
+                self._progress_file = prog_file
+                # Initial progress bump
+                self.progress.emit((idx + 0.1) / total, prefix + "Burning subtitles")
+                proc = start_burn_process(
+                    media,
+                    srt_path,
+                    burned_out,
+                    normalize_audio=self._normalize,
+                    font_name=self._font_name,
+                    progress_path=prog_file,
+                )
+                self._proc = proc
+                base = idx / total
+                end = (idx + 1) / total
+                # Total video duration for precise progress
+                duration_s = get_media_duration_seconds(media)
+                ret = self._wait_until_finished(
+                    proc,
+                    base_frac=base,
+                    end_frac=end,
+                    prefix=prefix,
+                    total_duration_s=duration_s,
+                )
+                if ret == -1:
+                    # Canceled: remove partial file
+                    with contextlib.suppress(OSError):
+                        if burned_out.exists():
+                            burned_out.unlink()
+                    with contextlib.suppress(OSError):
+                        if prog_file.exists():
+                            prog_file.unlink()
+                    self.canceled.emit()
+                    return
+                if ret != 0:
+                    self.log.emit("Burn-in failed")
+                    with contextlib.suppress(OSError):
+                        if burned_out.exists():
+                            burned_out.unlink()
+                    with contextlib.suppress(OSError):
+                        if prog_file.exists():
+                            prog_file.unlink()
+                else:
+                    outputs.append(str(burned_out))
+                self.progress.emit((idx + 1) / total, prefix + "Burned")
+            self.finished.emit(outputs)
+        except Exception as e:  # noqa: BLE001
+            self.error.emit(str(e))
 
 
 # * Entry point for GUI application
