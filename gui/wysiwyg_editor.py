@@ -77,8 +77,8 @@ class WysiwygEditor(QTableWidget):
         self.setItem(idx, 0, QTableWidgetItem(time_str))
         # Speaker cell as combobox
         speaker_combo = QComboBox()
-        # Use keyword to avoid boolean-positional lint complaint
-        speaker_combo.setEditable(editable=True)  # type: ignore[call-arg]
+        # Enable custom speaker entry
+        speaker_combo.setEditable(True)
         speaker_combo.addItems(self._speakers)
         current = (
             row.speaker_id if row.speaker_id in self._speakers else self._speakers[0]

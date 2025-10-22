@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -28,7 +30,7 @@ from PySide6.QtWidgets import (
 from core.ffmpeg import burn_subtitles
 from core.pipelines import LocalPipeline
 from gui.speaker_sidebar import SpeakerSidebar
-from gui.wysiwyg_editor import WysiwygEditor
+from gui.wysiwyg_editor import TableRow, WysiwygEditor
 from utils.exporters import export_document
 from utils.logging import get_logger
 
@@ -43,6 +45,16 @@ class CancelledByUserError(Exception):
 # * Main window for Artemonim's Speech Kit GUI
 class MainWindow(QMainWindow):
     """Application main window with Quick Transcribe controls and text viewer."""
+
+    # * Constants
+    MAX_SPEAKER_LEN = 64
+
+    def _can_show_modal(self) -> bool:
+        """Return True if it is safe to show modal dialogs (not under pytest/CI)."""
+        if os.getenv("PYTEST_CURRENT_TEST") is not None:
+            return False
+        suppress = os.getenv("SK_SUPPRESS_DIALOGS", "").lower()
+        return suppress not in {"1", "true", "yes"}
 
     def __init__(self) -> None:  # noqa: PLR0915
         super().__init__()
@@ -310,15 +322,20 @@ class MainWindow(QMainWindow):
 
     def on_log(self, line: str) -> None:
         """Handle log message from worker (currently unused)."""
-        # Append to editor bottom as lightweight log when not in view mode
-        # Keep existing text and add a separator for logs
-        # Minimal Phase 1.7: status bar + progress only
+        # Minimal Phase 1.7: surface critical warnings in GUI
+        if not line:
+            return
+        if ("Burn-in failed" in line or "SRT export failed" in line) and self._can_show_modal():
+            QMessageBox.warning(self, "Processing warning", line)
+        # Update status with last log line for visibility
+        self.status.showMessage(line)
 
     def on_error(self, message: str) -> None:
         """Handle processing error."""
         self._set_controls_enabled(True)  # noqa: FBT003
         self.progress.setValue(0)
-        QMessageBox.critical(self, "Processing error", message)
+        if self._can_show_modal():
+            QMessageBox.critical(self, "Processing error", message)
         self.status.showMessage("Error")
 
     def on_canceled(self) -> None:
@@ -332,18 +349,26 @@ class MainWindow(QMainWindow):
         self._set_controls_enabled(True)  # noqa: FBT003
         self.progress.setValue(100)
         self._clear_tabs()
-        if view_text:
-            self._add_tab("Document", view_text)
-        else:
-            # * Populate one tab per output artifact (show raw text for any format)
-            for out_str in _outputs:
-                try:
-                    p = Path(out_str)
-                    content = p.read_text(encoding="utf-8")
-                except OSError:
-                    content = ""
-                self._add_tab(p.stem, content)
+        try:
+            if view_text:
+                self._add_tab("Document", view_text)
+            else:
+                # * Populate one tab per output artifact (show raw text for any format)
+                for out_str in _outputs:
+                    try:
+                        p = Path(out_str)
+                        content = p.read_text(encoding="utf-8")
+                    except OSError:
+                        content = ""
+                    self._add_tab(p.stem, content)
+        except Exception as ex:  # noqa: BLE001
+            # Surface UI error if tab rendering fails
+            if self._can_show_modal():
+                QMessageBox.warning(self, "Viewer error", f"Cannot show results: {ex}")
         self.status.showMessage("Done")
+        # Explicit success toast (skip under pytest/CI)
+        if self._can_show_modal():
+            QMessageBox.information(self, "Completed", "Processing finished successfully.")
 
     def open_output_folder(self) -> None:
         """Open the output directory in the system file manager."""
@@ -373,8 +398,6 @@ class MainWindow(QMainWindow):
         editor = WysiwygEditor()
         # Parse plain text into table rows: "[hh:mm:ss.mmm --> hh:mm:ss.mmm] speaker: text"
         # Regex for leading time range
-        import re
-
         time_pat = re.compile(
             r"^(\d\d:\d\d:\d\d\.\d\d\d)\s*[→\-\>]\s*(\d\d:\d\d:\d\d\.\d\d\d)"
         )
@@ -400,16 +423,13 @@ class MainWindow(QMainWindow):
             if ":" in content and content.split(":", 1)[0].strip():
                 sp, txt = content.split(":", 1)
                 candidate = sp.strip()
-                if 1 <= len(candidate) <= 64:
+                if 1 <= len(candidate) <= self.MAX_SPEAKER_LEN:
                     speaker = candidate
                     content = txt.strip()
             rows.append((start, end, speaker, content))
         # Feed speakers and rows
         self.sidebar.set_speakers(list({r[2] for r in rows} or {"speaker_1"}))
         editor.set_speakers(self.sidebar.get_speakers())
-        # Import kept local to avoid circular dependency at module import time
-        from gui.wysiwyg_editor import TableRow  # type: ignore[import-not-found]
-
         editor.set_rows(
             [TableRow(start=s, end=e, speaker_id=sp, text=tx) for s, e, sp, tx in rows]
         )
@@ -493,6 +513,7 @@ class PipelineWorker(QObject):
                     view_text = doc.get_full_text()
                 self._report(prefix + "Exported", min(0.99, (idx + 1) / total))
             self._report("Completed", 1.0)
+            self.log.emit("Processing completed successfully")
             self.finished.emit(outputs, view_text)
         except Exception as e:  # noqa: BLE001
             self.error.emit(str(e))
@@ -563,6 +584,7 @@ class PipelineWorker(QObject):
                 )
                 burn_subtitles(media, srt_path, burned_out)
                 outputs.append(str(burned_out))
+                self.log.emit(f"Burn-in succeeded: {burned_out}")
                 # Try cleanup of intermediate WAV created in _work
                 try:
                     work_dir = self._out_dir / "_work"
