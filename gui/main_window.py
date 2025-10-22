@@ -777,15 +777,15 @@ class BurnWorker(QObject):
         pf = self._progress_file
         if pf is None or not pf.exists():
             return -1.0
+        last = -1.0
         try:
-            last = -1.0
             for line in pf.read_text(encoding="utf-8", errors="ignore").splitlines():
                 if line.startswith("out_time_ms="):
                     val = float(line.split("=", 1)[1])
                     last = val
-            return last
         except Exception:  # noqa: BLE001
-            return -1.0
+            last = -1.0
+        return last
 
     def _wait_until_finished(
         self,
