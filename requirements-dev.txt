@@ -44,7 +44,5 @@ ffmpeg-python>=0.2.0        # * FFmpeg wrapper for audio/video
 # llama-cpp-python>=0.1.104   # * Local LLM inference (Mistral GGUF) - will be added in Phase 2
 
 # ! Torch for GPU operations with CUDA support (Windows)
-# * Install specific CUDA version: torch with CUDA 12.1 support
-# * For other CUDA versions or platforms, visit: https://pytorch.org/get-started/locally/
-torch>=2.0.0,<2.2.0            # * PyTorch for GPU management (CUDA-enabled)
---index-url https://download.pytorch.org/whl/cu121  # * PyTorch CUDA 12.1 wheels repository 
+# * Security: require a fixed torch version; CUDA wheel selection is handled by tooling
+torch>=2.8.0                   # * PyTorch (use run/build scripts to pick CUDA wheels)
