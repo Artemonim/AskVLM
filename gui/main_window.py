@@ -18,14 +18,19 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSplitter,
     QStatusBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from core.ffmpeg import burn_subtitles
 from core.pipelines import LocalPipeline
+from gui.speaker_sidebar import SpeakerSidebar
 from gui.wysiwyg_editor import WysiwygEditor
 from utils.exporters import export_document
+from utils.logging import get_logger
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -87,32 +92,45 @@ class MainWindow(QMainWindow):
         self.chk_diar.setChecked(False)
         self.chk_dialog = QCheckBox("Dialog blocks")
         self.chk_dialog.setChecked(False)
+        self.chk_burn = QCheckBox("Burn-in subtitles")
+        self.chk_burn.setChecked(True)
+        self.chk_save_srt = QCheckBox("Also save .srt")
+        self.chk_save_srt.setChecked(True)
         opts_row.addWidget(self.chk_diar)
         opts_row.addWidget(self.chk_dialog)
+        opts_row.addWidget(self.chk_burn)
+        opts_row.addWidget(self.chk_save_srt)
         opts_row.addWidget(QLabel("Format:"))
         self.format_combo = QComboBox()
         self.format_combo.addItems(["txt", "srt", "vtt", "json"])
-        self.format_combo.setCurrentText("txt")
+        self.format_combo.setCurrentText("srt")
         opts_row.addWidget(self.format_combo)
         opts_row.addStretch(1)
         layout.addLayout(opts_row)
 
         # * Action buttons row
         actions_row = QHBoxLayout()
+        self.btn_quick_srt = QPushButton("Generate SRT")
         self.btn_start = QPushButton("Start")
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setEnabled(False)
         self.btn_open_out = QPushButton("Open Output Folder")
+        actions_row.addWidget(self.btn_quick_srt)
         actions_row.addWidget(self.btn_start)
         actions_row.addWidget(self.btn_cancel)
         actions_row.addStretch(1)
         actions_row.addWidget(self.btn_open_out)
         layout.addLayout(actions_row)
 
-        # * Text viewer
-        self.editor = WysiwygEditor()
-        self.editor.setReadOnly(True)
-        layout.addWidget(self.editor, 1)
+        # * Speaker sidebar + tabbed viewers
+        splitter = QSplitter()
+        self.sidebar = SpeakerSidebar()
+        splitter.addWidget(self.sidebar)
+        self.tabs = QTabWidget()
+        splitter.addWidget(self.tabs)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter, 1)
 
         # * Status bar with progress
         self.status = QStatusBar()
@@ -147,6 +165,13 @@ class MainWindow(QMainWindow):
         self.btn_open_out.clicked.connect(
             self._log_wrap(self.open_output_folder, "Open Output Folder")
         )
+        self.btn_quick_srt.clicked.connect(
+            self._log_wrap(self.generate_srt_quick, "Generate SRT")
+        )
+
+        # * Ensure at least one empty tab is visible
+        self._clear_tabs()
+        self._add_tab("Document", "")
 
     def choose_file(self) -> None:
         """Choose a single media file for processing."""
@@ -195,6 +220,8 @@ class MainWindow(QMainWindow):
         self.out_dir_edit.setEnabled(enabled)
         self.chk_diar.setEnabled(enabled)
         self.chk_dialog.setEnabled(enabled)
+        self.chk_burn.setEnabled(enabled)
+        self.chk_save_srt.setEnabled(enabled)
         self.format_combo.setEnabled(enabled)
         self.btn_start.setEnabled(enabled)
         self.btn_cancel.setEnabled(not enabled)
@@ -233,6 +260,8 @@ class MainWindow(QMainWindow):
             "enable_dialog_blocks": self.chk_dialog.isChecked(),
             "export_format": str(self.format_combo.currentText()),
             "single_view": self.input_mode == "file",
+            "burn_in": self.chk_burn.isChecked(),
+            "save_srt": self.chk_save_srt.isChecked(),
         }
 
         # Spin up worker and thread
@@ -244,8 +273,9 @@ class MainWindow(QMainWindow):
             try:
                 self._thread.quit()
                 self._thread.wait(2000)
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:  # noqa: BLE001
+                # * Best-effort cleanup; log for diagnostics
+                get_logger(__name__).debug("Thread cleanup issue: %s", exc)
             self._thread = None
         self._thread = QThread(self)
         self._worker = PipelineWorker(self.pipeline, inputs, out_dir, opts)
@@ -301,8 +331,18 @@ class MainWindow(QMainWindow):
         """Handle processing completion."""
         self._set_controls_enabled(True)  # noqa: FBT003
         self.progress.setValue(100)
+        self._clear_tabs()
         if view_text:
-            self.editor.setPlainText(view_text)
+            self._add_tab("Document", view_text)
+        else:
+            # * Populate one tab per output artifact (show raw text for any format)
+            for out_str in _outputs:
+                try:
+                    p = Path(out_str)
+                    content = p.read_text(encoding="utf-8")
+                except OSError:
+                    content = ""
+                self._add_tab(p.stem, content)
         self.status.showMessage("Done")
 
     def open_output_folder(self) -> None:
@@ -311,10 +351,88 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(out_dir)))
 
     def _log_wrap(self, func: Callable[..., Any], _name: str) -> Callable[..., Any]:
-        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        def _wrapped(*args: object, **kwargs: object) -> object:
             return func(*args, **kwargs)
 
         return _wrapped
+
+    def generate_srt_quick(self) -> None:
+        """Quick action: set format to SRT and start processing with current toggles."""
+        idx = self.format_combo.findText("srt")
+        if idx >= 0:
+            self.format_combo.setCurrentIndex(idx)
+        # Ensure defaults: save SRT always; burn per checkbox
+        self.start_processing()
+
+    # * Tabs helpers
+    def _clear_tabs(self) -> None:
+        while self.tabs.count() > 0:
+            self.tabs.removeTab(0)
+
+    def _add_tab(self, title: str, text: str) -> None:
+        editor = WysiwygEditor()
+        # Parse plain text into table rows: "[hh:mm:ss.mmm --> hh:mm:ss.mmm] speaker: text"
+        # Regex for leading time range
+        import re
+
+        time_pat = re.compile(
+            r"^(\d\d:\d\d:\d\d\.\d\d\d)\s*[→\-\>]\s*(\d\d:\d\d:\d\d\.\d\d\d)"
+        )
+        rows: list[tuple[float, float, str, str]] = []
+        for block in [x for x in (text or "").split("\n\n") if x.strip()]:
+            start = 0.0
+            end = 0.0
+            speaker = "speaker_1"
+            content = block.strip()
+            # Try time range at start
+            m = time_pat.match(content)
+            if m:
+
+                def parse_time(s: str) -> float:
+                    h, m, rest = s.split(":")
+                    s2, ms = rest.split(".")
+                    return int(h) * 3600 + int(m) * 60 + int(s2) + int(ms) / 1000.0
+
+                start = parse_time(m.group(1))
+                end = parse_time(m.group(2))
+                content = content[m.end() :].strip()
+            # Try speaker prefix
+            if ":" in content and content.split(":", 1)[0].strip():
+                sp, txt = content.split(":", 1)
+                candidate = sp.strip()
+                if 1 <= len(candidate) <= 64:
+                    speaker = candidate
+                    content = txt.strip()
+            rows.append((start, end, speaker, content))
+        # Feed speakers and rows
+        self.sidebar.set_speakers(list({r[2] for r in rows} or {"speaker_1"}))
+        editor.set_speakers(self.sidebar.get_speakers())
+        # Import kept local to avoid circular dependency at module import time
+        from gui.wysiwyg_editor import TableRow  # type: ignore[import-not-found]
+
+        editor.set_rows(
+            [TableRow(start=s, end=e, speaker_id=sp, text=tx) for s, e, sp, tx in rows]
+        )
+        # Fixed row height for two lines
+        fm_height = editor.fontMetrics().height()
+        # Avoid magic number warning by naming the padding constant
+        padding_px = 6
+        two_line_height = fm_height * 2 + padding_px
+        for r in range(editor.rowCount()):
+            editor.setRowHeight(r, two_line_height)
+        # Hide speaker column if all speakers are default and diarization disabled
+        hide_speaker = all(sp == "speaker_1" for _, _, sp, _ in rows)
+        editor.setColumnHidden(1, hide_speaker)
+        # Update stats
+        for _, _, sp, _ in rows:
+            self.sidebar.record_usage(title, sp)
+        self.tabs.addTab(editor, title)
+
+    # * Testing helpers
+    def get_editor_at(self, index: int) -> WysiwygEditor | None:
+        """Return the tab editor at the given index or None if not present."""
+        w = self.tabs.widget(index)
+        return w if isinstance(w, WysiwygEditor) else None
 
 
 class PipelineWorker(QObject):
@@ -359,33 +477,18 @@ class PipelineWorker(QObject):
                     self.canceled.emit()
                     return
                 prefix = f"[{idx + 1}/{total}] " if total > 1 else ""
-
-                def cb(
-                    msg: str, f: float, base: float = idx / total, prefix: str = prefix
-                ) -> None:
-                    # Scale progress across files
-                    self._report(prefix + msg, min(0.99, base + f / total))
-                    if self._cancel:
-                        # Interrupt pipeline through callback
-                        raise CancelledByUserError  # noqa: TRY301
-
-                # Configure pipeline according to options
-                self._pipeline.enable_diarization = bool(
-                    self._opts.get("enable_diarization", False)
-                )
-                self._pipeline.enable_dialog_blocks = bool(
-                    self._opts.get("enable_dialog_blocks", False)
-                )
-
+                cb = self._make_progress_cb(idx, total, prefix)
+                self._apply_pipeline_options()
                 try:
                     doc = self._pipeline.process(media, self._out_dir, progress=cb)
                 except CancelledByUserError:
                     self.canceled.emit()
                     return
                 fmt = str(self._opts.get("export_format", "txt"))
-                out_path = self._out_dir / f"{media.stem}.{fmt}"
-                outp = export_document(doc, fmt, out_path)
-                outputs.append(str(outp))
+                out_primary = self._export_primary(doc, media, fmt)
+                outputs.append(str(out_primary))
+                srt_path = self._maybe_export_srt(doc, media, fmt, outputs)
+                self._maybe_burn(media, srt_path, idx, total, prefix, outputs)
                 if bool(self._opts.get("single_view", False)):
                     view_text = doc.get_full_text()
                 self._report(prefix + "Exported", min(0.99, (idx + 1) / total))
@@ -393,6 +496,84 @@ class PipelineWorker(QObject):
             self.finished.emit(outputs, view_text)
         except Exception as e:  # noqa: BLE001
             self.error.emit(str(e))
+
+    # * Helpers to keep run() simple
+    def _make_progress_cb(
+        self, idx: int, total: int, prefix: str
+    ) -> Callable[[str, float], None]:
+        base = idx / total
+
+        def cb(msg: str, f: float) -> None:
+            self._report(prefix + msg, min(0.99, base + f / total))
+            if self._cancel:
+                raise CancelledByUserError
+
+        return cb
+
+    def _apply_pipeline_options(self) -> None:
+        self._pipeline.enable_diarization = bool(
+            self._opts.get("enable_diarization", False)
+        )
+        self._pipeline.enable_dialog_blocks = bool(
+            self._opts.get("enable_dialog_blocks", False)
+        )
+
+    def _export_primary(self, doc: Any, media: Path, fmt: str) -> Path:  # noqa: ANN401
+        out_path = self._out_dir / f"{media.stem}.{fmt}"
+        return export_document(doc, fmt, out_path)
+
+    def _maybe_export_srt(
+        self,
+        doc: Any,  # noqa: ANN401
+        media: Path,
+        fmt: str,
+        outputs: list[str],
+    ) -> Path:
+        srt_path = self._out_dir / f"{media.stem}.srt"
+        save_srt = bool(self._opts.get("save_srt", True))
+        need_srt = (fmt.lower() != "srt" and save_srt) or (fmt.lower() == "srt")
+        if need_srt:
+            try:
+                export_document(doc, "srt", srt_path)
+                if fmt.lower() != "srt":
+                    outputs.append(str(srt_path))
+            except Exception as ex:  # noqa: BLE001
+                self.log.emit(f"SRT export failed: {ex}")
+        return srt_path
+
+    def _maybe_burn(
+        self,
+        media: Path,
+        srt_path: Path,
+        idx: int,
+        total: int,
+        prefix: str,
+        outputs: list[str],
+    ) -> None:
+        burn = bool(self._opts.get("burn_in", True))
+        if (
+            burn
+            and srt_path.exists()
+            and media.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}
+        ):
+            burned_out = self._out_dir / f"{media.stem}_subbed.mp4"
+            try:
+                self._report(
+                    prefix + "Burning subtitles", min(0.99, (idx + 0.95) / total)
+                )
+                burn_subtitles(media, srt_path, burned_out)
+                outputs.append(str(burned_out))
+                # Try cleanup of intermediate WAV created in _work
+                try:
+                    work_dir = self._out_dir / "_work"
+                    wav = work_dir / f"{media.stem}.wav"
+                    if wav.exists():
+                        wav.unlink()
+                except OSError:
+                    # Not critical; leave file if we cannot delete
+                    self.log.emit("Cleanup of intermediate WAV failed")
+            except Exception as ex:  # noqa: BLE001
+                self.log.emit(f"Burn-in failed: {ex}")
 
 
 # * Entry point for GUI application

@@ -18,7 +18,10 @@ def prepare_audio(
     channels: int = 1,
 ) -> Path:
     """Ensure input media is converted to a WAV file with correct specs."""
-    output_wav = work_dir / f"{input_path.stem}.wav"
+    # Place intermediates into a hidden work subfolder to avoid cluttering outputs
+    work_subdir = work_dir / "_work"
+    work_subdir.mkdir(parents=True, exist_ok=True)
+    output_wav = work_subdir / f"{input_path.stem}.wav"
     logger.info("Preparing audio: %s -> %s", input_path, output_wav)
     extract_audio(input_path, output_wav, sample_rate=sample_rate, channels=channels)
     return output_wav

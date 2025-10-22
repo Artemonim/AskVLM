@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from editing.text_model import Document, TextSegment
+from utils.env import load_env_file
 
 from .audio_io import prepare_audio
 from .diarization import DiarizationPipeline
@@ -33,6 +34,8 @@ class LocalPipeline:
         compute_type: str = "auto",
     ) -> None:
         """Initialize pipeline components."""
+        # * Load .env for HF_TOKEN and other variables
+        load_env_file()
         # * Ensure ML caches are inside project directory
         cache_root = configure_ml_caches(get_project_cache_dir())
         # Prefer explicit model_root if provided, else use project cache/models

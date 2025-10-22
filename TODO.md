@@ -123,9 +123,9 @@
 ## Phase 1.8: AutoSubtitles & Resolve Workflow
 
 -   [x] Decision: Default artifact is sidecar SRT; burn-in is done in DaVinci Resolve.
--   [ ] CLI: `subtitle` command (batch: files/folders) producing SRT with CPS/duration rules.
+-   [x] CLI: `subtitle` command (batch: files/folders) producing SRT with CPS/duration rules.
 -   [ ] Optional: watch-folder mode to auto-generate SRT on new exports from Resolve.
--   [ ] GUI: quick action "Generate SRT for Resolve" (minimal controls).
+-   [x] GUI: quick action "Generate SRT for Resolve" (minimal controls).
 -   [x] Documentation: Add `doc/AutoSubtitles.md` (pipeline, RAM↔VRAM, Resolve flow).
 -   [ ] **VRAM & Performance**
     -   [ ] RAM residency for Align/Diari via ModelRegistry (CPU-resident, migrate to CUDA).

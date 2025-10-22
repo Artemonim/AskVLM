@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import Any
 
+from utils.logging import get_logger
+
 
 # * Represent a single speaker segment
 @dataclass
@@ -44,6 +46,7 @@ class DiarizationPipeline:
         self.device = device
         self._pipeline: Any | None = None
         self._try_load()
+        self._log = get_logger(__name__)
 
     def _try_load(self) -> None:
         """Attempt to load pyannote pipeline lazily with safe fallbacks."""
@@ -80,9 +83,9 @@ class DiarizationPipeline:
                 # * Enforce CUDA-only ML processing
                 msg = "CUDA is required for ML processing, but CPU was requested."
                 raise RuntimeError(msg)  # noqa: TRY301
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # * Device move is best-effort; log minimal info
-            pass
+            self._log.debug("Diarization device move failed: %s", exc)
         self._pipeline = pipe
 
     def diarize(self, audio_path: str) -> list[Segment]:
