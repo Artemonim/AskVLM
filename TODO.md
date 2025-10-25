@@ -132,6 +132,33 @@
     -   [ ] Prefetch on idle (Align/Diari CPU load, OS cache warm-up for ASR weights).
     -   [ ] Single heavy-model on GPU guarantee across pipeline (enforce via `gpu_guard`).
 
+## Phase 1.85: Disfluency Cleanup (Auto)
+
+-   [ ] Core detection & cutlist
+    -   [ ] `editing/disfluency.py`: detection of fillers and breaths
+        -   [ ] RU filler-words via dictionary + WhisperX alignment (word timestamps)
+        -   [ ] Filler-sounds ("э-э", "мм") via transcript tokens + simple audio heuristics
+        -   [ ] Breaths: heuristic (VAD + spectral slope/energy, 200–1200 ms) with optional PANNs(AudioSet)
+    -   [ ] Cutlist JSON schema: `start_ms`, `end_ms`, `type`, `confidence`, `action`, `margin_before_ms`, `margin_after_ms`
+    -   [ ] Audio apply: attenuate or cut with adaptive crossfade via FFmpeg wrapper
+    -   [ ] Integrate step into `core/pipelines.py` (optional, after Alignment)
+    -   [ ] Exporters: EDL for Resolve + updated SRT/VTT post-edits
+
+-   [ ] UI/Settings/CLI
+    -   [ ] `gui/main_window.py`: toggles (remove breaths, sounds, words), mode (attenuate/cut), parameters
+    -   [ ] `settings.json`/model: thresholds, durations, margins, per-type limits
+    -   [ ] CLI flags in Typer: `--cleanup-disfluencies` with granular options
+
+-   [ ] Quality & tests
+    -   [ ] Unit tests for detectors (mock audio, mock alignment)
+    -   [ ] Integration test: WAV → cutlist → processed WAV + SRT consistency
+    -   [ ] Metrics: per-type precision/recall on a small reviewed set
+
+-   [ ] Data & automation (minimal)
+    -   [ ] Auto-label from aligned transcripts: RU filler-words → positive spans; candidate breaths via heuristics
+    -   [ ] Manual review subset (30–60 мин): только low-confidence/граничные случаи
+    -   [ ] `tools/benchmark.py`: офлайн замер метрик и аудио A/B-отчёт
+
 ## Phase 2: Advanced Editing and Cloud Integration
 
 -   [ ] **Advanced Editing Features**
