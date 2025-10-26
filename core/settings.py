@@ -62,6 +62,9 @@ def configure_ml_caches(cache_root: Path | None = None) -> Path:
     os.environ.setdefault("HF_HOME", str(hf_dir))
     os.environ.setdefault("TRANSFORMERS_CACHE", str(hf_hub_dir))
     os.environ.setdefault("HF_HUB_CACHE", str(hf_hub_dir))
+    # ! Windows may lack privileges for symlinks; force copy mode to avoid WinError 1314
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 
     # * Torch cache (models/weights)
     os.environ.setdefault("TORCH_HOME", str(torch_dir))

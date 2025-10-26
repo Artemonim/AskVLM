@@ -45,8 +45,9 @@ class DiarizationPipeline:
         self.hf_token = hf_token or os.getenv("HF_TOKEN") or ""
         self.device = device
         self._pipeline: Any | None = None
-        self._try_load()
+        # Initialize logger before any method might use it
         self._log = get_logger(__name__)
+        self._try_load()
 
     def _try_load(self) -> None:
         """Attempt to load pyannote pipeline lazily with safe fallbacks."""
@@ -55,6 +56,7 @@ class DiarizationPipeline:
         except ModuleNotFoundError:
             # * pyannote is optional; skip loading
             self._pipeline = None
+            self._log.info("pyannote.audio is not installed; skipping diarization")
             return
 
         try:
@@ -68,10 +70,22 @@ class DiarizationPipeline:
         kwargs: dict[str, Any] = {}
         if self.hf_token:
             kwargs["use_auth_token"] = self.hf_token
+        # Warn once if likely gated
+        elif "pyannote/" in self.model_name:
+            self._log.warning(
+                "HF token is not set; gated model '%s' may fail to load. "
+                "Set HF_TOKEN in your environment.",
+                self.model_name,
+            )
         try:
             pipe = pipeline_cls.from_pretrained(self.model_name, **kwargs)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # ! If loading fails (e.g., gated model without token), skip diarization
+            self._log.warning(
+                "Could not load diarization pipeline '%s': %s. Skipping.",
+                self.model_name,
+                exc,
+            )
             self._pipeline = None
             return
 
@@ -98,8 +112,9 @@ class DiarizationPipeline:
             return []
         try:
             annotation = pipe(audio_path)
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             # ! Runtime failure (e.g., missing backends), return empty
+            self._log.warning("Diarization failed at runtime: %s", exc)
             return []
 
         out: list[Segment] = []

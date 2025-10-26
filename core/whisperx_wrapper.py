@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
@@ -9,6 +10,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 # Optional heavy deps (loaded via importlib)
+# * Ensure Hugging Face does not attempt symlinks on Windows (privilege issues)
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 try:
     fw_mod = importlib.import_module("faster_whisper")
     fw_whisper_cls = getattr(fw_mod, "WhisperModel", None)
@@ -27,6 +31,11 @@ except ModuleNotFoundError:  # pragma: no cover
 
 
 # * Light wrapper around faster-whisper / whisperx alignment when available
+# * VRAM thresholds (GiB) for auto model selection
+_VRAM_THRESHOLD_LARGE_GB = 12.0
+_VRAM_THRESHOLD_MEDIUM_GB = 8.0
+
+
 @dataclass
 class AlignedWord:
     """A single aligned word with timestamps."""
@@ -55,7 +64,7 @@ class WhisperXWrapper:
 
     def __init__(
         self,
-        model_name: str = "base",
+        model_name: str = "large-v3",
         device: str = "cuda",
         compute_type: str = "auto",
         model_root: Path | None = None,
@@ -67,6 +76,8 @@ class WhisperXWrapper:
         self._model: Any | None = None
         self._align_model: Any | None = None
 
+    # * Model is fixed to large-v3 per project policy; VRAM autoselection removed
+
     def _load_model(self) -> None:
         if self._model is not None:
             return
@@ -75,7 +86,7 @@ class WhisperXWrapper:
             raise RuntimeError(msg)
 
         download_root = str(self.model_root) if self.model_root else None
-        # * compute_type: auto => fp16 if cuda else int8 / float32 fallback
+        # * compute_type: prefer float16 on CUDA by default for quality; allow override
         ct = self.compute_type
         if ct == "auto":
             if (
@@ -93,8 +104,10 @@ class WhisperXWrapper:
             # * Enforce CUDA-only ML processing
             msg = "CUDA is required for ML processing."
             raise RuntimeError(msg)
+        chosen_model = self.model_name
+        logging.getLogger(__name__).info("Using Whisper model: %s", chosen_model)
         self._model = fw_whisper_cls(
-            self.model_name,
+            chosen_model,
             device=self.device,
             compute_type=ct,
             download_root=download_root,
@@ -119,9 +132,13 @@ class WhisperXWrapper:
             raise RuntimeError(msg)
         segments_out: list[dict[str, Any]] = []
         text_parts: list[str] = []
+        # * Filter out non-faster-whisper kwargs (subtitle layout hints etc.)
+        _kwargs_all = dict(kwargs)
+        for _k in ("max_line_width", "max_line_count"):
+            _kwargs_all.pop(_k, None)
         # streaming iterator
         segments, _info = model.transcribe(
-            str(audio_path), language=language, **dict(kwargs)
+            str(audio_path), language=language, **_kwargs_all
         )
         for seg in segments:
             start = float(seg.start)

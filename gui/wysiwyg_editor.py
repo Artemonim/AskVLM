@@ -48,6 +48,8 @@ class WysiwygEditor(QTableWidget):
         self._speakers: list[str] = ["speaker_1"]
         self._on_speaker_changed: Callable[[int, str], None] | None = None
         self.setPlaceholderText = lambda *_: None
+        # * Keep raw data for quick access (preview wiring)
+        self._rows: list[TableRow] = []
 
     def set_speakers(self, speakers: list[str]) -> None:
         """Set available speakers for comboboxes and refresh cells."""
@@ -59,12 +61,14 @@ class WysiwygEditor(QTableWidget):
     def set_rows(self, rows: list[TableRow]) -> None:
         """Replace all table rows with provided rows."""
         self.setRowCount(0)
+        self._rows = []
         for r in rows:
             self._append_row(r)
 
     def set_rows_from_tuples(self, rows: list[tuple[float, float, str, str]]) -> None:
         """Replace rows using raw tuples: (start, end, speaker_id, text)."""
         self.setRowCount(0)
+        self._rows = []
         for s, e, sp, tx in rows:
             self._append_row(TableRow(start=s, end=e, speaker_id=sp, text=tx))
 
@@ -72,6 +76,7 @@ class WysiwygEditor(QTableWidget):
         """Append one `TableRow` to the table and build widgets for its cells."""
         idx = self.rowCount()
         self.insertRow(idx)
+        self._rows.append(row)
         # Time cell
         time_str = self._format_time(row.start, row.end)
         self.setItem(idx, 0, QTableWidgetItem(time_str))
@@ -96,6 +101,12 @@ class WysiwygEditor(QTableWidget):
         except AttributeError:
             text_item.setFlags(text_item.flags())
         self.setItem(idx, 2, text_item)
+
+    def get_row_data(self, row: int) -> TableRow | None:
+        """Return `TableRow` for the given row index or None if invalid."""
+        if 0 <= row < len(self._rows):
+            return self._rows[row]
+        return None
 
     def _setup_speaker_cell(self, row: int) -> None:
         """Recreate combobox options for the speaker cell in the given row."""

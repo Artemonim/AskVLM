@@ -132,6 +132,26 @@
     -   [ ] Prefetch on idle (Align/Diari CPU load, OS cache warm-up for ASR weights).
     -   [ ] Single heavy-model on GPU guarantee across pipeline (enforce via `gpu_guard`).
 
+## Phase 1.81: Preview
+-   [x] Поле ввода длины строки субтитра (по умолчанию 42)
+-   [x] Поле ввода количества строк субтитра (по умолчанию 2)
+-   [x] **Subtitle preview**
+    -   [x] Новая правая часть главного окна приложения
+    -   [x] Превью субтитров: Отображает кадр, соответствующий стартовому таймингу выбранного субтитра, и сам субтитр на этом кадре.
+    -   [x] Extract frame at subtitle start using FFmpeg (`extract_frame_to_file`)
+    -   [x] Layout text according to UI limits (`max_line_width`, `max_line_count`) and display in preview
+    -   [x] Preview font selection applied to preview pane
+    -   [x] Editor selection → preview wiring (use `WysiwygEditor.get_row_data` and `SubtitlePreview.layout_text`)
+
+## Phase 1.82: Export, Burn & Persistence
+-   [x] Export SRT respects layout rules and UI hints (`SubtitleRules`, `export_srt_with_rules`)
+-   [x] Inline cancellable burn worker integrated into GUI (`_InlineBurnWorker`) with progress parsing
+-   [x] Pass subtitle layout options from UI to pipeline/exporters (`subtitle_max_line_width`, `subtitle_max_lines`)
+-   [x] UI persistence: save/load window geometry, splitter state, last input dir, table column widths
+-   [x] Windows HF symlink workaround: set `HF_HUB_DISABLE_SYMLINKS=1` (settings and wrapper)
+-   [x] Pipeline/CLI defaults updated: default Whisper model `large-v3`, default compute_type `float16`
+-   [ ] Review: separate BurnWorker vs inline worker refactor (suggestion)
+
 ## Phase 1.85: Disfluency Cleanup (Auto)
 
 -   [ ] Core detection & cutlist

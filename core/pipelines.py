@@ -9,7 +9,6 @@ from .audio_io import cleanup_intermediate_audio, prepare_audio
 from .diarization import DiarizationPipeline
 from .llm_formatter import LLMFormatter
 from .settings import configure_ml_caches, get_project_cache_dir
-from .whisper_wrapper import WhisperWrapper
 from .whisperx_wrapper import WhisperXWrapper
 
 if TYPE_CHECKING:
@@ -23,11 +22,11 @@ class LocalPipeline:
     def __init__(  # noqa: PLR0913
         self,
         model_root: Path | None = None,
-        whisper_model: str = "base",
+        whisper_model: str = "auto",
         llm_model: str = "gguf-q4_0",
         *,
         engine: str = "auto",  # whisper | whisperx | auto
-        enable_diarization: bool = True,
+        enable_diarization: bool = False,
         enable_dialog_blocks: bool = False,
         language: str | None = None,
         device: str = "auto",
@@ -44,15 +43,10 @@ class LocalPipeline:
         self.language = language
         self.device = device
         self.compute_type = compute_type
-        # STT engines
-        w_device = (
-            "cuda" if device in {"auto", "cuda"} else "cpu"
-        )  # basic mapping for whisper
-        self.whisper = WhisperWrapper(
-            model_name=whisper_model, model_root=self.model_root, device=w_device
-        )
+        # STT engine (Faster-Whisper via WhisperX)
+        w_device = "cuda" if device in {"auto", "cuda"} else "cpu"
         self.whisperx = WhisperXWrapper(
-            model_name=whisper_model,
+            model_name="large-v3" if whisper_model == "auto" else whisper_model,
             model_root=self.model_root,
             device=w_device,
             compute_type=compute_type,
@@ -69,6 +63,9 @@ class LocalPipeline:
         input_path: Path,
         work_dir: Path = Path(),
         progress: Callable[[str, float], None] | None = None,
+        *,
+        subtitle_max_line_width: int | None = None,
+        subtitle_max_lines: int | None = None,
     ) -> Document:
         """Process a media file through the pipeline and return a formatted document.
 
@@ -76,6 +73,8 @@ class LocalPipeline:
             input_path: Path to media file (audio/video).
             work_dir: Working directory for intermediate artifacts.
             progress: Optional callback reporting (message, 0..1) progress.
+            subtitle_max_line_width: Desired max chars per subtitle line (hint for WhisperX).
+            subtitle_max_lines: Desired max lines per subtitle cue (hint for WhisperX).
 
         """
 
@@ -93,30 +92,23 @@ class LocalPipeline:
         # * Step 2: Transcribe audio to raw text
         raw_text = ""
         transcript_segments: list[dict[str, object]] = []
-        engine_to_use = self.engine
-        report("Transcribing (engine selection)", 0.2)
-        if engine_to_use == "auto":
-            # Prefer faster-whisper/whisperx when available, fallback to whisper
-            try:
-                tx = self.whisperx.transcribe(audio_path, language=self.language)
-                raw_text = tx.get("text", "")
-                # * Keep coarse segments for export
-                transcript_segments = list(tx.get("segments", []) or [])
-                engine_to_use = "whisperx"
-            except Exception:  # noqa: BLE001
-                tx2 = self.whisper.transcribe(audio_path)
-                raw_text = str(tx2.get("text", ""))
-                transcript_segments = list(tx2.get("segments", []) or [])
-                engine_to_use = "whisper"
-        elif engine_to_use == "whisperx":
-            tx = self.whisperx.transcribe(audio_path, language=self.language)
-            raw_text = tx.get("text", "")
-            transcript_segments = list(tx.get("segments", []) or [])
-        else:
-            tx3 = self.whisper.transcribe(audio_path)
-            raw_text = str(tx3.get("text", ""))
-            transcript_segments = list(tx3.get("segments", []) or [])
-        report(f"Transcription complete ({engine_to_use})", 0.6)
+        report("Transcribing", 0.2)
+        wx_kwargs: dict[str, object] = {}
+        # * Default extreme recognition profile (fits on 8 GiB VRAM empirically)
+        # * Higher quality / VRAM usage: beam search and word-level timestamps
+        wx_kwargs["beam_size"] = 10
+        wx_kwargs["vad_filter"] = True
+        wx_kwargs["word_timestamps"] = True
+        if subtitle_max_line_width is not None:
+            wx_kwargs["max_line_width"] = int(subtitle_max_line_width)
+        if subtitle_max_lines is not None:
+            wx_kwargs["max_line_count"] = int(subtitle_max_lines)
+
+        # Use WhisperX (Faster-Whisper) exclusively for ASR
+        tx = self.whisperx.transcribe(audio_path, language=self.language, **wx_kwargs)
+        raw_text = tx.get("text", "")
+        transcript_segments = list(tx.get("segments", []) or [])
+        report("Transcription complete (whisperx)", 0.6)
 
         # * Step 3: Perform speaker diarization (optional)
         diarization_segments: list[Segment] = []
@@ -152,6 +144,8 @@ class LocalPipeline:
             format_text_fn=self.formatter.format_text,
         )
         report("Document built", 0.98)
+        # * Export subtitle artifacts are configured later using options passed from GUI
+        # * Export-time subtitle layout rules are applied by exporters
         # * Cleanup intermediates (_work WAV) after successful processing
         cleanup_intermediate_audio(input_path, work_dir)
         return doc

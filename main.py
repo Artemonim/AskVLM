@@ -25,8 +25,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--whisper-model",
-        default="base",
-        help="Name of Whisper model to use (default: base)",
+        default="large-v3",
+        help="Name of Whisper model to use (default: large-v3)",
     )
     parser.add_argument(
         "--llm-model",

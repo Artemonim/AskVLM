@@ -10,6 +10,7 @@ from core.pipelines import LocalPipeline
 from core.ffmpeg import burn_subtitles
 from editing.text_model import Document
 from utils.exporters import export_document, export_srt_with_rules, SubtitleRules
+from core.audio_io import prepare_audio
 
 
 app = typer.Typer(help="Artemonim's Speech Kit CLI")
@@ -23,7 +24,10 @@ def transcribe(
     output_dir: Path = typer.Option(
         Path("transcriptions"), "--output", "-o", help="Output directory"
     ),
-    whisper_model: str = typer.Option("base", help="Whisper/WhisperX model name"),
+    whisper_model: str = typer.Option(
+        "large-v3",
+        help="Whisper/WhisperX model name (default: large-v3)",
+    ),
     engine: str = typer.Option(
         "whisper", help="Engine: whisper | whisperx | auto (prefers faster-whisper)"
     ),
@@ -41,7 +45,11 @@ def transcribe(
         "auto", help="Device: auto|cuda|cpu (passed to engines where applicable)"
     ),
     compute_type: str = typer.Option(
-        "auto", help="Compute type for faster-whisper: auto|float16|int8|float32"
+        "float16",
+        help=(
+            "Compute type for faster-whisper: float16|int8|int8_float16|auto. "
+            "Default float16 (extreme profile) for best quality on 8+ GiB VRAM."
+        ),
     ),
 ) -> None:
     """Transcribe a file or directory and export results."""
@@ -84,10 +92,16 @@ def subtitle(
     output_dir: Path = typer.Option(
         Path("transcriptions"), "--output", "-o", help="Output directory"
     ),
-    whisper_model: str = typer.Option("base", help="Whisper/WhisperX model name"),
+    whisper_model: str = typer.Option(
+        "large-v3",
+        help="Whisper/WhisperX model name (default: large-v3)",
+    ),
     language: Optional[str] = typer.Option(None, help="Language code (optional)"),
     device: str = typer.Option("auto", help="Device: auto|cuda|cpu"),
-    compute_type: str = typer.Option("auto", help="Compute type for faster-whisper"),
+    compute_type: str = typer.Option(
+        "float16",
+        help="Compute type for faster-whisper (default float16; consider int8_float16 on 8–12 GiB if OOM)",
+    ),
     diarization: bool = typer.Option(False, help="Enable speaker diarization"),
     burn_in: bool = typer.Option(True, help="Burn subtitles into the video"),
     save_srt: bool = typer.Option(True, help="Always save .srt sidecar"),
@@ -134,6 +148,8 @@ def subtitle(
             out_video = output_dir / f"{media.stem}_subbed.mp4"
             burn_subtitles(media, srt_path, out_video)
             typer.echo(f"Burned-in video: {out_video}")
+
+
 
 
 def main() -> None:

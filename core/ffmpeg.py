@@ -210,3 +210,25 @@ def start_burn_process(
         stream = stream.global_args("-progress", str(progress_path), "-nostats")
     proc = stream.run_async(pipe_stdin=True, pipe_stdout=False, pipe_stderr=False)
     return cast("subprocess.Popen[bytes]", proc)
+
+
+def extract_frame_to_file(
+    video_file: str | Path,
+    timestamp_s: float,
+    output_file: str | Path,
+) -> Path:
+    """Extract a single video frame at `timestamp_s` seconds into `output_file`.
+
+    The output format is inferred from `output_file` extension (e.g., PNG/JPG).
+    Returns the absolute `Path` to the written file.
+    """
+    v = Path(video_file).resolve()
+    out = Path(output_file).resolve()
+    # * Use accurate seek after input for better precision; fast seek is fine for preview
+    (
+        ffmpeg.input(str(v), ss=max(0.0, float(timestamp_s)))
+        .output(str(out), vframes=1, q=2)
+        .overwrite_output()
+        .run(quiet=True)
+    )
+    return out
