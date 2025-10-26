@@ -45,26 +45,51 @@ nvidia-smi
 
 Look for "CUDA Capability Major/Minor version" or "CUDA Version" in the output.
 
-#### Option 1: CUDA 12.1 (Recommended)
+#### Option 1: CUDA 12.8 (Latest, Recommended for RTX 30/40 series)
 
 ```powershell
 pip uninstall torch torchvision torchaudio -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+pip cache purge
+pip install --no-cache-dir `
+  torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 `
+  --index-url https://download.pytorch.org/whl/cu128 `
+  --extra-index-url https://pypi.org/simple
 ```
 
-#### Option 2: CUDA 12.4 (Latest)
+#### Option 2: CUDA 12.4
 
 ```powershell
 pip uninstall torch torchvision torchaudio -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+pip cache purge
+pip install --no-cache-dir `
+  torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 `
+  --index-url https://download.pytorch.org/whl/cu124 `
+  --extra-index-url https://pypi.org/simple
 ```
 
-#### Option 3: CUDA 11.8 (Older Systems)
+#### Option 3: CUDA 12.1
 
 ```powershell
 pip uninstall torch torchvision torchaudio -y
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+pip cache purge
+pip install --no-cache-dir `
+  torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 `
+  --index-url https://download.pytorch.org/whl/cu121 `
+  --extra-index-url https://pypi.org/simple
 ```
+
+#### Option 4: CUDA 11.8 (Older Systems)
+
+```powershell
+pip uninstall torch torchvision torchaudio -y
+pip cache purge
+pip install --no-cache-dir `
+  torch==2.5.1+cu118 torchvision==0.20.1+cu118 torchaudio==2.5.1+cu118 `
+  --index-url https://download.pytorch.org/whl/cu118 `
+  --extra-index-url https://pypi.org/simple
+```
+
+**Note:** CUDA 12.4+ wheels are backward compatible with CUDA 12.8 drivers. If you have CUDA 12.8 installed, using cu124 wheels will work fine, but cu128 provides the best compatibility.
 
 ## Verification
 
@@ -82,6 +107,81 @@ GPU: NVIDIA GeForce RTX 3070
 ```
 
 ## Troubleshooting
+
+### Error: PyTorch installs CPU version despite using CUDA index
+
+**Symptom:**
+```powershell
+pip install torch --index-url https://download.pytorch.org/whl/cu124
+```
+Results in `torch.__version__` showing `2.9.0+cpu` instead of `2.9.0+cu124`.
+
+**Root Cause:**
+When pip cannot find the exact CUDA wheel or encounters network issues (DNS resolution failures, SSL errors), it falls back to the CPU-only version from the default PyPI index.
+
+**Solution:**
+Explicitly specify the CUDA version suffix in the package name:
+
+```powershell
+# * Clear any cached wheels first
+pip uninstall -y torch torchvision torchaudio
+pip cache purge
+
+# * Install with explicit CUDA version suffix
+pip install --no-cache-dir `
+  torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 `
+  --index-url https://download.pytorch.org/whl/cu128 `
+  --extra-index-url https://pypi.org/simple
+```
+
+**Why this works:**
+- Explicit version with `+cu128` suffix forces pip to look for CUDA-specific wheels only
+- `--no-cache-dir` ensures fresh download without using potentially wrong cached wheels
+- `--index-url` sets primary index to PyTorch CUDA repository
+- `--extra-index-url` allows dependencies to be downloaded from PyPI
+
+**Automated Fix:**
+The `build.ps1 -EnsureCUDA` script now automatically uses this method with fallback to multiple CUDA versions (cu128 → cu124 → cu121 → cu118).
+
+### Network Issues with PyTorch Downloads
+
+**Symptoms:**
+- `getaddrinfo failed` errors when downloading from `download.pytorch.org`
+- `SSLEOFError` or TLS handshake failures
+- Downloads work in browser but fail in pip
+
+**Possible Causes:**
+1. DNS resolution issues in Python's network stack
+2. CloudFront serving different IPv4/IPv6 addresses
+3. VPN or network configuration changes
+4. Firewall or antivirus blocking pip connections
+
+**Solutions:**
+
+1. **Change DNS servers** (Windows Network Settings):
+   - Set DNS to `1.1.1.1` (Cloudflare) or `8.8.8.8` (Google)
+   - Run `ipconfig /flushdns` after changing
+
+2. **Manual wheel download** (if network issues persist):
+   ```powershell
+   # Download .whl files in browser from:
+   # https://download.pytorch.org/whl/cu128/torch/
+   # https://download.pytorch.org/whl/cu128/torchvision/
+   # https://download.pytorch.org/whl/cu128/torchaudio/
+   
+   # Look for cp311-cp311-win_amd64.whl files with +cu128 suffix
+   # Example: torch-2.9.0+cu128-cp311-cp311-win_amd64.whl
+   
+   # Save to wheels/ directory, then install:
+   pip install --no-deps .\wheels\torch-2.9.0+cu128-cp311-cp311-win_amd64.whl
+   pip install --no-deps .\wheels\torchvision-0.24.0+cu128-cp311-cp311-win_amd64.whl
+   pip install --no-deps .\wheels\torchaudio-2.9.0+cu128-cp311-cp311-win_amd64.whl
+   ```
+
+3. **Verify installation** after any method:
+   ```powershell
+   python -c "import torch; print('torch:', torch.__version__, 'cuda:', torch.version.cuda, 'available:', torch.cuda.is_available())"
+   ```
 
 ### Error: "nvidia-smi not found"
 

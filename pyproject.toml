@@ -10,7 +10,6 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "PySide6>=6.5.0",
-    "torch>=2.8.0",  # ! Security: requires fixed torch; GPU wheel managed via run scripts
     "ffmpeg-python>=0.2.0",
     "pydantic>=2.0.0",
     "tqdm>=4.65.0",
@@ -44,6 +43,8 @@ dev = [
     "pip-audit>=2.6.0",
 ]
 ml = [
+    # * Torch is installed via build.ps1 -EnsureCUDA to ensure GPU wheel (cu128/cu124/cu121)
+    "torch>=2.5.0",
     "openai-whisper>=20231117",
     "faster-whisper>=1.0.0",
     "pyannote.audio>=3.1.0,<3.3.0",

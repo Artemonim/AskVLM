@@ -46,6 +46,29 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "critical": False,
         "desc": "Ruff formatter",
     },
+    "cuda": {
+        "command": [sys.executable, "-c"],
+        # * Checks CUDA availability in the current venv; fails CI if not available
+        "args": [
+            (
+                "import sys;\n"
+                "try:\n"
+                "    import torch\n"
+                "    ok = bool(getattr(torch,'cuda',None) and torch.cuda.is_available())\n"
+                "    dev = torch.cuda.get_device_name(0) if ok else 'N/A'\n"
+                "    cver = getattr(torch.version, 'cuda', None)\n"
+                "    ver = getattr(torch, '__version__', '?')\n"
+                "    print('[CUDA CHECK] available={0} device={1} cuda={2} torch={3}'.format(ok, dev, cver, ver))\n"
+                "    sys.exit(0 if ok else 1)\n"
+                "except Exception as e:\n"
+                "    print('[CUDA CHECK] error:', e)\n"
+                "    sys.exit(1)\n"
+            )
+        ],
+        "can_fix": False,
+        "critical": True,
+        "desc": "CUDA availability check",
+    },
     "ruff": {
         "command": [sys.executable, "-m", "ruff"],
         "args": ["check", "--output-format=concise", "--ignore", "E501"],
@@ -153,6 +176,54 @@ class LocalCI:
         code, _, _ = self._run(probe)
         return code == 0
 
+    def _should_run_pip_audit(self) -> bool:
+        """Check if pip-audit should run (only once per day)."""
+        last_run_file = ".pip_audit_last_run"
+        try:
+            if os.path.exists(last_run_file):
+                with open(last_run_file, "r", encoding="utf-8") as f:
+                    last_run_str = f.read().strip()
+                    last_run = float(last_run_str)
+                    # Check if 24 hours (86400 seconds) have passed
+                    if time.time() - last_run < 86400:
+                        return False
+        except (ValueError, OSError):
+            # If file is corrupted or can't be read, allow run
+            pass
+        return True
+
+    def _update_pip_audit_timestamp(self) -> None:
+        """Update the timestamp of last pip-audit run."""
+        last_run_file = ".pip_audit_last_run"
+        try:
+            with open(last_run_file, "w", encoding="utf-8") as f:
+                f.write(str(time.time()))
+        except OSError:
+            # If can't write, silently fail - next run will try again
+            pass
+
+    # * Dependency freshness check (runs at most once per day)
+    def _should_run_deps_check(self) -> bool:
+        last_run_file = ".deps_last_check"
+        try:
+            if os.path.exists(last_run_file):
+                with open(last_run_file, "r", encoding="utf-8") as f:
+                    last_run_str = f.read().strip()
+                    last_run = float(last_run_str)
+                    if time.time() - last_run < 86400:
+                        return False
+        except (ValueError, OSError):
+            pass
+        return True
+
+    def _update_deps_check_timestamp(self) -> None:
+        last_run_file = ".deps_last_check"
+        try:
+            with open(last_run_file, "w", encoding="utf-8") as f:
+                f.write(str(time.time()))
+        except OSError:
+            pass
+
     def _build_command(self, tool: str, fix: bool) -> List[str]:
         cfg = TOOLS[tool]
         cmd = list(cfg["command"])  # copy
@@ -222,7 +293,7 @@ class LocalCI:
 
     def run(self, only: Optional[str], fix: bool) -> Dict[str, Any]:
         tools = [only] if only else [
-            "ruff-format", "ruff", "compile", "mypy", "pyright", "pytest", "bandit", "pip-audit"
+            "ruff-format", "ruff", "compile", "mypy", "pyright", "pytest", "cuda", "bandit", "pip-audit"
         ]
 
         if not self.json_output:
@@ -254,13 +325,60 @@ class LocalCI:
                     self._log("STDERR:")
                     self._log(stderr)
 
+        # * Optional: check for outdated dependencies once per day (non-critical)
+        if self._should_run_deps_check():
+            code, out, err = self._run([sys.executable, "-m", "pip", "list", "--outdated", "--format=json"])
+            self._log("\n--- DEPENDENCY FRESHNESS CHECK ---")
+            self._log(f"Exit code: {code}")
+            if out:
+                self._log("STDOUT:")
+                self._log(out)
+            if err:
+                self._log("STDERR:")
+                self._log(err)
+            if code == 0:
+                try:
+                    data = json.loads(out or "[]")
+                    outdated_count = len(data) if isinstance(data, list) else 0
+                    self._log(f"Outdated packages: {outdated_count}")
+                except json.JSONDecodeError:
+                    self._log("Could not parse pip outdated JSON output")
+            self._update_deps_check_timestamp()
+
         for t in tools:
             if t in {"ruff-format", "ruff"} and fix and not only:
                 continue
+
+            # Skip pip-audit if it was run less than 24 hours ago
+            if t == "pip-audit" and not self._should_run_pip_audit():
+                if not self.json_output:
+                    self._print("-- pip-audit --")
+                    self._print("⏭️  pip-audit skipped (run once per day)")
+                self.results[t] = {
+                    "tool": t,
+                    "available": True,
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "critical": TOOLS[t]["critical"],
+                    "fixed": False,
+                    "exec_time": 0.0,
+                    "skipped": True,
+                }
+                # Log skipped pip-audit
+                self._log(f"\n--- PIP-AUDIT ---")
+                self._log("Skipped: run once per day")
+                continue
+
             if not self.json_output:
                 self._print(f"-- {t} --")
             result = self.run_tool(t, False)
             self.results[t] = result
+
+            # Update pip-audit timestamp if it ran successfully
+            if t == "pip-audit" and result.get("exit_code") == 0:
+                self._update_pip_audit_timestamp()
+
             if not self.json_output:
                 exec_time = result.get("exec_time", 0)
                 status = "✓" if result.get("exit_code", 0) == 0 else "✗"

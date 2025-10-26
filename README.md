@@ -342,29 +342,43 @@ A: Whisper models range from ~100MB (tiny) to ~3GB (large). PyAnnote models are 
 
 **Symptom:** Error message: "CUDA is required for ML processing, but no compatible GPU is available."
 
-**Cause:** PyTorch was installed with CPU-only support instead of CUDA-enabled wheels.
+**Cause:** PyTorch was installed with CPU-only support instead of CUDA-enabled wheels. This happens when pip cannot find CUDA wheels or encounters network issues, falling back to CPU-only version from PyPI.
 
 **Solution:**
 
-1. **For CUDA 12.1** (recommended for most modern systems):
+**⚠️ Important:** Always specify explicit CUDA version suffix (e.g., `+cu128`) to prevent CPU fallback!
+
+1. **For CUDA 12.8** (recommended for RTX 30/40 series):
    ```powershell
-   pip uninstall torch -y
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+   pip uninstall torch torchvision torchaudio -y
+   pip cache purge
+   pip install --no-cache-dir `
+     torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 `
+     --index-url https://download.pytorch.org/whl/cu128 `
+     --extra-index-url https://pypi.org/simple
    ```
 
-2. **For CUDA 12.4** (latest):
+2. **For CUDA 12.4**:
    ```powershell
-   pip uninstall torch -y
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+   pip uninstall torch torchvision torchaudio -y
+   pip cache purge
+   pip install --no-cache-dir `
+     torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 `
+     --index-url https://download.pytorch.org/whl/cu124 `
+     --extra-index-url https://pypi.org/simple
    ```
 
-3. **For CUDA 11.8** (older systems):
+3. **For CUDA 12.1**:
    ```powershell
-   pip uninstall torch -y
-   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
+   pip uninstall torch torchvision torchaudio -y
+   pip cache purge
+   pip install --no-cache-dir `
+     torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 `
+     --index-url https://download.pytorch.org/whl/cu121 `
+     --extra-index-url https://pypi.org/simple
    ```
 
-4. **Using the build script** (automatic):
+4. **Using the build script** (automatic with fallback):
    ```powershell
    .\.venv\Scripts\Activate.ps1
    .\build.ps1 -EnsureCUDA
@@ -372,14 +386,18 @@ A: Whisper models range from ~100MB (tiny) to ~3GB (large). PyAnnote models are 
 
 **Verification:**
 ```powershell
-python -c "import torch; print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}')"
+python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
 ```
 
 Expected output:
 ```
+PyTorch: 2.9.0+cu128
 CUDA available: True
-CUDA version: 12.1
+CUDA version: 12.8
+GPU: NVIDIA GeForce RTX 3070
 ```
+
+**For detailed troubleshooting** (network issues, manual downloads, etc.), see [doc/CUDA_SETUP.md](doc/CUDA_SETUP.md).
 
 ### Installation Requirements
 

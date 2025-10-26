@@ -153,14 +153,38 @@ if ($EnsureML) {
 # * Ensure CUDA-enabled torch; attempt known CUDA indices if unavailable
 if ($EnsureCUDA -and -not (Test-CUDA)) {
     Write-Host "Attempting to install CUDA-enabled PyTorch wheels..." -ForegroundColor Yellow
-    $indexes = @(
-        "https://download.pytorch.org/whl/cu124",
-        "https://download.pytorch.org/whl/cu121",
-        "https://download.pytorch.org/whl/cu118"
+    
+    # * Define CUDA versions to try with their explicit version specifiers
+    # ! IMPORTANT: Must specify version with +cuXXX suffix to avoid CPU fallback
+    $cudaConfigs = @(
+        @{index="https://download.pytorch.org/whl/cu128"; torch="2.9.0+cu128"; vision="0.24.0+cu128"; audio="2.9.0+cu128"},
+        @{index="https://download.pytorch.org/whl/cu124"; torch="2.6.0+cu124"; vision="0.21.0+cu124"; audio="2.6.0+cu124"},
+        @{index="https://download.pytorch.org/whl/cu121"; torch="2.5.1+cu121"; vision="0.20.1+cu121"; audio="2.5.1+cu121"},
+        @{index="https://download.pytorch.org/whl/cu118"; torch="2.5.1+cu118"; vision="0.20.1+cu118"; audio="2.5.1+cu118"}
     )
-    foreach ($u in $indexes) {
-        try { python -m pip install -q --index-url $u --extra-index-url https://download.pypi.org/simple torch torchvision torchaudio } catch {}
-        if (Test-CUDA) { break }
+    
+    # * Remove CPU-only installs and clear cache to avoid reuse of cached wheels
+    try { python -m pip uninstall -y torch torchvision torchaudio | Out-Null } catch {}
+    try { python -m pip cache purge | Out-Null } catch {}
+    
+    foreach ($cfg in $cudaConfigs) {
+        $cudaTag = $cfg.index.Split('/')[-1]
+        Write-Host ("Trying PyTorch {0} from: {1}" -f $cudaTag, $cfg.index) -ForegroundColor Yellow
+        try {
+            # * Explicitly specify version with CUDA suffix to prevent CPU fallback
+            python -m pip install --no-cache-dir `
+                --index-url $cfg.index `
+                --extra-index-url https://pypi.org/simple `
+                "torch==$($cfg.torch)" "torchvision==$($cfg.vision)" "torchaudio==$($cfg.audio)" | Out-Null
+        } catch {
+            Write-Host ("  Failed to install from {0}: {1}" -f $cudaTag, $_.Exception.Message) -ForegroundColor Red
+        }
+        if (Test-CUDA) {
+            Write-Host ("✓ Successfully installed PyTorch with {0}" -f $cudaTag) -ForegroundColor Green
+            break
+        }
+        # If still CPU, try uninstall again before next index
+        try { python -m pip uninstall -y torch torchvision torchaudio | Out-Null } catch {}
     }
     if (-not (Test-CUDA)) {
         Write-Error "CUDA is not available via PyTorch after installation attempts."
