@@ -157,6 +157,7 @@
 -   [x] Richer progress bar with elapsed/ETA and granular steps
 -   [x] High-level console logging initialization
 -   [x] Font size +/- controls affecting preview and burn-in
+-   [x] Preview: robust media-to-tab mapping and frame extraction (bugfix)
 -   [x] Preview matches burn styling (font size, outline, autoscale)
 -   [x] Stream transcription text to partial file during ASR
 

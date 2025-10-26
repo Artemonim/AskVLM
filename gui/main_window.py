@@ -465,7 +465,7 @@ class MainWindow(QMainWindow):
 
         # * Ensure at least one empty tab is visible
         self._clear_tabs()
-        self._add_tab("Document", "")
+        self._add_tab("Document", "", None)
 
         # * Connect editor selection changes to preview updates
         self.tabs.currentChanged.connect(self._on_tab_changed)
@@ -548,6 +548,8 @@ class MainWindow(QMainWindow):
                 "Please add inputs in the Input tab.",
             )
             return
+        # * Remember inputs for preview/tab mapping
+        self._last_inputs = inputs
         out_dir = Path(self.out_dir_edit.text()).resolve()
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -661,24 +663,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(100)
         self._clear_tabs()
         try:
-            srt_candidates = [x for x in _outputs if Path(x).suffix.lower() == ".srt"]
-            if srt_candidates:
-                p = Path(srt_candidates[0])
-                try:
-                    content = p.read_text(encoding="utf-8")
-                except OSError:
-                    content = ""
-                self._add_tab(p.stem, content)
-            elif view_text:
-                self._add_tab("Document", view_text)
-            else:
-                for out_str in _outputs:
-                    try:
-                        p = Path(out_str)
-                        content = p.read_text(encoding="utf-8")
-                    except OSError:
-                        content = ""
-                    self._add_tab(p.stem, content)
+            self._build_result_tabs(_outputs, view_text)
         except Exception as ex:  # noqa: BLE001
             # Surface UI error if tab rendering fails
             if self._can_show_modal():
@@ -693,6 +678,36 @@ class MainWindow(QMainWindow):
         srt_exists = any(Path(x).suffix.lower() == ".srt" for x in _outputs)
         self._has_transcript = bool(view_text.strip()) or srt_exists or bool(_outputs)
         self.btn_burn.setEnabled(self._has_transcript)
+
+    def _build_result_tabs(self, outputs: list[str], view_text: str) -> None:
+        """Build tabs for results and establish preview mapping to media files."""
+        srt_candidates = [x for x in outputs if Path(x).suffix.lower() == ".srt"]
+        if srt_candidates:
+            p = Path(srt_candidates[0])
+            try:
+                content = p.read_text(encoding="utf-8")
+            except OSError as exc:
+                get_logger(__name__).debug("Failed to read SRT '%s': %s", p, exc)
+                content = ""
+            self._add_tab(p.stem, content, self._find_input_media_by_stem(p.stem))
+            return
+        if view_text:
+            # * Single-view implies single input; try to map media
+            media: Path | None = None
+            if len(self._last_inputs) == 1:
+                candidate = self._last_inputs[0]
+                if candidate.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}:
+                    media = candidate
+            self._add_tab("Document", view_text, media)
+            return
+        for out_str in outputs:
+            p = Path(out_str)
+            try:
+                content = p.read_text(encoding="utf-8")
+            except OSError as exc:
+                get_logger(__name__).debug("Failed to read output '%s': %s", p, exc)
+                content = ""
+            self._add_tab(p.stem, content, self._find_input_media_by_stem(p.stem))
 
     def open_output_folder(self) -> None:
         """Open the output directory in the system file manager."""
@@ -736,19 +751,22 @@ class MainWindow(QMainWindow):
         # Push current font overrides to preview
         self.preview.set_font_family(self.font_combo.currentText())
         self.preview.set_font_size_override(self._font_px)
-        # Try to extract a frame if a single file input is selected and is a video
+        # * Try to extract a frame for the media mapped to the current tab
         try:
-            if (
-                self.input_mode == "file"
-                and self.input_path is not None
-                and self.input_path.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}
-            ):
-                frame_path = (
-                    self.last_output_dir / f".{self.input_path.stem}.preview.png"
-                )
+            media_path = self._get_preview_media_path_for_current_tab()
+            if media_path is not None and media_path.suffix.lower() in {
+                ".mp4",
+                ".mov",
+                ".mkv",
+                ".avi",
+            }:
+                # Ensure output directory exists for the preview artifact
+                with contextlib.suppress(OSError):
+                    self.last_output_dir.mkdir(parents=True, exist_ok=True)
+                frame_path = self.last_output_dir / f".{media_path.stem}.preview.png"
                 # Prefer start timestamp; fallback to 0
                 ts = max(0.0, float(data.start))
-                extract_frame_to_file(self.input_path, ts, frame_path)
+                extract_frame_to_file(media_path, ts, frame_path)
                 img = QImage(str(frame_path))
                 if not img.isNull():
                     self.preview.set_background_image(img)
@@ -760,6 +778,54 @@ class MainWindow(QMainWindow):
             get_logger(__name__).debug("Preview frame extraction failed: %s", exc)
         # If cannot show frame, keep plain background
         self.preview.set_background_image(None)
+
+    def _get_preview_media_path_for_current_tab(self) -> Path | None:
+        """Return media path associated with the current tab or a best-effort fallback.
+
+        The method first resolves mapping by the tab's title, then falls back to
+        single-input scenarios and legacy `input_mode`/`input_path` fields.
+        """
+        # * Primary: by tab title mapping
+        idx = self.tabs.currentIndex()
+        if idx >= 0:
+            title = str(self.tabs.tabText(idx))
+            mapped = self._tab_to_media.get(title)
+            if mapped is not None:
+                return mapped
+        # * Fallback: only one known input
+        if len(self._last_inputs) == 1:
+            return self._last_inputs[0]
+        # * Legacy fallback: direct input selectors
+        if self.input_mode == "file" and self.input_path is not None:
+            return self.input_path
+        # * Last resort: if Input tab contains exactly one video file
+        items = [
+            Path(self.input_list.item(i).text()) for i in range(self.input_list.count())
+        ]
+        videos = [
+            p
+            for p in items
+            if p.is_file() and p.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}
+        ]
+        if len(videos) == 1:
+            return videos[0]
+        return None
+
+    def _find_input_media_by_stem(self, stem: str) -> Path | None:
+        """Return input media whose stem matches `stem` if available.
+
+        Searches the remembered inputs first, then the current Input tab list.
+        """
+        # * Prefer remembered inputs from the last run
+        for p in self._last_inputs:
+            if p.stem == stem:
+                return p
+        # * Fallback: scan visible Input tab entries
+        for i in range(self.input_list.count()):
+            p = Path(self.input_list.item(i).text())
+            if p.is_file() and p.stem == stem:
+                return p
+        return None
 
     def start_burn(self) -> None:
         """Start burn-in process for selected inputs using burn settings."""
@@ -930,7 +996,7 @@ class MainWindow(QMainWindow):
         while self.tabs.count() > 0:
             self.tabs.removeTab(0)
 
-    def _add_tab(self, title: str, text: str) -> None:  # noqa: PLR0915, C901
+    def _add_tab(self, title: str, text: str, media: Path | None = None) -> None:  # noqa: PLR0915, C901
         editor = WysiwygEditor()
         # Parse plain text into table rows: "[hh:mm:ss.mmm --> hh:mm:ss.mmm] speaker: text"
         # Regex for leading time range
@@ -1009,7 +1075,11 @@ class MainWindow(QMainWindow):
         editor.horizontalHeader().sectionResized.connect(
             lambda _i, _o, _n, ed=editor: self._save_table_widths(ed)
         )
+        # * Register tab and map to media (for preview frame extraction)
         self.tabs.addTab(editor, title)
+        if media is not None:
+            # * Store mapping by title for simplicity; titles are per-session unique
+            self._tab_to_media[title] = media
 
     # * Testing helpers
     def get_editor_at(self, index: int) -> WysiwygEditor | None:
