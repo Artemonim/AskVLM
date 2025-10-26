@@ -91,8 +91,12 @@ class LocalPipeline:
                 progress(msg, pct)
 
         report("Preparing audio", 0.05)
-        # * Step 1: Ensure audio is in WAV format
-        audio_path = prepare_audio(input_path, work_dir)
+        # * Step 1: Ensure audio is in WAV format (cancellable)
+        audio_path = prepare_audio(
+            input_path,
+            work_dir,
+            should_cancel=should_cancel,
+        )
         report("Audio prepared", 0.15)
 
         # * Media duration (for ETA and streaming progress)

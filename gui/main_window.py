@@ -1125,7 +1125,14 @@ class MainWindow(QMainWindow):
             # Update underlying wrapper and force reload next time
             self.pipeline.whisperx.model_name = model
             if force_reload and isinstance(self.pipeline.whisperx, WhisperXWrapper):
-                self.pipeline.whisperx.__dict__.pop("_model", None)
+                # Recreate wrapper to avoid private member access and ensure clean reload
+                wx_old = self.pipeline.whisperx
+                self.pipeline.whisperx = WhisperXWrapper(
+                    model_name=wx_old.model_name,
+                    device=wx_old.device,
+                    compute_type=wx_old.compute_type,
+                    model_root=wx_old.model_root,
+                )
         except Exception:  # noqa: BLE001
             # Fallback: rebuild pipeline with desired model
             self.pipeline = LocalPipeline(
