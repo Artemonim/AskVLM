@@ -152,6 +152,14 @@
 -   [x] Pipeline/CLI defaults updated: default Whisper model `large-v3`, default compute_type `float16`
 -   [ ] Review: separate BurnWorker vs inline worker refactor (suggestion)
 
+## Phase 1.83: Progress, Preview Parity, Streaming
+
+-   [x] Richer progress bar with elapsed/ETA and granular steps
+-   [x] High-level console logging initialization
+-   [x] Font size +/- controls affecting preview and burn-in
+-   [x] Preview matches burn styling (font size, outline, autoscale)
+-   [x] Stream transcription text to partial file during ASR
+
 ## Phase 1.85: Disfluency Cleanup (Auto)
 
 -   [ ] Core detection & cutlist

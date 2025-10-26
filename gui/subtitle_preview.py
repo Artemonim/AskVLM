@@ -35,6 +35,7 @@ class SubtitlePreview(QWidget):
         self._bg: QPixmap | None = None
         self._text_lines: list[str] = []
         self._font_family: str | None = None
+        self._font_px_override: int | None = None
         # * Bottom padding as fraction of widget height
         self._bottom_padding_ratio = 0.08
         # * Inter-line spacing multiplier
@@ -75,6 +76,14 @@ class SubtitlePreview(QWidget):
         self._font_family = family
         self.update()
 
+    def set_font_size_override(self, pixels: int | None) -> None:
+        """Set an absolute font size in pixels; None restores auto-scaling.
+
+        The override ensures the preview matches forced style used for burn-in.
+        """
+        self._font_px_override = pixels if (pixels or 0) > 0 else None
+        self.update()
+
     @staticmethod
     def layout_text(text: str, max_line_chars: int, max_lines: int) -> list[str]:
         """Split text into lines respecting character and line limits.
@@ -112,10 +121,14 @@ class SubtitlePreview(QWidget):
         if not self._text_lines:
             return
 
-        # Compute font size from height with conservative bounds
-        font_px = max(self._min_font_px, min(self._max_font_px, int(height * 0.045)))
-        font = QFont(self._font_family or "Open Sans", pointSize=font_px)
-        font.setBold(True)
+        # Compute font size: respect override; otherwise auto-scale similarly to burn
+        if self._font_px_override is not None:
+            font_px = int(max(10, min(96, self._font_px_override)))
+        else:
+            # Approximate ffmpeg burn autoscale (~3% of height, clamped)
+            font_px = max(20, min(38, int(height * 0.03)))
+        font = QFont(self._font_family or "Open Sans")
+        font.setPixelSize(font_px)
         painter.setRenderHints(
             QPainter.RenderHint.Antialiasing | QPainter.RenderHint.TextAntialiasing
         )
@@ -129,7 +142,8 @@ class SubtitlePreview(QWidget):
         # Outline then fill for readability
         outline_color = QColor(0, 0, 0)
         fill_color = QColor(255, 255, 255)
-        stroke_width = max(2.0, min(6.0, font_px * 0.12))
+        # Match libass default Outline=2 (constant px)
+        stroke_width = 2.0
         for i, line in enumerate(self._text_lines):
             path = QPainterPath()
             w = metrics.horizontalAdvance(line)

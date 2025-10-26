@@ -2,11 +2,9 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QGroupBox,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -15,12 +13,8 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
+    QWidget,
 )
-
-if TYPE_CHECKING:
-    from PySide6.QtWidgets import (
-        QWidget,
-    )
 
 
 @dataclass
@@ -32,11 +26,11 @@ class SpeakerStats:
     tabs: list[str]
 
 
-class SpeakerSidebar(QGroupBox):
+class SpeakerSidebar(QWidget):
     """Sidebar widget with speaker list, rename/add, and usage counts per tab."""
 
-    def __init__(self, title: str = "Speakers", parent: QWidget | None = None) -> None:
-        super().__init__(title, parent)
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
         self._speakers: list[str] = ["speaker_1"]
         self._tab_usages: dict[str, Counter[str]] = defaultdict(Counter)
 

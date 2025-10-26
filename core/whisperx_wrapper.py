@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
 # Optional heavy deps (loaded via importlib)
@@ -119,7 +120,13 @@ class WhisperXWrapper:
             self._align_model = whisperx_mod
 
     def transcribe(
-        self, audio_path: Path, language: str | None = None, **kwargs: object
+        self,
+        audio_path: Path,
+        language: str | None = None,
+        *,
+        on_segment: Callable[[dict[str, Any]], None] | None = None,
+        progress: Callable[[float, str], None] | None = None,
+        **kwargs: object,
     ) -> dict[str, Any]:
         """Transcribe audio and return faster-whisper style result dict.
 
@@ -144,9 +151,17 @@ class WhisperXWrapper:
             start = float(seg.start)
             end = float(seg.end)
             txt = str(seg.text or "").strip()
-            segments_out.append({"start": start, "end": end, "text": txt})
+            seg_dict = {"start": start, "end": end, "text": txt}
+            segments_out.append(seg_dict)
             if txt:
                 text_parts.append(txt)
+            # * Streaming callback for incremental handling (e.g., ETA/progress, partial files)
+            if on_segment is not None:
+                on_segment(seg_dict)
+            if progress is not None and end > 0:
+                # * Best-effort progress within transcription phase
+                p = max(0.0, min(1.0, end))
+                progress(p, "transcribe")
         return {"text": " ".join(text_parts).strip(), "segments": segments_out}
 
     def align(

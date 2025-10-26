@@ -19,6 +19,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -37,11 +39,26 @@ from core.ffmpeg import (
     start_burn_process,
 )
 from core.pipelines import LocalPipeline
+from core.whisperx_wrapper import WhisperXWrapper
 from gui.speaker_sidebar import SpeakerSidebar
 from gui.subtitle_preview import SubtitlePreview
 from gui.wysiwyg_editor import TableRow, WysiwygEditor
 from utils.exporters import SubtitleRules, export_document, export_srt_with_rules
-from utils.logging import get_logger
+from utils.logging import get_logger, setup_logging
+
+
+def _format_eta(seconds: float) -> str:
+    """Return HH:MM:SS or MM:SS string for ETA display."""
+    try:
+        total = int(max(0.0, float(seconds)))
+    except Exception:  # noqa: BLE001
+        total = 0
+    h = total // 3600
+    m = (total % 3600) // 60
+    s = total % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
 
 
 class _InlineBurnWorker(QObject):
@@ -60,12 +77,14 @@ class _InlineBurnWorker(QObject):
         *,
         norm: bool,
         font: str | None,
+        font_px: int | None = None,
     ) -> None:
         super().__init__()
         self._inputs = paths
         self._out_dir = outd
         self._normalize = norm
         self._font_name = font
+        self._font_px = font_px
         self._cancel = False
         self._proc: Popen[bytes] | None = None
 
@@ -88,6 +107,7 @@ class _InlineBurnWorker(QObject):
         try:
             outputs: list[str] = []
             total = max(1, len(self._inputs))
+            start_time = time.time()
             for idx, media in enumerate(self._inputs):
                 if self._is_canceled():
                     self.canceled.emit()
@@ -103,10 +123,17 @@ class _InlineBurnWorker(QObject):
                     if prog_file.exists():
                         prog_file.unlink()
                 self.progress.emit((idx + 0.1) / total, prefix + "Burning subtitles")
+                # Force style when preview overrides size
+                force_style = (
+                    f"Fontsize={int(self._font_px or 0)},Outline=2,Shadow=0"
+                    if (self._font_px or 0) > 0
+                    else None
+                )
                 proc = start_burn_process(
                     media,
                     srt_path,
                     burned_out,
+                    force_style,
                     normalize_audio=self._normalize,
                     font_name=self._font_name,
                     progress_path=prog_file,
@@ -153,13 +180,27 @@ class _InlineBurnWorker(QObject):
                     if p_ms >= 0 and duration_s > 0:
                         ratio = min(1.0, (p_ms / 1000.0) / duration_s)
                         shown = min(0.995, base + ratio * (end - base))
+                        # Compute ETA
+                        elapsed = time.time() - start_time
+                        processed = max(1e-6, (idx + ratio))
+                        total_units = float(total)
+                        est_total = elapsed / processed * total_units
+                        eta = max(0.0, est_total - elapsed)
+                        eta_str = _format_eta(eta)
+                        self.progress.emit(
+                            shown, prefix + f"Burning subtitles (ETA {eta_str})"
+                        )
                     else:
                         shown = min(0.995, shown + 0.02)
+                    # Provide heartbeat when no structured progress is available
                     self.progress.emit(shown, prefix + "Burning subtitles")
                     time.sleep(poll_sleep_s)
             self.finished.emit(outputs)
         except Exception as e:  # noqa: BLE001
-            self.error.emit(str(e))
+            # Surface error details in both status bar and log
+            msg = str(e)
+            get_logger(__name__).error("Processing error: %s", msg)
+            self.error.emit(msg)
 
 
 if TYPE_CHECKING:
@@ -193,6 +234,10 @@ class MainWindow(QMainWindow):
 
     def __init__(self) -> None:  # noqa: PLR0915
         super().__init__()
+        # Ensure logging to console for high-level operations
+        with contextlib.suppress(Exception):
+            setup_logging()
+        get_logger(__name__).info("MainWindow initializing")
         self.setWindowTitle("Artemonim's Speech Kit")
         self.resize(800, 600)
 
@@ -213,16 +258,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
 
-        # * Input selection row (file or folder)
-        input_row = QHBoxLayout()
-        self.btn_choose_file = QPushButton("Choose File…")
-        self.btn_choose_folder = QPushButton("Choose Folder…")
-        self.lbl_input = QLabel("No input selected")
-        self.lbl_input.setMinimumWidth(300)
-        input_row.addWidget(self.btn_choose_file)
-        input_row.addWidget(self.btn_choose_folder)
-        input_row.addWidget(self.lbl_input, 1)
-        layout.addLayout(input_row)
+        # (Removed legacy top input row; input management lives in the Input tab)
 
         # * Output directory row
         out_row = QHBoxLayout()
@@ -252,7 +288,10 @@ class MainWindow(QMainWindow):
         self.format_combo.setCurrentText("srt")
         opts_row.addWidget(self.format_combo)
         opts_row.addStretch(1)
-        # Start/Cancel moved to options row
+        # Quality toggle and Start/Cancel
+        self.btn_quality = QPushButton("Quality: Good")
+        self._quality_mode: Literal["good", "fast"] = "good"
+        opts_row.addWidget(self.btn_quality)
         self.btn_start = QPushButton("Start")
         self.btn_cancel = QPushButton("Cancel")
         self.btn_cancel.setEnabled(_UI_UNCHECKED)
@@ -304,16 +343,55 @@ class MainWindow(QMainWindow):
         except Exception as exc:  # noqa: BLE001
             get_logger(__name__).debug("Font families enumeration failed: %s", exc)
         burn_row.addWidget(self.font_combo)
+        # Font size controls
+        burn_row.addWidget(QLabel("Size:"))
+        self.btn_font_dec = QPushButton("-")
+        self.btn_font_inc = QPushButton("+")
+        burn_row.addWidget(self.btn_font_dec)
+        burn_row.addWidget(self.btn_font_inc)
         burn_row.addStretch(1)
         layout.addLayout(burn_row)
 
-        # * Speaker sidebar + tabbed viewers + subtitle preview (Phase 1.81)
+        # * Left tabs (Speakers, Input) + center editors + right preview
         self.splitter = QSplitter()
+        # Left tabs
+        self.left_tabs = QTabWidget()
+        # Input tab (make first)
+        input_tab = QWidget()
+        in_layout = QVBoxLayout(input_tab)
+        in_layout.setContentsMargins(4, 4, 4, 4)
+        self.input_list = QListWidget()
+        self.input_list.setSelectionMode(
+            self.input_list.SelectionMode.ExtendedSelection
+        )
+        in_layout.addWidget(self.input_list, 1)
+        in_controls = QHBoxLayout()
+        self.btn_in_add_file = QPushButton("Add File(s)…")
+        self.btn_in_remove = QPushButton("Remove")
+        self.btn_in_up = QPushButton("Up")
+        self.btn_in_down = QPushButton("Down")
+        for b in (
+            self.btn_in_add_file,
+            self.btn_in_remove,
+            self.btn_in_up,
+            self.btn_in_down,
+        ):
+            in_controls.addWidget(b)
+        in_controls.addStretch(1)
+        in_layout.addLayout(in_controls)
+        self.left_tabs.addTab(input_tab, "Input")
+        # Speakers tab (second), add Sidebar directly without legacy label/wrapper
+        speakers_tab = QWidget()
+        sp_layout = QVBoxLayout(speakers_tab)
+        sp_layout.setContentsMargins(0, 0, 0, 0)
         self.sidebar = SpeakerSidebar()
-        self.splitter.addWidget(self.sidebar)
+        sp_layout.addWidget(self.sidebar)
+        self.left_tabs.addTab(speakers_tab, "Speakers")
+        self.splitter.addWidget(self.left_tabs)
+        # Center editors
         self.tabs = QTabWidget()
         self.splitter.addWidget(self.tabs)
-        # New right preview pane
+        # Right preview
         self.preview = SubtitlePreview()
         self.splitter.addWidget(self.preview)
         self.splitter.setStretchFactor(0, 0)
@@ -349,12 +427,7 @@ class MainWindow(QMainWindow):
         self._tab_to_media: dict[str, Path] = {}
 
         # * Wire up signals
-        self.btn_choose_file.clicked.connect(
-            self._log_wrap(self.choose_file, "Choose File")
-        )
-        self.btn_choose_folder.clicked.connect(
-            self._log_wrap(self.choose_folder, "Choose Folder")
-        )
+        # (Removed legacy top input actions)
         self.out_dir_btn.clicked.connect(
             self._log_wrap(self.choose_output_dir, "Choose Output Dir")
         )
@@ -364,6 +437,21 @@ class MainWindow(QMainWindow):
             self._log_wrap(self.open_output_folder, "Open Output Folder")
         )
         self.btn_burn.clicked.connect(self._log_wrap(self.start_burn, "Burn"))
+        # Input tab actions
+        self.btn_in_add_file.clicked.connect(
+            self._log_wrap(self._input_add_file, "Input Add File")
+        )
+        self.btn_in_remove.clicked.connect(
+            self._log_wrap(self._input_remove_selected, "Input Remove")
+        )
+        self.btn_in_up.clicked.connect(self._log_wrap(self._input_move_up, "Input Up"))
+        self.btn_in_down.clicked.connect(
+            self._log_wrap(self._input_move_down, "Input Down")
+        )
+        # Quality toggle
+        self.btn_quality.clicked.connect(
+            self._log_wrap(self._toggle_quality, "Toggle Quality")
+        )
         # Preview updates on options change
         self.spin_line_len.valueChanged.connect(
             lambda _v: self._update_preview_for_selection()
@@ -372,6 +460,8 @@ class MainWindow(QMainWindow):
             lambda _v: self._update_preview_for_selection()
         )
         self.font_combo.currentTextChanged.connect(self.preview.set_font_family)
+        self.btn_font_dec.clicked.connect(lambda: self._nudge_font_size(-2))
+        self.btn_font_inc.clicked.connect(lambda: self._nudge_font_size(+2))
 
         # * Ensure at least one empty tab is visible
         self._clear_tabs()
@@ -386,6 +476,9 @@ class MainWindow(QMainWindow):
         self.btn_burn.setEnabled(_UI_UNCHECKED)
         # Initialize preview font
         self.preview.set_font_family(self.font_combo.currentText())
+        self._font_px: int | None = None
+        # Apply initial quality
+        self._apply_quality_to_pipeline()
 
     def choose_file(self) -> None:
         """Choose a single media file for processing."""
@@ -400,7 +493,6 @@ class MainWindow(QMainWindow):
             self.input_mode = "file"
             self.input_path = p
             self.last_input_dir = p.parent
-            self.lbl_input.setText(str(p))
             self.status.showMessage(f"Selected file: {p}")
 
     def choose_folder(self) -> None:
@@ -413,7 +505,6 @@ class MainWindow(QMainWindow):
             self.input_mode = "folder"
             self.input_path = p
             self.last_input_dir = p
-            self.lbl_input.setText(str(p))
             self.status.showMessage(f"Selected folder: {p}")
 
     def choose_output_dir(self) -> None:
@@ -428,14 +519,17 @@ class MainWindow(QMainWindow):
             self.status.showMessage(f"Output directory: {p}")
 
     def _set_controls_enabled(self, enabled: bool) -> None:  # noqa: FBT001
-        self.btn_choose_file.setEnabled(enabled)
-        self.btn_choose_folder.setEnabled(enabled)
+        if hasattr(self, "btn_choose_file"):
+            self.btn_choose_file.setEnabled(enabled)
+        if hasattr(self, "btn_choose_folder"):
+            self.btn_choose_folder.setEnabled(enabled)
         self.out_dir_btn.setEnabled(enabled)
         self.out_dir_edit.setEnabled(enabled)
         self.chk_diar.setEnabled(enabled)
         self.chk_dialog.setEnabled(enabled)
         self.chk_save_srt.setEnabled(enabled)
         self.format_combo.setEnabled(enabled)
+        self.btn_quality.setEnabled(enabled)
         self.btn_start.setEnabled(enabled)
         self.btn_cancel.setEnabled(not enabled)
         if self._burn_worker is None:
@@ -446,8 +540,13 @@ class MainWindow(QMainWindow):
     def start_processing(self) -> None:
         """Start pipeline processing in a background thread (QThread)."""
         # Validate input
-        if not self.input_path or self.input_mode not in {"file", "folder"}:
-            QMessageBox.information(self, "No input", "Please choose a file or folder.")
+        inputs = self._gather_inputs()
+        if not inputs:
+            QMessageBox.information(
+                self,
+                "No input",
+                "Please add inputs in the Input tab.",
+            )
             return
         out_dir = Path(self.out_dir_edit.text()).resolve()
         try:
@@ -456,27 +555,15 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Output error", f"Cannot create output dir: {e}")
             return
 
-        # Build inputs list
-        if self.input_mode == "file":
-            inputs = [self.input_path]
-        else:
-            # Accept common media extensions
-            patterns = ["*.wav", "*.mp3", "*.mp4", "*.avi", "*.mkv"]
-            inputs = []
-            for pat in patterns:
-                inputs.extend(self.input_path.glob(pat))
-            if not inputs:
-                QMessageBox.information(
-                    self, "No media", "No media files found in folder."
-                )
-                return
+        # Apply model quality on each run
+        self._apply_quality_to_pipeline(force_reload=True)
 
         # Configure worker options
         opts = {
             "enable_diarization": self.chk_diar.isChecked(),
             "enable_dialog_blocks": self.chk_dialog.isChecked(),
             "export_format": str(self.format_combo.currentText()),
-            "single_view": self.input_mode == "file",
+            "single_view": len(inputs) == 1,
             "save_srt": self.chk_save_srt.isChecked(),
             # * Subtitle readability options for exporters
             "subtitle_max_line_width": int(self.spin_line_len.value()),
@@ -532,6 +619,7 @@ class MainWindow(QMainWindow):
 
     def on_progress(self, frac: float, msg: str) -> None:
         """Update progress bar and status message."""
+        # Show progress percentage, elapsed and ETA when encoded in msg
         self.progress.setValue(int(max(0.0, min(1.0, frac)) * 100))
         if msg:
             self.status.showMessage(msg)
@@ -541,6 +629,8 @@ class MainWindow(QMainWindow):
         # Minimal Phase 1.7: surface critical warnings in GUI
         if not line:
             return
+        # Mirror into console logger for visibility when launching from terminal
+        get_logger(__name__).info("Worker: %s", line)
         if (
             "Burn-in failed" in line or "SRT export failed" in line
         ) and self._can_show_modal():
@@ -643,6 +733,9 @@ class MainWindow(QMainWindow):
             data.text, self.spin_line_len.value(), self.spin_max_lines.value()
         )
         self.preview.set_text_lines(lines)
+        # Push current font overrides to preview
+        self.preview.set_font_family(self.font_combo.currentText())
+        self.preview.set_font_size_override(self._font_px)
         # Try to extract a frame if a single file input is selected and is a video
         try:
             if (
@@ -659,6 +752,8 @@ class MainWindow(QMainWindow):
                 img = QImage(str(frame_path))
                 if not img.isNull():
                     self.preview.set_background_image(img)
+                    # Ensure preview font override applied after image update
+                    self.preview.set_font_size_override(self._font_px)
                     return
         except Exception as exc:  # noqa: BLE001
             # * Best-effort preview; log and continue with plain background
@@ -703,7 +798,7 @@ class MainWindow(QMainWindow):
         self._burn_thread = QThread(self)
         # Inline lightweight burn worker (signals via lambda wrappers)
         self._burn_worker = _InlineBurnWorker(
-            inputs, out_dir, norm=normalize, font=font_name
+            inputs, out_dir, norm=normalize, font=font_name, font_px=self._font_px
         )
         self._burn_worker.moveToThread(self._burn_thread)
         self._burn_thread.started.connect(self._burn_worker.run)
@@ -730,6 +825,20 @@ class MainWindow(QMainWindow):
         self.chk_normalize.setEnabled(_UI_CHECKED)
         self.font_combo.setEnabled(_UI_CHECKED)
         self.status.showMessage("Burn completed")
+
+    # * Font size helpers
+    def _nudge_font_size(self, delta: int) -> None:
+        """Increase or decrease preview/burn font size by delta pixels.
+
+        When None, initialize from current auto-estimate (~3% of preview height).
+        """
+        if self._font_px is None:
+            est = max(20, min(38, int(self.preview.height() * 0.03)))
+            self._font_px = est
+        self._font_px = int(max(10, min(96, (self._font_px or 0) + int(delta))))
+        self.preview.set_font_size_override(self._font_px)
+        # Trigger re-layout
+        self._update_preview_for_selection()
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802
         """Ensure we cancel background tasks and persist settings on close."""
@@ -916,6 +1025,115 @@ class MainWindow(QMainWindow):
             s.setValue("ui/table_speaker_width", int(editor.columnWidth(1)))
             s.setValue("ui/table_text_width", int(editor.columnWidth(2)))
 
+    # * Input helpers
+    def _gather_inputs(self) -> list[Path]:
+        def expand_entry(entry: str) -> list[Path]:
+            p = Path(entry)
+            if p.is_dir():
+                try:
+                    # Include all immediate files in the directory (no extension filter)
+                    return [c for c in p.iterdir() if c.is_file()]
+                except OSError:
+                    return []
+            return [p] if p.is_file() else []
+
+        # Prefer entries from Input tab
+        items = (
+            [self.input_list.item(i).text() for i in range(self.input_list.count())]
+            if hasattr(self, "input_list") and self.input_list.count() > 0
+            else []
+        )
+        collected = [p for s in items for p in expand_entry(s)]
+
+        # Top-row selectors removed; rely entirely on Input tab entries
+
+        # Deduplicate preserving order
+        uniq: list[Path] = []
+        seen: set[str] = set()
+        for p in collected:
+            try:
+                s = str(p.resolve())
+            except OSError:
+                s = str(p)
+            if s not in seen:
+                seen.add(s)
+                uniq.append(Path(s))
+        return uniq
+
+    def _input_add_file(self) -> None:
+        # Allow selecting multiple files; if a directory is given, add it directly
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add File(s)",
+            str(self.last_input_dir),
+            "All Files (*.*)",
+        )
+        for fn in files:
+            p = Path(fn)
+            if not p.exists():
+                continue
+            if p.is_dir():
+                # Add directory itself; later expansion happens in _gather_inputs
+                self.last_input_dir = p
+                self.input_list.addItem(QListWidgetItem(str(p)))
+                continue
+            if p.is_file():
+                self.last_input_dir = p.parent
+                self.input_list.addItem(QListWidgetItem(str(p)))
+
+    # (Removed _input_add_folder)
+
+    def _input_remove_selected(self) -> None:
+        for item in self.input_list.selectedItems():
+            row = self.input_list.row(item)
+            self.input_list.takeItem(row)
+
+    # (Removed _input_clear)
+
+    def _input_move_up(self) -> None:
+        sel = self.input_list.selectedItems()
+        if not sel:
+            return
+        row = self.input_list.row(sel[0])
+        if row <= 0:
+            return
+        item = self.input_list.takeItem(row)
+        self.input_list.insertItem(row - 1, item)
+        self.input_list.setCurrentItem(item)
+
+    def _input_move_down(self) -> None:
+        sel = self.input_list.selectedItems()
+        if not sel:
+            return
+        row = self.input_list.row(sel[0])
+        if row >= self.input_list.count() - 1:
+            return
+        item = self.input_list.takeItem(row)
+        self.input_list.insertItem(row + 1, item)
+        self.input_list.setCurrentItem(item)
+
+    # * Quality toggle
+    def _toggle_quality(self) -> None:
+        self._quality_mode = "fast" if self._quality_mode == "good" else "good"
+        self.btn_quality.setText(
+            "Quality: Good" if self._quality_mode == "good" else "Quality: Fast"
+        )
+
+    def _apply_quality_to_pipeline(self, *, force_reload: bool = False) -> None:
+        model = "large-v3" if self._quality_mode == "good" else "small"
+        try:
+            # Update underlying wrapper and force reload next time
+            self.pipeline.whisperx.model_name = model
+            if force_reload and isinstance(self.pipeline.whisperx, WhisperXWrapper):
+                self.pipeline.whisperx.__dict__.pop("_model", None)
+        except Exception:  # noqa: BLE001
+            # Fallback: rebuild pipeline with desired model
+            self.pipeline = LocalPipeline(
+                enable_diarization=bool(self.chk_diar.isChecked()),
+                enable_dialog_blocks=bool(self.chk_dialog.isChecked()),
+                whisper_model=model,
+            )
+
 
 class PipelineWorker(QObject):
     """Background worker that runs the LocalPipeline over one or more inputs."""
@@ -951,7 +1169,7 @@ class PipelineWorker(QObject):
     def _raise_canceled(self) -> None:
         """Raise a cancellation error to abort processing cleanly."""
         msg = "Canceled"
-        raise RuntimeError(msg)
+        raise CancelledByUserError(msg)
 
     def _export_primary(self, doc: Any, media: Path, fmt: str) -> Path:  # noqa: ANN401
         if fmt.lower() == "none":
@@ -995,61 +1213,88 @@ class PipelineWorker(QObject):
                 self.log.emit(f"SRT export failed: {ex}")
         return srt_path
 
-    def run(self) -> None:
+    def run(self) -> None:  # noqa: C901
         """Execute the processing pipeline."""
         try:
             outputs: list[str] = []
             view_text: str = ""
             total = max(1, len(self._inputs))
+
+            def make_cb(
+                prefix: str, base: float, start_ts: float
+            ) -> Callable[[str, float], None]:
+                def _cb(msg: str, f: float) -> None:
+                    frac_overall = min(0.99, base + max(0.0, min(1.0, f)) / total)
+                    elapsed = max(0.0, time.time() - start_ts)
+                    inner = max(1e-4, min(0.9999, f if f > 0 else 0.0001))
+                    est_total = elapsed / inner
+                    eta = max(0.0, est_total - elapsed)
+                    msg2 = f"{msg} (elapsed {_format_eta(elapsed)} • ETA {_format_eta(eta)})"
+                    self._report(prefix + msg2, frac_overall)
+                    if self._cancel:
+                        self._raise_canceled()
+
+                return _cb
+
             for idx, media in enumerate(self._inputs):
                 if self._cancel:
                     self.canceled.emit()
                     return
                 prefix = f"[{idx + 1}/{total}] " if total > 1 else ""
-                # Inline progress callback with cancel support
                 base = idx / total
+                cb = make_cb(prefix, base, time.time())
 
-                def cb(
-                    msg: str, f: float, *, _prefix: str = prefix, _base: float = base
-                ) -> None:
-                    self._report(_prefix + msg, min(0.99, _base + f / total))
-                    if self._cancel:
-                        # Use helper to raise so linter/mypy don't complain about inline raise
-                        self._raise_canceled()
+                try:
+                    lw = self._opts.get("subtitle_max_line_width", 42)
+                    ml = self._opts.get("subtitle_max_lines", 2)
+                    lw_i = int(lw) if isinstance(lw, (int, str)) else 42
+                    ml_i = int(ml) if isinstance(ml, (int, str)) else 2
+                    doc = self._pipeline.process(
+                        media,
+                        self._out_dir,
+                        progress=cb,
+                        should_cancel=lambda: bool(self._cancel),
+                        subtitle_max_line_width=lw_i,
+                        subtitle_max_lines=ml_i,
+                    )
+                    fmt = str(self._opts.get("export_format", "txt"))
+                    out_primary = self._export_primary(doc, media, fmt)
+                    outputs.append(str(out_primary))
+                    self._maybe_export_srt(doc, media, fmt, outputs)
+                    if bool(self._opts.get("single_view", False)):
+                        view_text = doc.get_full_text()
+                    self._report(prefix + "Exported", min(0.99, (idx + 1) / total))
+                except CancelledByUserError:
+                    # Treat cancel as a normal early-exit path
+                    self.canceled.emit()
+                    return
+                except Exception as ex:  # noqa: BLE001
+                    self.log.emit(f"Skipping '{media}': {ex}")
+                    self._report(
+                        prefix + "Skipped (error)", min(0.99, (idx + 1) / total)
+                    )
+                    continue
 
-                lw = self._opts.get("subtitle_max_line_width", 42)
-                ml = self._opts.get("subtitle_max_lines", 2)
-                lw_i = int(lw) if isinstance(lw, (int, str)) else 42
-                ml_i = int(ml) if isinstance(ml, (int, str)) else 2
-                doc = self._pipeline.process(
-                    media,
-                    self._out_dir,
-                    progress=cb,
-                    subtitle_max_line_width=lw_i,
-                    subtitle_max_lines=ml_i,
-                )
-                fmt = str(self._opts.get("export_format", "txt"))
-                out_primary = self._export_primary(doc, media, fmt)
-                outputs.append(str(out_primary))
-                self._maybe_export_srt(doc, media, fmt, outputs)
-                # Burn removed from pipeline; handled by separate BurnWorker
-                if bool(self._opts.get("single_view", False)):
-                    view_text = doc.get_full_text()
-                self._report(prefix + "Exported", min(0.99, (idx + 1) / total))
             self._report("Completed", 1.0)
             self.log.emit("Processing completed successfully")
+            if not outputs:
+                # Emit error directly without raising
+                self.error.emit("No valid inputs were processed")
+                return
             self.finished.emit(outputs, view_text)
         except Exception as e:  # noqa: BLE001
             self.error.emit(str(e))
 
 
-def _launch_gui() -> int:
-    """Create Qt application and show the main window."""
+def main() -> int:
+    """Start the Qt application and show the main window."""
+    get_logger(__name__).info("Application starting")
     app = QApplication(sys.argv)
     w = MainWindow()
     w.show()
+    get_logger(__name__).info("MainWindow shown successfully")
     return app.exec()
 
 
-if __name__ == "__main__":
-    raise SystemExit(_launch_gui())
+if __name__ == "__main__":  # pragma: no cover - manual run path
+    raise SystemExit(main())
