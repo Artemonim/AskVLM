@@ -5,11 +5,9 @@ from PySide6.QtWidgets import QApplication
 
 from core.diarization import DiarizationPipeline
 from core.llm_formatter import LLMFormatter
-from core.pipelines import LocalPipeline, create_default_local_pipeline
 from core.whisperx_wrapper import WhisperXWrapper
 from editing.text_model import Document, TextSegment
 from gui.main_window import MainWindow, PipelineWorker
-from utils.exporters import export_document
 
 
 def test_diarization_returns_list_without_pyannote() -> None:
@@ -100,9 +98,6 @@ def test_processing_fixture_twice_produces_two_tabs(tmp_path: Path) -> None:
     assert ed0.item(0, 2).text() if ed0.item(0, 2) else ""
     assert ed1.rowCount() >= 1
     assert ed1.item(0, 2).text() if ed1.item(0, 2) else ""
-
-
-    
 
 
 def test_time_parsing_populates_nonzero_times() -> None:

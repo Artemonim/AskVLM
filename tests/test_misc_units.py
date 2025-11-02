@@ -2,14 +2,14 @@ from pathlib import Path
 
 import pytest
 
-from utils import logging as logutils
-from utils import exporters as ex
-from utils import downloader
 from core import ffmpeg as ffm
 from editing.text_model import Document, TextSegment
+from utils import downloader
+from utils import exporters as ex
+from utils import logging as logutils
 
 
-def test_setup_logging_and_get_logger():
+def test_setup_logging_and_get_logger() -> None:
     """setup_logging adds a StreamHandler and sets level; get_logger returns a logger."""
     logutils.setup_logging()
     root = logutils.logging.getLogger()
@@ -18,13 +18,13 @@ def test_setup_logging_and_get_logger():
     assert lg.name == "x"
 
 
-def test_ffmpeg_get_media_duration_seconds_success(monkeypatch: pytest.MonkeyPatch):
+def test_ffmpeg_get_media_duration_seconds_success(monkeypatch: pytest.MonkeyPatch) -> None:
     """get_media_duration_seconds parses float duration from ffprobe result."""
     monkeypatch.setattr(ffm.ffmpeg, "probe", lambda p: {"format": {"duration": "12.5"}})
     assert ffm.get_media_duration_seconds("file") == pytest.approx(12.5)
 
 
-def test_parse_ts_and_export_document_txt(tmp_path: Path):
+def test_parse_ts_and_export_document_txt(tmp_path: Path) -> None:
     """_parse_ts_srt_to_seconds parses ms; export_document('txt') writes speaker text."""
     # _parse_ts_srt_to_seconds is used via public exporters; sanity-check indirectly
     assert ex._parse_ts_srt_to_seconds("00:00:00,500") == pytest.approx(0.5)  # type: ignore[attr-defined]
@@ -35,9 +35,7 @@ def test_parse_ts_and_export_document_txt(tmp_path: Path):
     assert "speaker_1: Hi" in out.read_text(encoding="utf-8")
 
 
-def test_downloader_download_model_not_implemented(tmp_path: Path):
+def test_downloader_download_model_not_implemented(tmp_path: Path) -> None:
     """download_model is not implemented and raises NotImplementedError."""
     with pytest.raises(NotImplementedError):
         downloader.download_model("m", "u", tmp_path)
-
-

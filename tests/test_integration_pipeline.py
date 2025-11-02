@@ -1,5 +1,5 @@
-from collections.abc import Callable
 import os
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -77,17 +77,19 @@ def test_real_diarization_pyannote_small(tmp_path: Path) -> None:
 
         pipeline.diarizer = DiarizationPipeline(device="cuda")
     segs = pipeline.diarizer.diarize(str(wav)) if pipeline.diarizer else []
-    assert isinstance(segs, list) and len(segs) > 0
+    assert isinstance(segs, list)
+    assert len(segs) > 0
 
 
-def test_integration_pipeline_fast_smoke_with_diarization_and_export(tmp_path: Path) -> None:
+def test_integration_pipeline_fast_smoke_with_diarization_and_export(
+    tmp_path: Path,
+) -> None:
     """Integration smoke on small model with diarization and export.
 
     - Uses small model for ASR
     - Enables diarization (pyannote token is loaded from .env)
     - Exports TXT and SRT and checks presence
     """
-
     fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
     if not fixture.exists():
         # Gracefully skip if fixture is not available locally
@@ -112,8 +114,10 @@ def test_integration_pipeline_fast_smoke_with_diarization_and_export(tmp_path: P
     srtp = tmp_path / f"{fixture.stem}.srt"
     export_document(doc, "txt", txtp)
     export_document(doc, "srt", srtp)
-    assert txtp.exists() and txtp.stat().st_size >= 0
-    assert srtp.exists() and srtp.stat().st_size >= 0
+    assert txtp.exists()
+    assert txtp.stat().st_size >= 0
+    assert srtp.exists()
+    assert srtp.stat().st_size >= 0
 
 
 @pytest.mark.parametrize(

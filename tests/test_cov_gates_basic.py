@@ -1,34 +1,35 @@
 import json
 import os
-from pathlib import Path
-
-import builtins
 import types
+from pathlib import Path
+from typing import Never
 
 import pytest
 
-from core import ffmpeg as ffm
 from core import audio_io
+from core import ffmpeg as ffm
 from core import settings as core_settings
 from core.gpu_guard import GPUResourceGuard
 from utils import downloader
 
 
-def test_find_project_root_points_to_repo_root():
+def test_find_project_root_points_to_repo_root() -> None:
     """Root discovery returns a directory containing pyproject.toml."""
     # Ensure it returns a directory containing pyproject.toml
     root = core_settings._find_project_root()
     assert (root / "pyproject.toml").exists()
 
 
-def test_get_project_cache_dir_is_under_root():
+def test_get_project_cache_dir_is_under_root() -> None:
     """Cache directory is .cache at project root."""
     cache = core_settings.get_project_cache_dir()
     assert cache.name == ".cache"
     assert cache.parent.exists()
 
 
-def test_configure_ml_caches_sets_env_and_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_configure_ml_caches_sets_env_and_dirs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """configure_ml_caches creates dirs and sets env variables."""
     used = core_settings.configure_ml_caches(cache_root=tmp_path)
     # Directories
@@ -43,7 +44,9 @@ def test_configure_ml_caches_sets_env_and_dirs(tmp_path: Path, monkeypatch: pyte
     assert os.environ.get("XDG_CACHE_HOME") == str(used)
 
 
-def test_load_settings_writes_and_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_load_settings_writes_and_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """load_settings writes defaults and applies env override for hf_token."""
     settings_path = tmp_path / "settings.json"
     # First load creates defaults and writes file
@@ -59,7 +62,7 @@ def test_load_settings_writes_and_reads(tmp_path: Path, monkeypatch: pytest.Monk
     assert s2.hf_token == "TOKEN123"
 
 
-def test_downloader_ensure_and_check(tmp_path: Path):
+def test_downloader_ensure_and_check(tmp_path: Path) -> None:
     """ensure_models_dir creates dir; check_missing_models returns missing names."""
     models_dir = tmp_path / "models"
     downloader.ensure_models_dir(models_dir)
@@ -71,7 +74,7 @@ def test_downloader_ensure_and_check(tmp_path: Path):
     assert missing == ["m2.bin"]
 
 
-def test_load_models_config(tmp_path: Path):
+def test_load_models_config(tmp_path: Path) -> None:
     """load_models_config loads JSON and returns empty dict for absent file."""
     cfg_path = tmp_path / "models.json"
     cfg_path.write_text(json.dumps({"a": "1"}), encoding="utf-8")
@@ -80,21 +83,27 @@ def test_load_models_config(tmp_path: Path):
     assert downloader.load_models_config(tmp_path / "absent.json") == {}
 
 
-def test_ffmpeg_get_media_duration_seconds_handles_error(monkeypatch: pytest.MonkeyPatch):
+def test_ffmpeg_get_media_duration_seconds_handles_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """get_media_duration_seconds returns 0.0 when ffprobe raises."""
-    def raise_err(_):  # noqa: ANN001
-        raise RuntimeError("ffprobe error")
+
+    def raise_err(_) -> Never:  # noqa: ANN001
+        msg = "ffprobe error"
+        raise RuntimeError(msg)
 
     monkeypatch.setattr(ffm.ffmpeg, "probe", raise_err)
     assert ffm.get_media_duration_seconds("nope.mp4") == 0.0
 
 
-def test_prepare_audio_non_cancellable_creates_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_prepare_audio_non_cancellable_creates_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """prepare_audio non-cancellable path writes expected WAV file."""
     # Arrange a fake extract_audio that writes a file to the expected destination
     created: list[Path] = []
 
-    def fake_extract(inp, out, sample_rate=16000, channels=1):  # noqa: ANN001, ARG001
+    def fake_extract(inp, out, sample_rate=16000, channels=1) -> None:  # noqa: ANN001
         Path(out).write_bytes(b"RIFF....WAVE")
         created.append(Path(out))
 
@@ -107,7 +116,7 @@ def test_prepare_audio_non_cancellable_creates_output(tmp_path: Path, monkeypatc
     assert out in created
 
 
-def test_cleanup_intermediate_audio_removes_files(tmp_path: Path):
+def test_cleanup_intermediate_audio_removes_files(tmp_path: Path) -> None:
     """cleanup_intermediate_audio removes wav and empty work dir."""
     media = tmp_path / "clip.mp3"
     media.write_bytes(b"x")
@@ -122,12 +131,12 @@ def test_cleanup_intermediate_audio_removes_files(tmp_path: Path):
     assert not work_dir.exists()
 
 
-def test_gpu_guard_acquire_and_context(monkeypatch: pytest.MonkeyPatch):
+def test_gpu_guard_acquire_and_context(monkeypatch: pytest.MonkeyPatch) -> None:
     """GPUResourceGuard empties CUDA cache on switch and on context exit."""
     calls = {"empty": 0}
 
     class DummyCUDA:
-        def empty_cache(self):  # noqa: D401
+        def empty_cache(self) -> None:
             calls["empty"] += 1
 
     # Patch torch.cuda
@@ -143,5 +152,3 @@ def test_gpu_guard_acquire_and_context(monkeypatch: pytest.MonkeyPatch):
         pass
     # Context exit triggers another empty_cache
     assert calls["empty"] >= 2
-
-

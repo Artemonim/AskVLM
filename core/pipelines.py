@@ -230,6 +230,7 @@ def create_default_local_pipeline() -> LocalPipeline:
     """
     return LocalPipeline()
 
+
 def _build_document(
     *,
     formatted_text: str,
