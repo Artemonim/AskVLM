@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import sys
@@ -8,8 +9,27 @@ import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from PySide6.QtCore import QByteArray, QObject, QSettings, Qt, QThread, QUrl, Signal
-from PySide6.QtGui import QAction, QDesktopServices, QFontDatabase, QImage
+from PySide6.QtCore import (
+    QByteArray,
+    QObject,
+    QSettings,
+    QSize,
+    Qt,
+    QThread,
+    QTimer,
+    QUrl,
+    Signal,
+)
+from PySide6.QtGui import (
+    QAction,
+    QDesktopServices,
+    QFont,
+    QFontDatabase,
+    QIcon,
+    QImage,
+    QPainter,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -17,10 +37,9 @@ from PySide6.QtWidgets import (
     QCompleter,
     QFileDialog,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -28,6 +47,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QVBoxLayout,
     QWidget,
@@ -40,10 +61,19 @@ from core.ffmpeg import (
 )
 from core.pipelines import LocalPipeline
 from core.whisperx_wrapper import WhisperXWrapper
+from editing.text_model import Document, TextSegment
 from gui.speaker_sidebar import SpeakerSidebar
 from gui.subtitle_preview import SubtitlePreview
 from gui.wysiwyg_editor import TableRow, WysiwygEditor
-from utils.exporters import SubtitleRules, export_document, export_srt_with_rules
+from utils.exporters import (
+    SubtitleRules,
+    append_ask_metadata_to_srt,
+    export_document,
+    export_srt_with_rules,
+    extract_ask_metadata_from_srt,
+    fill_empty_gaps_in_srt,
+    strip_ask_meta_from_srt,
+)
 from utils.logging import get_logger, setup_logging
 
 
@@ -283,6 +313,10 @@ class MainWindow(QMainWindow):
         opts_row.addWidget(self.chk_dialog)
         opts_row.addWidget(self.chk_save_srt)
         opts_row.addWidget(QLabel("Format:"))
+        # Option: avoid empty gaps in generated SRT (stretch previous cue)
+        self.chk_no_empty = QCheckBox("No empty")
+        self.chk_no_empty.setChecked(False)
+        opts_row.addWidget(self.chk_no_empty)
         self.format_combo = QComboBox()
         self.format_combo.addItems(["none", "txt", "srt", "vtt", "json"])
         self.format_combo.setCurrentText("srt")
@@ -294,25 +328,10 @@ class MainWindow(QMainWindow):
         opts_row.addWidget(self.btn_quality)
         self.btn_start = QPushButton("Start")
         self.btn_cancel = QPushButton("Cancel")
-        self.btn_cancel.setEnabled(_UI_UNCHECKED)
+        self.btn_cancel.setEnabled(False)
         opts_row.addWidget(self.btn_start)
         opts_row.addWidget(self.btn_cancel)
         layout.addLayout(opts_row)
-
-        # * Subtitle rules row (Phase 1.81)
-        rules_row = QHBoxLayout()
-        rules_row.addWidget(QLabel("Line length:"))
-        self.spin_line_len = QSpinBox()
-        self.spin_line_len.setRange(20, 120)
-        self.spin_line_len.setValue(42)
-        rules_row.addWidget(self.spin_line_len)
-        rules_row.addWidget(QLabel("Lines:"))
-        self.spin_max_lines = QSpinBox()
-        self.spin_max_lines.setRange(1, 3)
-        self.spin_max_lines.setValue(2)
-        rules_row.addWidget(self.spin_max_lines)
-        rules_row.addStretch(1)
-        layout.addLayout(rules_row)
 
         # * Burn-in row
         burn_row = QHBoxLayout()
@@ -321,6 +340,17 @@ class MainWindow(QMainWindow):
         self.chk_normalize.setChecked(_UI_CHECKED)
         burn_row.addWidget(self.btn_burn)
         burn_row.addWidget(self.chk_normalize)
+        # Move Line length controls into burn row
+        burn_row.addWidget(QLabel("Line length:"))
+        self.spin_line_len = QSpinBox()
+        self.spin_line_len.setRange(20, 120)
+        self.spin_line_len.setValue(42)
+        burn_row.addWidget(self.spin_line_len)
+        burn_row.addWidget(QLabel("Lines:"))
+        self.spin_max_lines = QSpinBox()
+        self.spin_max_lines.setRange(1, 3)
+        self.spin_max_lines.setValue(2)
+        burn_row.addWidget(self.spin_max_lines)
         burn_row.addWidget(QLabel("Font:"))
         self.font_combo = QComboBox()
         try:
@@ -334,7 +364,7 @@ class MainWindow(QMainWindow):
                 if idx2 >= 0:
                     self.font_combo.setCurrentIndex(idx2)
             # Enable type-to-filter with popup completer
-            self.font_combo.setEditable(_UI_CHECKED)
+            self.font_combo.setEditable(True)
             completer = QCompleter(self.font_combo.model(), self.font_combo)
             completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
             completer.setFilterMode(Qt.MatchFlag.MatchContains)
@@ -360,22 +390,39 @@ class MainWindow(QMainWindow):
         input_tab = QWidget()
         in_layout = QVBoxLayout(input_tab)
         in_layout.setContentsMargins(4, 4, 4, 4)
-        self.input_list = QListWidget()
+        # * Input list as two-column table: [status icon] [path]
+        self.input_list = QTableWidget(0, 2)
+        self.input_list.setHorizontalHeaderLabels(["", "Path"])  # icon, text
+        with contextlib.suppress(Exception):
+            # Small icon column
+            self.input_list.setColumnWidth(0, 24)
+            self.input_list.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.ResizeMode.Fixed
+            )
+            self.input_list.horizontalHeader().setSectionResizeMode(
+                1, QHeaderView.ResizeMode.Stretch
+            )
+            self.input_list.horizontalHeader().setStretchLastSection(True)
+            # Do not elide long paths
+            self.input_list.setTextElideMode(Qt.TextElideMode.ElideNone)
+            # Ensure icons are visible and rows tall enough
+            self.input_list.setIconSize(QSize(16, 16))
+            self.input_list.verticalHeader().setDefaultSectionSize(22)
+        # Select entire rows; allow multi-select
+        self.input_list.setSelectionBehavior(
+            self.input_list.SelectionBehavior.SelectRows
+        )
         self.input_list.setSelectionMode(
             self.input_list.SelectionMode.ExtendedSelection
         )
+        # Paths are not edited in-place
+        self.input_list.setEditTriggers(self.input_list.EditTrigger.NoEditTriggers)
         in_layout.addWidget(self.input_list, 1)
         in_controls = QHBoxLayout()
         self.btn_in_add_file = QPushButton("Add File(s)…")
         self.btn_in_remove = QPushButton("Remove")
-        self.btn_in_up = QPushButton("Up")
-        self.btn_in_down = QPushButton("Down")
-        for b in (
-            self.btn_in_add_file,
-            self.btn_in_remove,
-            self.btn_in_up,
-            self.btn_in_down,
-        ):
+        self.btn_in_reset = QPushButton("Reset")
+        for b in (self.btn_in_add_file, self.btn_in_remove, self.btn_in_reset):
             in_controls.addWidget(b)
         in_controls.addStretch(1)
         in_layout.addLayout(in_controls)
@@ -425,6 +472,16 @@ class MainWindow(QMainWindow):
         # * Preview mapping and state
         self._last_inputs: list[Path] = []
         self._tab_to_media: dict[str, Path] = {}
+        # * Input status state and icon cache
+        self._input_status: dict[str, str] = {}
+        self._status_icon_cache: dict[str, QIcon] = {}
+        # * Overlay state: per-input secondary icon (session done / spinner)
+        self._input_overlay: dict[str, str] = {}
+        self._composite_icon_cache: dict[str, QIcon] = {}
+        self._spinner_phase: int = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(1000)
+        self._spinner_timer.timeout.connect(self._on_spinner_tick)
 
         # * Wire up signals
         # (Removed legacy top input actions)
@@ -444,10 +501,11 @@ class MainWindow(QMainWindow):
         self.btn_in_remove.clicked.connect(
             self._log_wrap(self._input_remove_selected, "Input Remove")
         )
-        self.btn_in_up.clicked.connect(self._log_wrap(self._input_move_up, "Input Up"))
-        self.btn_in_down.clicked.connect(
-            self._log_wrap(self._input_move_down, "Input Down")
+        self.btn_in_reset.clicked.connect(
+            self._log_wrap(self._input_reset_status_selected, "Input Reset")
         )
+        # Double-click to open SRT tab for a row
+        self.input_list.itemDoubleClicked.connect(self._on_input_item_double_clicked)
         # Quality toggle
         self.btn_quality.clicked.connect(
             self._log_wrap(self._toggle_quality, "Toggle Quality")
@@ -463,22 +521,25 @@ class MainWindow(QMainWindow):
         self.btn_font_dec.clicked.connect(lambda: self._nudge_font_size(-2))
         self.btn_font_inc.clicked.connect(lambda: self._nudge_font_size(+2))
 
-        # * Ensure at least one empty tab is visible
+        # * Start with no tabs; content tabs are added upon results or user action
         self._clear_tabs()
-        self._add_tab("Document", "", None)
 
         # * Connect editor selection changes to preview updates
         self.tabs.currentChanged.connect(self._on_tab_changed)
+        # React to output dir change to rescan statuses
+        self.out_dir_edit.textChanged.connect(lambda _t: self._scan_output_statuses())
 
         # * Load persisted settings
         self._load_settings()
         # Burn is disabled until transcript exists
-        self.btn_burn.setEnabled(_UI_UNCHECKED)
+        self.btn_burn.setEnabled(False)
         # Initialize preview font
         self.preview.set_font_family(self.font_combo.currentText())
         self._font_px: int | None = None
         # Apply initial quality
         self._apply_quality_to_pipeline()
+        # Initial status scan
+        self._scan_output_statuses()
 
     def choose_file(self) -> None:
         """Choose a single media file for processing."""
@@ -517,6 +578,8 @@ class MainWindow(QMainWindow):
             self.out_dir_edit.setText(str(p))
             self.last_output_dir = p
             self.status.showMessage(f"Output directory: {p}")
+            # Rescan statuses for the new output folder
+            self._scan_output_statuses()
 
     def _set_controls_enabled(self, enabled: bool) -> None:  # noqa: FBT001
         if hasattr(self, "btn_choose_file"):
@@ -537,7 +600,7 @@ class MainWindow(QMainWindow):
             self.chk_normalize.setEnabled(enabled)
             self.font_combo.setEnabled(enabled)
 
-    def start_processing(self) -> None:
+    def start_processing(self) -> None:  # noqa: PLR0915
         """Start pipeline processing in a background thread (QThread)."""
         # Validate input
         inputs = self._gather_inputs()
@@ -548,8 +611,31 @@ class MainWindow(QMainWindow):
                 "Please add inputs in the Input tab.",
             )
             return
+        # Apply restrictions based on current statuses
+        allowed: list[Path] = []
+        skipped_restricted = 0
+        for p in inputs:
+            st = self._get_input_status(p)
+            if st == "good":
+                skipped_restricted += 1
+                continue
+            if st == "fast" and self._quality_mode == "fast":
+                skipped_restricted += 1
+                continue
+            allowed.append(p)
+        if not allowed:
+            QMessageBox.information(
+                self,
+                "Nothing to process",
+                "All inputs are already processed under current quality. Switch to Good or use Burn.",
+            )
+            return
+        if skipped_restricted > 0:
+            self.status.showMessage(
+                f"Skipping {skipped_restricted} input(s) due to existing status"
+            )
         # * Remember inputs for preview/tab mapping
-        self._last_inputs = inputs
+        self._last_inputs = allowed
         out_dir = Path(self.out_dir_edit.text()).resolve()
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
@@ -570,6 +656,8 @@ class MainWindow(QMainWindow):
             # * Subtitle readability options for exporters
             "subtitle_max_line_width": int(self.spin_line_len.value()),
             "subtitle_max_lines": int(self.spin_max_lines.value()),
+            # * Quality metadata for SRT
+            "quality": self._quality_mode,
         }
 
         # Ensure pipeline flags reflect current UI before processing
@@ -583,6 +671,16 @@ class MainWindow(QMainWindow):
         # Reset transcript availability
         self._has_transcript = False
         self.btn_burn.setEnabled(_UI_UNCHECKED)
+        # Mark selected/allowed inputs as spinning
+        self._input_overlay.clear()
+        for p in allowed:
+            try:
+                key = str(p.resolve())
+            except OSError:
+                key = str(p)
+            self._input_overlay[key] = "spin"
+        self._spinner_phase = 0
+        self._spinner_timer.start()
         # Ensure previous thread is fully stopped before creating new one
         if self._thread is not None:
             try:
@@ -593,7 +691,7 @@ class MainWindow(QMainWindow):
                 get_logger(__name__).debug("Thread cleanup issue: %s", exc)
             self._thread = None
         self._thread = QThread(self)
-        self._worker = PipelineWorker(self.pipeline, inputs, out_dir, opts)
+        self._worker = PipelineWorker(self.pipeline, allowed, out_dir, opts)
         self._worker.moveToThread(self._thread)
 
         # Connect signals
@@ -639,6 +737,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Processing warning", line)
         # Update status with last log line for visibility
         self.status.showMessage(line)
+        # * Detect per-file errors to mark input status as error
+        m = re.search(r"Skipping '([^']+)'\:", line)
+        if m:
+            with contextlib.suppress(OSError):
+                err_path = Path(m.group(1)).resolve()
+                self._set_input_status(err_path, "error")
 
     def on_error(self, message: str) -> None:
         """Handle processing error."""
@@ -678,6 +782,20 @@ class MainWindow(QMainWindow):
         srt_exists = any(Path(x).suffix.lower() == ".srt" for x in _outputs)
         self._has_transcript = bool(view_text.strip()) or srt_exists or bool(_outputs)
         self.btn_burn.setEnabled(self._has_transcript)
+        # Rescan statuses based on new outputs
+        self._scan_output_statuses()
+        # Stop spinner and mark processed as done for this session
+        self._spinner_timer.stop()
+        for p in self._last_inputs:
+            try:
+                key = str(p.resolve())
+            except OSError:
+                key = str(p)
+            if self._input_overlay.get(key) == "spin":
+                self._input_overlay[key] = "done"
+        # Refresh icons
+        for i in range(self.input_list.rowCount()):
+            self._update_item_icon_row(i)
 
     def _build_result_tabs(self, outputs: list[str], view_text: str) -> None:
         """Build tabs for results and establish preview mapping to media files."""
@@ -689,7 +807,17 @@ class MainWindow(QMainWindow):
             except OSError as exc:
                 get_logger(__name__).debug("Failed to read SRT '%s': %s", p, exc)
                 content = ""
-            self._add_tab(p.stem, content, self._find_input_media_by_stem(p.stem))
+            # Strip ASK metadata lines/cues from viewer text
+            try:
+                content2 = strip_ask_meta_from_srt(content)
+            except Exception:
+                # fallback: filter comment lines only
+                content2 = "\n".join(
+                    line
+                    for line in content.splitlines()
+                    if not line.startswith("# ASK_META:")
+                )
+            self._add_tab(p.stem, content2, self._find_input_media_by_stem(p.stem))
             return
         if view_text:
             # * Single-view implies single input; try to map media
@@ -707,7 +835,73 @@ class MainWindow(QMainWindow):
             except OSError as exc:
                 get_logger(__name__).debug("Failed to read output '%s': %s", p, exc)
                 content = ""
-            self._add_tab(p.stem, content, self._find_input_media_by_stem(p.stem))
+            # Strip ASK metadata lines/cues from viewer text
+            try:
+                content2 = strip_ask_meta_from_srt(content)
+            except Exception:
+                content2 = "\n".join(
+                    line
+                    for line in content.splitlines()
+                    if not line.startswith("# ASK_META:")
+                )
+            self._add_tab(p.stem, content2, self._find_input_media_by_stem(p.stem))
+
+    def _remove_placeholder_document_tab_if_present(self) -> None:
+        # Remove an initial empty placeholder tab named "Document"
+        # when a real SRT tab is added as the first actual content.
+        idx = self._find_tab_index_by_title("Document")
+        if idx is not None and self.tabs.count() > 1:
+            w = self.get_editor_at(idx)
+            if w is not None and w.rowCount() == 0:
+                self.tabs.removeTab(idx)
+
+    def _find_tab_index_by_title(self, title: str) -> int | None:
+        for i in range(self.tabs.count()):
+            if self.tabs.tabText(i) == title:
+                return i
+        return None
+
+    # * Autosave current tab to SRT
+    def _autosave_tab_srt(self, title: str, editor: WysiwygEditor) -> None:
+        try:
+            doc = Document()
+            for row in range(editor.rowCount()):
+                tr = editor.get_row_data(row)
+                if tr is None:
+                    continue
+                # Current speaker text from combobox
+                sp_widget = editor.cellWidget(row, 1)
+                speaker = (
+                    sp_widget.currentText()
+                    if hasattr(sp_widget, "currentText")
+                    else tr.speaker_id
+                )
+                # Current text from table item
+                text_item = editor.item(row, 2)
+                text = text_item.text() if text_item is not None else tr.text
+                doc.add_segment(
+                    TextSegment(speaker, float(tr.start), float(tr.end), text)
+                )
+            # Export SRT with rules and append metadata
+            rules = SubtitleRules(
+                max_line_chars=int(self.spin_line_len.value()),
+                max_lines=int(self.spin_max_lines.value()),
+            )
+            srt_text = export_srt_with_rules(doc, rules)
+            srt_text = append_ask_metadata_to_srt(
+                srt_text,
+                tool_name="Artemonim's Speech Kit",
+                quality=str(self._quality_mode),
+                completed=True,
+            )
+            out_dir = Path(self.out_dir_edit.text()).resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            (out_dir / f"{title}.srt").write_text(srt_text, encoding="utf-8")
+            # After autosave, refresh statuses from disk
+            self._scan_output_statuses()
+            self.status.showMessage("Autosaved SRT")
+        except OSError as exc:
+            get_logger(__name__).debug("Autosave failed: %s", exc)
 
     def open_output_folder(self) -> None:
         """Open the output directory in the system file manager."""
@@ -735,8 +929,8 @@ class MainWindow(QMainWindow):
             return
         selected = editor.selectedIndexes()
         if not selected:
-            # No selection: clear preview text only
-            self.preview.set_text_lines([])
+            # No selection: clear both text and background to avoid stale frames
+            self.preview.clear()
             return
         row = selected[0].row()
         data = editor.get_row_data(row)
@@ -799,9 +993,11 @@ class MainWindow(QMainWindow):
         if self.input_mode == "file" and self.input_path is not None:
             return self.input_path
         # * Last resort: if Input tab contains exactly one video file
-        items = [
-            Path(self.input_list.item(i).text()) for i in range(self.input_list.count())
-        ]
+        items = []
+        for i in range(self.input_list.rowCount()):
+            it = self.input_list.item(i, 1)
+            if it is not None:
+                items.append(Path(it.text()))
         videos = [
             p
             for p in items
@@ -821,11 +1017,61 @@ class MainWindow(QMainWindow):
             if p.stem == stem:
                 return p
         # * Fallback: scan visible Input tab entries
-        for i in range(self.input_list.count()):
-            p = Path(self.input_list.item(i).text())
+        for i in range(self.input_list.rowCount()):
+            it = self.input_list.item(i, 1)
+            if it is None:
+                continue
+            p = Path(it.text())
             if p.is_file() and p.stem == stem:
                 return p
         return None
+
+    def _on_input_item_double_clicked(self, _item: QTableWidgetItem) -> None:
+        # Open corresponding SRT in a new tab if exists
+        out_dir = Path(self.out_dir_edit.text()).resolve()
+        sel = self.input_list.selectedIndexes()
+        if not sel:
+            return
+        row = sel[0].row()
+        it = self.input_list.item(row, 1)
+        if it is None:
+            return
+        p = Path(it.text())
+        srt = out_dir / f"{p.stem}.srt"
+        if srt.exists():
+            try:
+                content = srt.read_text(encoding="utf-8")
+            except OSError:
+                return
+            content2 = "\n".join(
+                line
+                for line in content.splitlines()
+                if not line.startswith("# ASK_META:")
+            )
+            self._add_tab(srt.stem, content2, self._find_input_media_by_stem(p.stem))
+
+    def _close_orphan_tabs(self) -> None:
+        # Close tabs whose mapped media is not in current Input table
+        present: set[str] = set()
+        for i in range(self.input_list.rowCount()):
+            it = self.input_list.item(i, 1)
+            if it is None:
+                continue
+            with contextlib.suppress(OSError):
+                present.add(str(Path(it.text()).resolve()))
+        # Iterate titles mapped to media
+        to_remove: list[int] = []
+        for idx in range(self.tabs.count()):
+            title = self.tabs.tabText(idx)
+            media = self._tab_to_media.get(title)
+            if media is None:
+                continue
+            with contextlib.suppress(OSError):
+                key = str(media.resolve())
+            if key not in present:
+                to_remove.append(idx)
+        for idx in reversed(to_remove):
+            self.tabs.removeTab(idx)
 
     def start_burn(self) -> None:
         """Start burn-in process for selected inputs using burn settings."""
@@ -995,6 +1241,7 @@ class MainWindow(QMainWindow):
     def _clear_tabs(self) -> None:
         while self.tabs.count() > 0:
             self.tabs.removeTab(0)
+        # Create a hidden placeholder to simplify logic if needed
 
     def _add_tab(self, title: str, text: str, media: Path | None = None) -> None:  # noqa: PLR0915, C901
         editor = WysiwygEditor()
@@ -1071,12 +1318,25 @@ class MainWindow(QMainWindow):
                 editor.setColumnWidth(2, w2)
         # Connect selection change to preview
         editor.itemSelectionChanged.connect(self._update_preview_for_selection)
+
+        # Autosave on cell content changes and on speaker changes
+        def _autosave_on_change_title_ed(
+            _arg: object = None, *, _t: str = title, _ed: WysiwygEditor = editor
+        ) -> None:
+            self._autosave_tab_srt(_t, _ed)
+
+        editor.itemChanged.connect(_autosave_on_change_title_ed)
+        editor.on_speaker_changed(lambda _row, _val: _autosave_on_change_title_ed())
         # Persist column widths on resize changes
         editor.horizontalHeader().sectionResized.connect(
             lambda _i, _o, _n, ed=editor: self._save_table_widths(ed)
         )
         # * Register tab and map to media (for preview frame extraction)
         self.tabs.addTab(editor, title)
+        # Prefer the newly added tab
+        self.tabs.setCurrentIndex(self.tabs.count() - 1)
+        # Remove placeholder "Document" tab if present and empty
+        self._remove_placeholder_document_tab_if_present()
         if media is not None:
             # * Store mapping by title for simplicity; titles are per-session unique
             self._tab_to_media[title] = media
@@ -1108,11 +1368,12 @@ class MainWindow(QMainWindow):
             return [p] if p.is_file() else []
 
         # Prefer entries from Input tab
-        items = (
-            [self.input_list.item(i).text() for i in range(self.input_list.count())]
-            if hasattr(self, "input_list") and self.input_list.count() > 0
-            else []
-        )
+        items = []
+        if hasattr(self, "input_list") and self.input_list.rowCount() > 0:
+            for i in range(self.input_list.rowCount()):
+                it = self.input_list.item(i, 1)
+                if it is not None:
+                    items.append(it.text())
         collected = [p for s in items for p in expand_entry(s)]
 
         # Top-row selectors removed; rely entirely on Input tab entries
@@ -1130,6 +1391,229 @@ class MainWindow(QMainWindow):
                 uniq.append(Path(s))
         return uniq
 
+    # * Input status and icon helpers
+    def _get_status_icon(self, status: str) -> QIcon:
+        # Cache by status key
+        if status in self._status_icon_cache:
+            return self._status_icon_cache[status]
+        symbol = {
+            "": "",
+            "error": "❌",
+            "fast": "⏩",
+            "good": "📄",
+            "burned": "🔥",
+        }.get(status, "")
+        if not symbol:
+            icon = QIcon()
+            self._status_icon_cache[status] = icon
+            return icon
+        # Render a small pixmap with the symbol
+        pm = QPixmap(16, 16)
+        pm.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pm)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, on=True)
+            f = QFont()
+            # Prefer emoji-capable font on Windows/Linux/macOS for symbol rendering
+            try:
+                families = set(QFontDatabase.families())
+            except Exception:  # noqa: BLE001
+                families = set()
+            for fam in (
+                "Segoe UI Emoji",
+                "Segoe UI Symbol",
+                "Noto Color Emoji",
+                "Apple Color Emoji",
+            ):
+                if fam in families:
+                    f.setFamily(fam)
+                    break
+            f.setPointSize(10)
+            painter.setFont(f)
+            painter.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, symbol)
+        finally:
+            painter.end()
+        icon = QIcon(pm)
+        self._status_icon_cache[status] = icon
+        return icon
+
+    def _get_overlay_icon(self, overlay: str) -> QIcon:
+        symbol = {
+            "done": "✔️",
+            "spin0": "🔃",
+            "spin1": "🔁",
+            "": "",
+        }.get(overlay, "")
+        if not symbol:
+            return QIcon()
+        pm = QPixmap(16, 16)
+        pm.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pm)
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing, on=True)
+            f = QFont()
+            try:
+                families = set(QFontDatabase.families())
+            except Exception:  # noqa: BLE001
+                families = set()
+            for fam in (
+                "Segoe UI Emoji",
+                "Segoe UI Symbol",
+                "Noto Color Emoji",
+                "Apple Color Emoji",
+            ):
+                if fam in families:
+                    f.setFamily(fam)
+                    break
+            f.setPointSize(10)
+            p.setFont(f)
+            p.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, symbol)
+        finally:
+            p.end()
+        return QIcon(pm)
+
+    def _get_composite_text_for_key(self, key: str) -> str:
+        base = self._input_status.get(key, "")
+        overlay = self._input_overlay.get(key, "")
+        base_symbol = {
+            "": "",
+            "error": "❌",
+            "fast": "⏩",
+            "good": "📄",
+            "burned": "🔥",
+        }.get(base, "")
+        overlay_symbol = ""
+        if overlay == "done":
+            overlay_symbol = "✔️"
+        elif overlay == "spin":
+            overlay_symbol = "🔁" if (self._spinner_phase % 2) else "🔃"
+        # Return combined string with thin space between to avoid overlap
+        return (
+            base_symbol + ("\u2009" + overlay_symbol if overlay_symbol else "")
+        ).strip()
+
+    def _on_spinner_tick(self) -> None:
+        self._spinner_phase = (self._spinner_phase + 1) % 2
+        # Refresh visible composite icons
+        for i in range(self.input_list.rowCount()):
+            it = self.input_list.item(i, 1)
+            if it is None:
+                continue
+            try:
+                key = str(Path(it.text()).resolve())
+            except OSError:
+                key = str(Path(it.text()))
+            if self._input_overlay.get(key) == "spin":
+                self._update_item_icon_row(i)
+
+    def _get_input_status(self, path: Path) -> str:
+        with contextlib.suppress(OSError):
+            key = str(path.resolve())
+            return self._input_status.get(key, "")
+        return self._input_status.get(key, "")
+
+    def _set_input_status(self, path: Path, status: str) -> None:
+        with contextlib.suppress(OSError):
+            key = str(path.resolve())
+        if "key" not in locals():
+            key = str(path)
+        prev = self._input_status.get(key, "")
+        if prev == status:
+            return
+        self._input_status[key] = status
+        # Update any matching list item icon (composite with overlay)
+        for i in range(self.input_list.rowCount()):
+            it = self.input_list.item(i, 1)
+            if it is None:
+                continue
+            with contextlib.suppress(OSError):
+                if str(Path(it.text()).resolve()) == key:
+                    icon_text = self._get_composite_text_for_key(key)
+                    icon_item = self.input_list.item(i, 0)
+                    if icon_item is None:
+                        icon_item = QTableWidgetItem(icon_text)
+                        self.input_list.setItem(i, 0, icon_item)
+                    else:
+                        icon_item.setText(icon_text)
+                    continue
+            if str(Path(it.text())) == key:
+                icon_text = self._get_composite_text_for_key(key)
+                icon_item = self.input_list.item(i, 0)
+                if icon_item is None:
+                    icon_item = QTableWidgetItem(icon_text)
+                    self.input_list.setItem(i, 0, icon_item)
+                else:
+                    icon_item.setText(icon_text)
+
+    def _update_item_icon_row(self, row: int) -> None:
+        it = self.input_list.item(row, 1)
+        if it is None:
+            return
+        p = Path(it.text())
+        try:
+            key = str(p.resolve())
+        except OSError:
+            key = str(p)
+        icon_text = self._get_composite_text_for_key(key)
+        icon_item = self.input_list.item(row, 0)
+        if icon_item is None:
+            icon_item = QTableWidgetItem(icon_text)
+            with contextlib.suppress(Exception):
+                icon_item.setFlags(icon_item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                icon_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.input_list.setItem(row, 0, icon_item)
+        else:
+            icon_item.setText(icon_text)
+            with contextlib.suppress(Exception):
+                icon_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+
+    def _scan_output_statuses(self) -> None:  # noqa: C901, PLR0912
+        out_dir_text = self.out_dir_edit.text()
+        try:
+            out_dir = Path(out_dir_text).resolve()
+        except (OSError, ValueError):
+            return
+        # Build availability maps
+        burned_set: set[str] = set()
+        fast_set: set[str] = set()
+        good_set: set[str] = set()
+        for srt in out_dir.glob("*.srt"):
+            try:
+                txt = srt.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            meta = extract_ask_metadata_from_srt(txt) or {}
+            if isinstance(meta, dict):
+                if str(meta.get("tool", "")) != "Artemonim's Speech Kit" or not bool(
+                    meta.get("completed", False)
+                ):
+                    pass
+                else:
+                    q = str(meta.get("quality", "")).lower()
+                    if q == "good":
+                        good_set.add(srt.stem)
+                    elif q == "fast":
+                        fast_set.add(srt.stem)
+        for mp4 in out_dir.glob("*_subbed.mp4"):
+            burned_set.add(re.sub(r"_subbed$", "", mp4.stem))
+        # Assign statuses with precedence: burned > good > fast > error/none
+        for i in range(self.input_list.rowCount()):
+            it = self.input_list.item(i, 1)
+            if it is None:
+                continue
+            p = Path(it.text())
+            stem = p.stem
+            new_status = ""
+            if stem in burned_set:
+                new_status = "burned"
+            elif stem in good_set:
+                new_status = "good"
+            elif stem in fast_set:
+                new_status = "fast"
+            self._set_input_status(p, new_status)
+            # Also refresh composite icon in case overlay exists
+            self._update_item_icon_row(i)
+
     def _input_add_file(self) -> None:
         # Allow selecting multiple files; if a directory is given, add it directly
         files, _ = QFileDialog.getOpenFileNames(
@@ -1145,48 +1629,101 @@ class MainWindow(QMainWindow):
             if p.is_dir():
                 # Add directory itself; later expansion happens in _gather_inputs
                 self.last_input_dir = p
-                self.input_list.addItem(QListWidgetItem(str(p)))
+                row = self.input_list.rowCount()
+                self.input_list.insertRow(row)
+                # icon cell empty; path in column 1
+                self.input_list.setItem(row, 1, QTableWidgetItem(str(p)))
+                self._update_item_icon_row(row)
                 continue
             if p.is_file():
                 self.last_input_dir = p.parent
-                self.input_list.addItem(QListWidgetItem(str(p)))
+                row = self.input_list.rowCount()
+                self.input_list.insertRow(row)
+                self.input_list.setItem(row, 1, QTableWidgetItem(str(p)))
+                self._update_item_icon_row(row)
+        # After adding, rescan statuses
+        self._scan_output_statuses()
 
     # (Removed _input_add_folder)
 
     def _input_remove_selected(self) -> None:
-        for item in self.input_list.selectedItems():
-            row = self.input_list.row(item)
-            self.input_list.takeItem(row)
+        sel_rows = sorted(
+            {i.row() for i in self.input_list.selectedIndexes()}, reverse=True
+        )
+        for row in sel_rows:
+            it = self.input_list.item(row, 1)
+            if it is not None:
+                with contextlib.suppress(OSError):
+                    key = str(Path(it.text()).resolve())
+                    self._input_status.pop(key, None)
+                    self._input_overlay.pop(key, None)
+            self.input_list.removeRow(row)
+        # Close tabs whose media is no longer present in Input
+        self._close_orphan_tabs()
+        self._scan_output_statuses()
+        # Refresh preview; if nothing selected, it will be cleared
+        self._update_preview_for_selection()
 
     # (Removed _input_clear)
 
     def _input_move_up(self) -> None:
-        sel = self.input_list.selectedItems()
+        sel = self.input_list.selectedIndexes()
         if not sel:
             return
-        row = self.input_list.row(sel[0])
+        row = sel[0].row()
         if row <= 0:
             return
-        item = self.input_list.takeItem(row)
-        self.input_list.insertItem(row - 1, item)
-        self.input_list.setCurrentItem(item)
+        self._swap_rows(row, row - 1)
+        self.input_list.selectRow(row - 1)
+        self._scan_output_statuses()
 
     def _input_move_down(self) -> None:
-        sel = self.input_list.selectedItems()
+        sel = self.input_list.selectedIndexes()
         if not sel:
             return
-        row = self.input_list.row(sel[0])
-        if row >= self.input_list.count() - 1:
+        row = sel[0].row()
+        if row >= self.input_list.rowCount() - 1:
             return
-        item = self.input_list.takeItem(row)
-        self.input_list.insertItem(row + 1, item)
-        self.input_list.setCurrentItem(item)
+        self._swap_rows(row, row + 1)
+        self.input_list.selectRow(row + 1)
+        self._scan_output_statuses()
+
+    def _swap_rows(self, a: int, b: int) -> None:
+        if a == b:
+            return
+        max_col = max(1, self.input_list.columnCount() - 1)
+        for col in range(max_col + 1):
+            ia = self.input_list.takeItem(a, col)
+            ib = self.input_list.takeItem(b, col)
+            if ib is not None:
+                self.input_list.setItem(a, col, ib)
+            if ia is not None:
+                self.input_list.setItem(b, col, ia)
+
+    def _input_reset_status_selected(self) -> None:
+        rows = {i.row() for i in self.input_list.selectedIndexes()}
+        for row in rows:
+            it = self.input_list.item(row, 1)
+            if it is None:
+                continue
+            try:
+                key = str(Path(it.text()).resolve())
+            except OSError:
+                key = str(Path(it.text()))
+            # Clear status and overlay
+            self._input_status.pop(key, None)
+            self._input_overlay.pop(key, None)
+            self._update_item_icon_row(row)
 
     # * Quality toggle
     def _toggle_quality(self) -> None:
         self._quality_mode = "fast" if self._quality_mode == "good" else "good"
         self.btn_quality.setText(
             "Quality: Good" if self._quality_mode == "good" else "Quality: Fast"
+        )
+        # Informative hint for what will be processed under current statuses
+        self.status.showMessage(
+            "Quality set to %s" % ("Good" if self._quality_mode == "good" else "Fast")
         )
 
     def _apply_quality_to_pipeline(self, *, force_reload: bool = False) -> None:
@@ -1283,6 +1820,40 @@ class PipelineWorker(QObject):
                 ml_val2 = int(ml_obj2) if isinstance(ml_obj2, (int, str)) else 2
                 rules = SubtitleRules(max_line_chars=lw_val2, max_lines=ml_val2)
                 srt_text = export_srt_with_rules(doc, rules)
+                # Append ASK metadata to allow status scan to detect quality
+                qual = str(self._opts.get("quality", "")).lower() or None
+                meta_payload = None
+                if qual in {"fast", "good"}:
+                    meta_payload = {
+                        "tool": "Artemonim's Speech Kit",
+                        "quality": qual,
+                        "completed": True,
+                    }
+                # If configured to append metadata as a subtitle cue AFTER video end,
+                # append a single cue with JSON payload one second after the last block.
+                if meta_payload is not None:
+                    # Compute end time as the max end across segments, fallback 0
+                    max_end = 0.0
+                    for seg in doc.segments:
+                        try:
+                            max_end = max(max_end, float(seg.end_time))
+                        except Exception:
+                            continue
+                    # One-second gap after end
+                    meta_start = max_end + 1.0
+                    meta_start + 0.5
+                    # Build meta cue as JSON on single line
+                    meta_line = json.dumps(meta_payload, ensure_ascii=False)
+                    # Append cue (index will be appended when writing full SRT)
+                    srt_text += f"\n{meta_line}\n"
+                # If UI requests no-empty SRT, fill gaps by stretching previous cues
+                if bool(
+                    self.chk_no_empty.isChecked()
+                    if hasattr(self, "chk_no_empty")
+                    else False
+                ):
+                    with contextlib.suppress(Exception):
+                        srt_text = fill_empty_gaps_in_srt(srt_text)
                 srt_path.write_text(srt_text, encoding="utf-8")
                 if fmt.lower() != "srt":
                     outputs.append(str(srt_path))

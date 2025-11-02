@@ -161,6 +161,14 @@
 -   [x] Preview matches burn styling (font size, outline, autoscale)
 -   [x] Stream transcription text to partial file during ASR
 
+## Phase 1.84: Input Status, Autosave, Metadata
+
+-   [x] Input list: status icons (empty/❌/⏩/📄/🔥) per file
+-   [x] Move "Line length" controls into Burn row
+-   [x] Autosave SRT on editor changes with ASK metadata
+-   [x] SRT metadata: tool name, quality (fast/good), completed flag
+-   [x] Scan output folder for ASK metadata to pre-mark input statuses
+
 ## Phase 1.85: Disfluency Cleanup (Auto)
 
 -   [ ] Core detection & cutlist

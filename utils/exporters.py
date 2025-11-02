@@ -8,6 +8,7 @@ import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from editing.text_model import Document
 
@@ -184,6 +185,59 @@ def export_srt_with_rules(doc: Document, rules: SubtitleRules | None = None) -> 
     return "\n".join(out)
 
 
+def _parse_ts_srt_to_seconds(ts: str) -> float:
+    """Parse SRT timestamp 'HH:MM:SS,mmm' into seconds (float)."""
+    s = ts.strip()
+    try:
+        hms, ms = s.split(",")
+        h, m, sec = hms.split(":")
+        return int(h) * 3600 + int(m) * 60 + int(sec) + int(ms) / 1000.0
+    except Exception:
+        return 0.0
+
+
+def fill_empty_gaps_in_srt(srt_text: str) -> str:
+    """Stretch previous cue end times to remove gaps between cues.
+
+    The function scans for SRT timecode lines and adjusts only those lines,
+    ignoring any trailing comment or JSON metadata lines.
+    """
+    import re as _re
+
+    lines = srt_text.splitlines()
+    # Capture leading/trailing parts to preserve whitespace
+    time_re = _re.compile(
+        r"^(?P<prefix>\s*)(?P<start>\d{2}:\d{2}:\d{2},\d{3})\s*-->\s*(?P<end>\d{2}:\d{2}:\d{2},\d{3})(?P<suffix>.*)$"
+    )
+    # Collect time line indices and timestamps
+    time_lines: list[tuple[int, str, str, str, str]] = []
+    for idx, ln in enumerate(lines):
+        m = time_re.match(ln)
+        if not m:
+            continue
+        time_lines.append(
+            (
+                idx,
+                m.group("prefix"),
+                m.group("start"),
+                m.group("end"),
+                m.group("suffix"),
+            )
+        )
+    if len(time_lines) < 2:
+        return srt_text
+    # Adjust end time of each cue to next cue's start if gap exists
+    for i in range(len(time_lines) - 1):
+        idx, prefix, start_s, end_s, suffix = time_lines[i]
+        next_start = time_lines[i + 1][2]
+        end_t = _parse_ts_srt_to_seconds(end_s)
+        next_start_t = _parse_ts_srt_to_seconds(next_start)
+        if end_t < next_start_t:
+            # Replace only the end timestamp in the original line
+            lines[idx] = f"{prefix}{start_s} --> {next_start}{suffix}"
+    return "\n".join(lines)
+
+
 # * VTT exporter
 def _format_ts_vtt(seconds: float) -> str:
     ms = round(seconds * 1000)
@@ -248,3 +302,110 @@ def export_document(doc: Document, fmt: str, out_path: Path) -> Path:
             json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
         )
     return out_path
+
+
+# * Metadata helpers for SRT sidecar inside file
+ASK_META_PREFIX = "# ASK_META: "
+
+
+def append_ask_metadata_to_srt(
+    srt_text: str,
+    *,
+    tool_name: str,
+    quality: str | None = None,
+    completed: bool | None = None,
+) -> str:
+    """Append ASK metadata lines to the end of an SRT string.
+
+    The metadata is appended after a trailing blank line using a single line
+    starting with a stable prefix so other tools ignore it safely.
+
+    Args:
+        srt_text: Existing SRT contents.
+        tool_name: Name of the producing tool (e.g., "Artemonim's Speech Kit").
+        quality: Optional quality marker: "fast" | "good".
+        completed: Optional completion flag.
+
+    Returns:
+        The SRT contents with one metadata line appended.
+
+    """
+    payload: dict[str, Any] = {"tool": str(tool_name)}
+    if quality is not None:
+        payload["quality"] = str(quality)
+    if completed is not None:
+        payload["completed"] = bool(completed)
+    meta_line = ASK_META_PREFIX + json.dumps(payload, ensure_ascii=False)
+    if not srt_text.endswith("\n"):
+        srt_text += "\n"
+    return srt_text + meta_line + "\n"
+
+
+def extract_ask_metadata_from_srt(srt_text: str) -> dict[str, Any] | None:
+    """Extract ASK metadata payload from an SRT string if present.
+
+    The function searches for the last line starting with the fixed
+    prefix and parses the JSON that follows.
+
+    Args:
+        srt_text: SRT file contents.
+
+    Returns:
+        Parsed metadata dict or None when absent/invalid.
+
+    """
+    try:
+        # 1) Prefer explicit comment prefix (# ASK_META: {...})
+        for line in reversed(srt_text.splitlines()):
+            if line.startswith(ASK_META_PREFIX):
+                raw = line[len(ASK_META_PREFIX) :].strip()
+                data = json.loads(raw)
+                if isinstance(data, dict):
+                    return data
+                return None
+        # 2) Fallback: look for a JSON payload on the last non-empty line (subtitle cue)
+        for line in reversed(srt_text.splitlines()):
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("{") and s.endswith("}"):
+                try:
+                    data = json.loads(s)
+                    if isinstance(data, dict) and "tool" in data:
+                        return data
+                except json.JSONDecodeError:
+                    pass
+            # stop after encountering a non-empty non-json line
+            break
+    except (ValueError, OSError):
+        return None
+    return None
+
+
+def strip_ask_meta_from_srt(srt_text: str) -> str:
+    """Return SRT text with ASK metadata lines/cues removed.
+
+    Removes both comment-style metadata lines starting with the stable
+    prefix ("# ASK_META:") and any standalone JSON object lines that
+    parse to a dict containing a "tool" key. This is safe for displaying
+    inside the editor/viewer and avoids treating metadata as subtitle text.
+    """
+    out_lines: list[str] = []
+    for line in srt_text.splitlines():
+        s = line.strip()
+        if not s:
+            out_lines.append(line)
+            continue
+        if s.startswith(ASK_META_PREFIX):
+            # skip comment metadata
+            continue
+        if s.startswith("{") and s.endswith("}"):
+            try:
+                data = json.loads(s)
+                if isinstance(data, dict) and "tool" in data:
+                    # skip standalone JSON meta cue
+                    continue
+            except json.JSONDecodeError:
+                pass
+        out_lines.append(line)
+    return "\n".join(out_lines) + ("\n" if srt_text.endswith("\n") else "")
