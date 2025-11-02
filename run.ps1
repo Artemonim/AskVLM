@@ -26,6 +26,8 @@ function Show-Help {
     Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
     Write-Host "  -Help             Show this help"
     Write-Host ""
+    Write-Host "Coverage gates: FAIL <65%, WARN <75% (applied post-pytest)" -ForegroundColor Yellow
+    Write-Host ""
     Write-Host "Examples:"
     Write-Host "  .\run.ps1 -Tool ruff"
     Write-Host "  .\run.ps1 -Path core,editing"

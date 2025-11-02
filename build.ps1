@@ -29,6 +29,8 @@ function Show-Help {
     Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
     Write-Host "  -Help             Show this help"
     Write-Host ""
+    Write-Host "Coverage gates: FAIL <65%, WARN <75% (applied post-pytest)" -ForegroundColor Yellow
+    Write-Host ""
     Write-Host "Examples:"
     Write-Host "  .\\build.ps1 -Tool ruff"
     Write-Host "  .\\build.ps1 -Path core,editing"
@@ -79,13 +81,15 @@ try {
 
 # * Ensure core dev deps exist
 try {
-    python -c "import importlib.util,sys;mods=['ruff','mypy','pytest','pip_audit'];sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)" | Out-Null
+    python -c "import importlib.util,sys;mods=['ruff','mypy','pytest','pytest_cov','pip_audit'];sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)" | Out-Null
     if ($LASTEXITCODE -ne 0) {
         Write-Host "Installing dev dependencies..." -ForegroundColor Yellow
         if (Test-Path "requirements-dev.txt") { python -m pip install -r requirements-dev.txt | Out-Null }
         if (Test-Path "requirements.txt") { python -m pip install -r requirements.txt | Out-Null }
         # Ensure pip-audit present if not via requirements
         try { python -m pip install -q pip-audit | Out-Null } catch {}
+        # Ensure pytest-cov present if not via requirements
+        try { python -m pip install -q pytest-cov | Out-Null } catch {}
     }
 } catch {}
 

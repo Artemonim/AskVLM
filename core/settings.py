@@ -134,5 +134,6 @@ def load_settings(path: Path) -> Settings:
     except Exception:  # noqa: BLE001,S110
         pass
     with path.open("w", encoding="utf-8") as f:
-        json.dump(settings.model_dump(), f, indent=2)
+        # * Ensure JSON-serializable representation (Path -> str)
+        json.dump(settings.model_dump(mode="json"), f, indent=2)
     return settings

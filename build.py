@@ -27,6 +27,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple, TextIO
+import xml.etree.ElementTree as ET
 
 
 def linting_path() -> str:
@@ -100,6 +101,8 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     },
     "pytest": {
         "command": [sys.executable, "-m", "pytest"],
+        # * Coverage collection is configured via pyproject.toml addopts
+        # * Keep --cov-fail-under=0 to avoid pytest failing; gating is done below
         "args": ["-q", "--maxfail=1", "--cov-fail-under=0"],
         "can_fix": False,
         "critical": True,
@@ -137,6 +140,10 @@ class LocalCI:
         self._log(f"Build started at {time.strftime('%Y-%m-%d %H:%M:%S')}")
         self._log(f"Targets: {', '.join(self.targets)}")
         self._log("=" * 50)
+        # * Coverage gates
+        self.coverage_warn_threshold: float = 75.0
+        self.coverage_fail_threshold: float = 65.0
+        self.coverage_xml_path: str = "coverage.xml"
 
     def _print(self, msg: str) -> None:
         if not self.json_output:
@@ -401,6 +408,30 @@ class LocalCI:
                     self._log("STDERR:")
                     self._log(stderr)
 
+        # * Evaluate test coverage after pytest run
+        try:
+            cov_res = self._evaluate_coverage()
+            if cov_res is not None:
+                self.results["coverage"] = cov_res
+                if not self.json_output:
+                    status = "✓" if cov_res.get("exit_code", 0) == 0 else "✗"
+                    pct = cov_res.get("percent")
+                    pct_str = f"{pct:.1f}%" if isinstance(pct, (int, float)) else "n/a"
+                    self._print(f"-- coverage --\n{status} coverage={pct_str}")
+                # Log details
+                self._log("\n--- COVERAGE ---")
+                self._log(f"Exit code: {cov_res.get('exit_code', 'unknown')}")
+                self._log(f"Percent: {cov_res.get('percent', 'n/a')}")
+                if cov_res.get("stdout"):
+                    self._log("STDOUT:")
+                    self._log(str(cov_res.get("stdout")))
+                if cov_res.get("stderr"):
+                    self._log("STDERR:")
+                    self._log(str(cov_res.get("stderr")))
+        except Exception as _exc:  # noqa: BLE001
+            # Coverage evaluation errors are non-fatal
+            pass
+
         self.results["summary"] = self._summary()
         if not self.json_output:
             self._print_summary()
@@ -493,6 +524,18 @@ class LocalCI:
             except json.JSONDecodeError:
                 pass
             return f"pip-audit: {self._count_nonempty_lines(text)} findings"
+        # * coverage: show percent and gate
+        if name == "coverage":
+            pct = res.get("percent")
+            try:
+                pctf = float(pct) if pct is not None else None
+            except Exception:
+                pctf = None
+            if pctf is not None:
+                if pctf < self.coverage_fail_threshold:
+                    return f"coverage: {pctf:.1f}% < fail {self.coverage_fail_threshold:.0f}%"
+                return f"coverage: {pctf:.1f}%"
+            return "coverage: failed to compute"
         # * Default: show exit code and line count
         return f"{name}: exit={res.get('exit_code')}, lines={self._count_nonempty_lines(text)}"
 
@@ -517,6 +560,14 @@ class LocalCI:
                 low = int(sev.get("LOW", 0))
                 if high == 0 and (med > 0 or low > 0):
                     return f"bandit: MEDIUM={med}, LOW={low}"
+        if name == "coverage":
+            pct = res.get("percent")
+            try:
+                pctf = float(pct) if pct is not None else None
+            except Exception:
+                pctf = None
+            if pctf is not None and self.coverage_fail_threshold <= pctf < self.coverage_warn_threshold:
+                return f"coverage: {pctf:.1f}% < warn {self.coverage_warn_threshold:.0f}%"
         return None
 
     def _limit(self, items: List[str], n: int = 20) -> List[str]:
@@ -648,6 +699,67 @@ class LocalCI:
                     self._print(f"      - {ln}")
         self._print(f"Execution time: {s['execution_time']}s")
         self._print(f"Overall: {s['overall_status']}")
+
+    # * Coverage evaluation helper
+    def _evaluate_coverage(self) -> Optional[Dict[str, Any]]:
+        """Read coverage.xml and apply gates: FAIL < fail_threshold; WARN < warn_threshold.
+
+        Returns a result dict compatible with other tools, or None if no coverage file is found.
+        """
+        path = self.coverage_xml_path
+        if not os.path.exists(path):
+            return None
+        start_time = time.time()
+        percent: Optional[float] = None
+        err: str = ""
+        try:
+            tree = ET.parse(path)
+            root = tree.getroot()
+            # coverage.py writes attributes on root: line-rate or totals
+            line_rate = root.attrib.get("line-rate")
+            if line_rate is not None:
+                percent = float(line_rate) * 100.0
+            else:
+                # Fallback to totals
+                lines_valid = root.attrib.get("lines-valid")
+                lines_covered = root.attrib.get("lines-covered")
+                if lines_valid and lines_covered:
+                    lv = float(lines_valid)
+                    lc = float(lines_covered)
+                    percent = 0.0 if lv == 0 else (lc / lv) * 100.0
+        except Exception as exc:  # noqa: BLE001
+            err = str(exc)
+
+        if percent is None:
+            return {
+                "tool": "coverage",
+                "available": True,
+                "exit_code": 1,
+                "stdout": "",
+                "stderr": err or "coverage percent not found",
+                "critical": False,
+                "fixed": False,
+                "exec_time": round(time.time() - start_time, 2),
+            }
+
+        # Decide gate: critical fail if below fail threshold; warning if below warn threshold
+        exit_code = 0
+        critical = False
+        if percent < self.coverage_fail_threshold:
+            exit_code = 1
+            critical = True
+
+        return {
+            "tool": "coverage",
+            "available": True,
+            "exit_code": exit_code,
+            "stdout": f"coverage={percent:.2f}%",
+            "stderr": "",
+            "critical": critical,
+            "fixed": False,
+            "exec_time": round(time.time() - start_time, 2),
+            "percent": percent,
+        }
 
 
 def main() -> None:

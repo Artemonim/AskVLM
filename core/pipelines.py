@@ -217,6 +217,19 @@ class LocalPipeline:
         return doc
 
 
+def create_default_local_pipeline() -> LocalPipeline:
+    """Return a `LocalPipeline` configured with application defaults.
+
+    Defaults are aligned with the GUI/CLI behavior:
+    - engine="auto" (prefer Faster-Whisper; WhisperX alignment when available)
+    - device="auto" (prefer CUDA when available)
+    - enable_diarization=False
+    - enable_dialog_blocks=False
+    - whisper_model="auto" (resolves to "large-v3")
+    - compute_type="auto" (prefers float16 on CUDA)
+    """
+    return LocalPipeline()
+
 def _build_document(
     *,
     formatted_text: str,

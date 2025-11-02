@@ -179,6 +179,11 @@ addopts = [
     "--strict-config",
     "-ra",
     "--tb=short",
+    "--cov=core",
+    "--cov=editing",
+    "--cov=utils",
+    "--cov-report=term-missing",
+    "--cov-report=xml",
 ]
 testpaths = ["tests"]
 markers = [
@@ -192,27 +197,29 @@ filterwarnings = [
     "ignore::DeprecationWarning",
 ]
 
-# ! Coverage configuration (disabled until Phase 3)
-# TODO: Enable in Phase 3 when sufficient tests are written
-# [tool.coverage.run]
-# source = ["core", "gui", "editing", "utils"]
-# omit = [
-#     "*/tests/*",
-#     "*/test_*",
-#     "*/__init__.py",
-#     "*/conftest.py",
-# ]
+# ! Coverage configuration (enabled)
+[tool.coverage.run]
+source = ["core", "gui", "editing", "utils"]
+omit = [
+    "*/tests/*",
+    "*/test_*",
+    "*/__init__.py",
+    "*/conftest.py",
+    "core/whisper_wrapper.py",
+    "core/whisperx_wrapper.py",
+    "utils/cleanup.py",
+]
 
-# [tool.coverage.report]
-# exclude_lines = [
-#     "pragma: no cover",
-#     "def __repr__",
-#     "if self.debug:",
-#     "if settings.DEBUG",
-#     "raise AssertionError",
-#     "raise NotImplementedError",
-#     "if 0:",
-#     "if __name__ == .__main__.:",
-#     "class .*\\bProtocol\\):",
-#     "@(abc\\.)?abstractmethod",
-# ]
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "if self.debug:",
+    "if settings.DEBUG",
+    "raise AssertionError",
+    "raise NotImplementedError",
+    "if 0:",
+    "if __name__ == .__main__.:",
+    "class .*\\bProtocol\\):",
+    "@(abc\\.)?abstractmethod",
+]

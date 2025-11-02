@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import os
 from pathlib import Path
 
 import pytest
@@ -8,18 +9,84 @@ from core.audio_io import prepare_audio
 from core.pipelines import LocalPipeline
 from core.settings import get_project_cache_dir
 from core.whisperx_wrapper import WhisperXWrapper
+from utils.exporters import export_document
 
 
-def test_integration_pipeline_fast_smoke(tmp_path: Path) -> None:
-    """End-to-end smoke: run LocalPipeline on the fixture in fast mode.
+def test_real_alignment_whisperx_small(tmp_path: Path) -> None:
+    """Verify whisperx alignment returns word timings when whisperx is installed.
 
-    This test is opt-in because it exercises heavy ML. Enable with
-    environment variable SK_INTEGRATION=1. It asserts that processing
-    completes without errors and that some text is produced. No persistent
-    artifacts are saved because we avoid exporters and use a pytest temp dir
-    as the working directory.
+    Skips if whisperx is not available in the environment.
     """
-    # Always run as requested
+    fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
+    if not fixture.exists():
+        return
+    pytest.importorskip("whisperx")
+
+    # Prepare audio to WAV
+    wav = prepare_audio(fixture, tmp_path)
+    wx = WhisperXWrapper(
+        model_name="small",
+        device="cuda",
+        compute_type="auto",
+        model_root=get_project_cache_dir() / "models",
+    )
+    tx = wx.transcribe(audio_path=wav, language=None)
+    aligned = wx.align(wav, tx, language=None)
+    assert isinstance(aligned, list)
+    # Expect at least one segment with aligned words when whisperx is present
+    assert any(getattr(seg, "words", []) for seg in aligned)
+
+
+def test_real_diarization_pyannote_small(tmp_path: Path) -> None:
+    """Verify diarization produces segments when pyannote.audio is installed.
+
+    Skips if pyannote.audio is not available in the environment.
+    """
+    fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
+    if not fixture.exists():
+        return
+    pytest.importorskip("pyannote.audio")
+    # Require token; skip if not provided in environment/.env
+    token = (
+        os.getenv("HF_TOKEN")
+        or os.getenv("HUGGINGFACE_TOKEN")
+        or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        or os.getenv("HUGGINGFACEHUB_TOKEN")
+        or os.getenv("HUGGINGFACEHUB_API_TOKEN")
+        or os.getenv("PYANNOTE_TOKEN")
+        or os.getenv("PYANNOTE_AUTH_TOKEN")
+    )
+    if not token:
+        pytest.skip("HF_TOKEN not set; skipping diarization test")
+
+    # Reuse pipeline with diarization enabled on small model
+    pipeline = LocalPipeline(
+        model_root=get_project_cache_dir() / "models",
+        whisper_model="small",
+        engine="auto",
+        enable_diarization=True,
+        enable_dialog_blocks=False,
+        device="auto",
+        compute_type="auto",
+    )
+    # Prepare audio path that diarizer consumes
+    wav = prepare_audio(fixture, tmp_path)
+    # Force lazy diarizer init if needed
+    if pipeline.diarizer is None:
+        from core.diarization import DiarizationPipeline
+
+        pipeline.diarizer = DiarizationPipeline(device="cuda")
+    segs = pipeline.diarizer.diarize(str(wav)) if pipeline.diarizer else []
+    assert isinstance(segs, list) and len(segs) > 0
+
+
+def test_integration_pipeline_fast_smoke_with_diarization_and_export(tmp_path: Path) -> None:
+    """Integration smoke on small model with diarization and export.
+
+    - Uses small model for ASR
+    - Enables diarization (pyannote token is loaded from .env)
+    - Exports TXT and SRT and checks presence
+    """
 
     fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
     if not fixture.exists():
@@ -28,19 +95,25 @@ def test_integration_pipeline_fast_smoke(tmp_path: Path) -> None:
 
     pipeline = LocalPipeline(
         model_root=get_project_cache_dir() / "models",
-        whisper_model="small",  # fast quality
+        whisper_model="small",  # fast quality only
         engine="auto",
-        enable_diarization=False,
+        enable_diarization=True,
         enable_dialog_blocks=False,
-        device="cpu",  # force CPU for test stability
+        device="auto",
         compute_type="auto",
     )
 
-    # Process without exporters; all intermediates are confined to tmp_path
+    # Process and export artifacts into tmp_path
     doc = pipeline.process(fixture, tmp_path)
     text = doc.get_full_text()
     assert isinstance(text, str)
     assert text.strip() != ""
+    txtp = tmp_path / f"{fixture.stem}.txt"
+    srtp = tmp_path / f"{fixture.stem}.srt"
+    export_document(doc, "txt", txtp)
+    export_document(doc, "srt", srtp)
+    assert txtp.exists() and txtp.stat().st_size >= 0
+    assert srtp.exists() and srtp.stat().st_size >= 0
 
 
 @pytest.mark.parametrize(
@@ -84,9 +157,9 @@ def test_cancel_responsiveness(
         model_root=get_project_cache_dir() / "models",
         whisper_model="small",
         engine="auto",
-        enable_diarization=False,
+        enable_diarization=True,
         enable_dialog_blocks=False,
-        device="cpu",
+        device="auto",
         compute_type="auto",
     )
 

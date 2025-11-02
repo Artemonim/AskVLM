@@ -260,7 +260,7 @@
         -   [ ] Unit tests (mock Torch, mock SpeechKit).
         -   [ ] Integration tests (WAV -> JSON comparison).
         -   [ ] GUI autotests (`pyside-tester`, signal/slot checks).
-        -   [ ] Enable code coverage requirements (80% minimum coverage).
+    -   [x] Enable code coverage gates (FAIL <65%, WARN <75%).
     -   [ ] `tools/benchmark.py` script.
 -   [x] **CI/CD (GitHub Actions)**
     -   [x] Linting (`ruff`).

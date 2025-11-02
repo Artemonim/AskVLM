@@ -1,4 +1,3 @@
-import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -6,7 +5,7 @@ from PySide6.QtWidgets import QApplication
 
 from core.diarization import DiarizationPipeline
 from core.llm_formatter import LLMFormatter
-from core.pipelines import LocalPipeline
+from core.pipelines import LocalPipeline, create_default_local_pipeline
 from core.whisperx_wrapper import WhisperXWrapper
 from editing.text_model import Document, TextSegment
 from gui.main_window import MainWindow, PipelineWorker
@@ -29,7 +28,7 @@ def test_llm_formatter_identity_when_no_model() -> None:
 
 def test_whisperx_align_fallback_without_whisperx() -> None:
     """Test that WhisperXWrapper align falls back without whisperx installed."""
-    wx = WhisperXWrapper(model_name="tiny", device="cpu", compute_type="auto")
+    wx = WhisperXWrapper(model_name="tiny", device="cuda", compute_type="auto")
     aligned = wx.align(Path("missing.wav"), {"segments": []}, language=None)
     assert isinstance(aligned, list)
 
@@ -103,32 +102,7 @@ def test_processing_fixture_twice_produces_two_tabs(tmp_path: Path) -> None:
     assert ed1.item(0, 2).text() if ed1.item(0, 2) else ""
 
 
-def test_integration_transcribe_fixture_smoke(tmp_path: Path) -> None:
-    """Smoke test: process the fixture and ensure some text and basic exports exist.
-
-    Controlled by env SK_INTEGRATION=1 to avoid long runs by default.
-    """
-    if os.getenv("SK_INTEGRATION") != "1":
-        return
-    fixture = Path("tests/fixtures/test_video_first.mp4")
-    if not fixture.exists():
-        return
-    out = tmp_path
-    pipeline = LocalPipeline(
-        engine="auto", enable_diarization=False, enable_dialog_blocks=False
-    )
-    doc = pipeline.process(fixture, out)
-    text = doc.get_full_text()
-    assert isinstance(text, str)
-    # Export TXT and SRT
-    txtp = out / f"{fixture.stem}.txt"
-    srtp = out / f"{fixture.stem}.srt"
-    export_document(doc, "txt", txtp)
-    export_document(doc, "srt", srtp)
-    assert txtp.exists()
-    assert txtp.stat().st_size >= 0
-    assert srtp.exists()
-    assert srtp.stat().st_size >= 0
+    
 
 
 def test_time_parsing_populates_nonzero_times() -> None:

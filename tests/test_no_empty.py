@@ -44,5 +44,3 @@ def test_fill_empty_gaps_ignores_meta_json_cue() -> None:
     assert "00:00:00,000 --> 00:00:02,000" in filled
     # Meta JSON line should remain present (function only adjusts cue timings)
     assert '{"tool":"ASK"}' in filled.replace(" ", "")
-
-

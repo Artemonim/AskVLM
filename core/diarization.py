@@ -42,7 +42,14 @@ class DiarizationPipeline:
 
         """
         self.model_name = model_name
-        self.hf_token = hf_token or os.getenv("HF_TOKEN") or ""
+        # Accept common env names for HF/pyannote tokens
+        self.hf_token = (
+            hf_token
+            or os.getenv("HF_TOKEN")
+            or os.getenv("PYANNOTE_TOKEN")
+            or os.getenv("PYANNOTE_AUTH_TOKEN")
+            or ""
+        )
         self.device = device
         self._pipeline: Any | None = None
         # Initialize logger before any method might use it
