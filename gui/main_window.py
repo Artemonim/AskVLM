@@ -7,7 +7,8 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
+from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from PySide6.QtCore import (
     QByteArray,
@@ -658,6 +659,8 @@ class MainWindow(QMainWindow):
             "subtitle_max_lines": int(self.spin_max_lines.value()),
             # * Quality metadata for SRT
             "quality": self._quality_mode,
+            # * NoEmpty: stretch cues to next start to avoid gaps
+            "no_empty": bool(self.chk_no_empty.isChecked()),
         }
 
         # Ensure pipeline flags reflect current UI before processing
@@ -671,14 +674,8 @@ class MainWindow(QMainWindow):
         # Reset transcript availability
         self._has_transcript = False
         self.btn_burn.setEnabled(_UI_UNCHECKED)
-        # Mark selected/allowed inputs as spinning
+        # Prepare spinner animation; overlays are set per-file on start events
         self._input_overlay.clear()
-        for p in allowed:
-            try:
-                key = str(p.resolve())
-            except OSError:
-                key = str(p)
-            self._input_overlay[key] = "spin"
         self._spinner_phase = 0
         self._spinner_timer.start()
         # Ensure previous thread is fully stopped before creating new one
@@ -701,6 +698,9 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self.on_error)
         self._worker.canceled.connect(self.on_canceled)
         self._worker.finished.connect(self.on_finished)
+        # Per-file lifecycle
+        self._worker.file_started.connect(self._on_file_started)
+        self._worker.file_finished.connect(self._on_file_finished)
         # Ensure cleanup
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
@@ -760,6 +760,46 @@ class MainWindow(QMainWindow):
         self._set_controls_enabled(enabled=True)
         self.progress.setValue(0)
         self.status.showMessage("Canceled")
+
+    # * Per-file UI updates
+    def _on_file_started(self, media_path: str) -> None:
+        """Mark a single input row as actively processing (spinner overlay)."""
+        try:
+            key = str(Path(media_path).resolve())
+        except OSError:
+            key = str(media_path)
+        self._input_overlay[key] = "spin"
+        # Ensure spinner is running
+        if not self._spinner_timer.isActive():
+            self._spinner_phase = 0
+            self._spinner_timer.start()
+        # Refresh icon for this row only
+        for i in range(self.input_list.rowCount()):
+            it = self.input_list.item(i, 1)
+            if it is not None and (
+                it.text() == media_path or str(Path(it.text())) == media_path
+            ):
+                self._update_item_icon_row(i)
+                break
+
+    def _on_file_finished(self, media_path: str, _outputs: list[str]) -> None:
+        """Mark a single input row as completed and refresh status immediately."""
+        try:
+            key = str(Path(media_path).resolve())
+        except OSError:
+            key = str(media_path)
+        if self._input_overlay.get(key) == "spin":
+            self._input_overlay[key] = "done"
+        # Refresh statuses from disk so icons switch from pending ➜ fast/good
+        self._scan_output_statuses()
+        # Update just this row's icon
+        for i in range(self.input_list.rowCount()):
+            it = self.input_list.item(i, 1)
+            if it is not None and (
+                it.text() == media_path or str(Path(it.text())) == media_path
+            ):
+                self._update_item_icon_row(i)
+                break
 
     def on_finished(self, _outputs: list[str], view_text: str) -> None:
         """Handle processing completion."""
@@ -1757,6 +1797,9 @@ class PipelineWorker(QObject):
     error = Signal(str)
     canceled = Signal()
     finished = Signal(list, str)  # (output_paths, view_text)
+    # * Per-file lifecycle signals
+    file_started = Signal(str)  # absolute media path
+    file_finished = Signal(str, list)  # absolute media path, outputs for this file
 
     def __init__(
         self,
@@ -1820,38 +1863,17 @@ class PipelineWorker(QObject):
                 ml_val2 = int(ml_obj2) if isinstance(ml_obj2, (int, str)) else 2
                 rules = SubtitleRules(max_line_chars=lw_val2, max_lines=ml_val2)
                 srt_text = export_srt_with_rules(doc, rules)
-                # Append ASK metadata to allow status scan to detect quality
+                # Append ASK metadata (comment-style) to allow status scan to detect quality
                 qual = str(self._opts.get("quality", "")).lower() or None
-                meta_payload = None
                 if qual in {"fast", "good"}:
-                    meta_payload = {
-                        "tool": "Artemonim's Speech Kit",
-                        "quality": qual,
-                        "completed": True,
-                    }
-                # If configured to append metadata as a subtitle cue AFTER video end,
-                # append a single cue with JSON payload one second after the last block.
-                if meta_payload is not None:
-                    # Compute end time as the max end across segments, fallback 0
-                    max_end = 0.0
-                    for seg in doc.segments:
-                        try:
-                            max_end = max(max_end, float(seg.end_time))
-                        except Exception:
-                            continue
-                    # One-second gap after end
-                    meta_start = max_end + 1.0
-                    meta_start + 0.5
-                    # Build meta cue as JSON on single line
-                    meta_line = json.dumps(meta_payload, ensure_ascii=False)
-                    # Append cue (index will be appended when writing full SRT)
-                    srt_text += f"\n{meta_line}\n"
-                # If UI requests no-empty SRT, fill gaps by stretching previous cues
-                if bool(
-                    self.chk_no_empty.isChecked()
-                    if hasattr(self, "chk_no_empty")
-                    else False
-                ):
+                    srt_text = append_ask_metadata_to_srt(
+                        srt_text,
+                        tool_name="Artemonim's Speech Kit",
+                        quality=qual,
+                        completed=True,
+                    )
+                # * If requested via options, fill gaps by stretching previous cues (NoEmpty)
+                if bool(self._opts.get("no_empty", False)):
                     with contextlib.suppress(Exception):
                         srt_text = fill_empty_gaps_in_srt(srt_text)
                 srt_path.write_text(srt_text, encoding="utf-8")
@@ -1861,43 +1883,103 @@ class PipelineWorker(QObject):
                 self.log.emit(f"SRT export failed: {ex}")
         return srt_path
 
-    def run(self) -> None:  # noqa: C901
-        """Execute the processing pipeline."""
+    def _cleanup_partial_file(self, media: Path) -> None:
+        """Remove streaming partial transcript file for the given media if present."""
         try:
-            outputs: list[str] = []
-            view_text: str = ""
-            total = max(1, len(self._inputs))
+            p = self._out_dir / f"{media.stem}.partial.txt"
+            if p.exists():
+                with contextlib.suppress(OSError):
+                    p.unlink()
+        except Exception:  # noqa: BLE001
+            return
 
-            def make_cb(
-                prefix: str, base: float, start_ts: float
+    def run(self) -> None:  # noqa: C901
+        """Execute the processing pipeline with optional parallelism.
+
+        - In 'fast' quality mode, run up to 2 files in parallel (GPU + CPU).
+        - Otherwise, run sequentially, but if the next file is 10x shorter than the
+          currently running GPU job, schedule it concurrently on CPU.
+        """
+        try:
+            from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+
+            outputs_all: list[str] = []
+            view_text_global: str = ""
+            files: list[Path] = list(self._inputs)
+            total = max(1, len(files))
+            if not files:
+                self.error.emit("No inputs provided")
+                return
+
+            # * Resolve durations for scheduling decisions
+            dur_map: dict[Path, float] = {}
+            for p in files:
+                with contextlib.suppress(Exception):
+                    dur_map[p] = max(0.0, get_media_duration_seconds(p))
+                dur_map.setdefault(p, 0.0)
+
+            # * Options snapshot
+            fmt = str(self._opts.get("export_format", "txt"))
+            lw_obj = self._opts.get("subtitle_max_line_width", 42)
+            ml_obj = self._opts.get("subtitle_max_lines", 2)
+            lw_i = int(lw_obj) if isinstance(lw_obj, (int, str)) else 42
+            ml_i = int(ml_obj) if isinstance(ml_obj, (int, str)) else 2
+            quality = str(self._opts.get("quality", "")).lower()
+            gpu_slots = 2 if quality == "fast" else 1
+            cpu_slots = 1
+
+            # * Helper to clone pipeline for a specific device
+            def _make_pipeline_for_device(device: str) -> Any:  # noqa: ANN401
+                base = self._pipeline
+                # Gracefully handle stub/test pipelines that only expose `process`
+                if not isinstance(base, LocalPipeline):
+                    return base
+                return LocalPipeline(
+                    model_root=base.model_root,
+                    whisper_model=base.whisperx.model_name,
+                    llm_model=base.formatter.model_name,
+                    engine=base.engine,
+                    enable_diarization=base.enable_diarization,
+                    enable_dialog_blocks=base.enable_dialog_blocks,
+                    language=base.language,
+                    device=device,
+                    compute_type=base.compute_type,
+                )
+
+            completed_count = 0
+
+            # * Shared progress callback factory for each job (index-based)
+            def make_job_cb(
+                job_index: int, start_ts: float
             ) -> Callable[[str, float], None]:
                 def _cb(msg: str, f: float) -> None:
-                    frac_overall = min(0.99, base + max(0.0, min(1.0, f)) / total)
+                    inner = max(0.0, min(1.0, f))
+                    frac_overall = min(0.99, (completed_count + inner) / total)
                     elapsed = max(0.0, time.time() - start_ts)
-                    inner = max(1e-4, min(0.9999, f if f > 0 else 0.0001))
-                    est_total = elapsed / inner
+                    inner_safe = max(1e-4, inner if inner > 0 else 0.0001)
+                    est_total = elapsed / inner_safe
                     eta = max(0.0, est_total - elapsed)
-                    msg2 = f"{msg} (elapsed {_format_eta(elapsed)} • ETA {_format_eta(eta)})"
-                    self._report(prefix + msg2, frac_overall)
+                    msg2 = f"[{job_index + 1}/{total}] {msg} (elapsed {_format_eta(elapsed)} • ETA {_format_eta(eta)})"
+                    self._report(msg2, frac_overall)
                     if self._cancel:
                         self._raise_canceled()
 
                 return _cb
 
-            for idx, media in enumerate(self._inputs):
-                if self._cancel:
-                    self.canceled.emit()
-                    return
-                prefix = f"[{idx + 1}/{total}] " if total > 1 else ""
-                base = idx / total
-                cb = make_cb(prefix, base, time.time())
-
+            def _job(
+                media: Path, device: str, job_index: int
+            ) -> tuple[Path, list[str], str]:
+                """Run end-to-end processing for one media on the given device."""
+                # Emit start
                 try:
-                    lw = self._opts.get("subtitle_max_line_width", 42)
-                    ml = self._opts.get("subtitle_max_lines", 2)
-                    lw_i = int(lw) if isinstance(lw, (int, str)) else 42
-                    ml_i = int(ml) if isinstance(ml, (int, str)) else 2
-                    doc = self._pipeline.process(
+                    self.file_started.emit(str(media.resolve()))
+                except OSError:
+                    self.file_started.emit(str(media))
+                local_outputs: list[str] = []
+                try:
+                    pl = _make_pipeline_for_device(device)
+                    cb = make_job_cb(job_index, time.time())
+                    doc = pl.process(
                         media,
                         self._out_dir,
                         progress=cb,
@@ -1905,31 +1987,110 @@ class PipelineWorker(QObject):
                         subtitle_max_line_width=lw_i,
                         subtitle_max_lines=ml_i,
                     )
-                    fmt = str(self._opts.get("export_format", "txt"))
+                    # Export primary and optional SRT
                     out_primary = self._export_primary(doc, media, fmt)
-                    outputs.append(str(out_primary))
-                    self._maybe_export_srt(doc, media, fmt, outputs)
-                    if bool(self._opts.get("single_view", False)):
-                        view_text = doc.get_full_text()
-                    self._report(prefix + "Exported", min(0.99, (idx + 1) / total))
-                except CancelledByUserError:
-                    # Treat cancel as a normal early-exit path
-                    self.canceled.emit()
-                    return
-                except Exception as ex:  # noqa: BLE001
-                    self.log.emit(f"Skipping '{media}': {ex}")
-                    self._report(
-                        prefix + "Skipped (error)", min(0.99, (idx + 1) / total)
+                    local_outputs.append(str(out_primary))
+                    self._maybe_export_srt(doc, media, fmt, local_outputs)
+                    view_text_local = (
+                        doc.get_full_text()
+                        if bool(self._opts.get("single_view", False))
+                        else ""
                     )
-                    continue
+                    return media, local_outputs, view_text_local
+                finally:
+                    # Always attempt to remove partial file for this media
+                    self._cleanup_partial_file(media)
 
+            # * Scheduler
+            idx = 0
+            running: dict[Future[tuple[Path, list[str], str]], tuple[Path, str, int]] = {}
+
+            def _count_running(device: str) -> int:
+                return sum(1 for _f, (_m, d, _i) in running.items() if d == device)
+
+            def _gpu_medias_running() -> list[Path]:
+                return [m for _f, (m, d, _i) in running.items() if d == "cuda"]
+
+            def _dur_gpu_ref() -> float:
+                meds = _gpu_medias_running()
+                if not meds:
+                    return 0.0
+                return max(dur_map.get(m, 0.0) for m in meds)
+
+            def _can_schedule_cpu(next_media: Path) -> bool:
+                if _count_running("cuda") <= 0:
+                    return False
+                if _count_running("cpu") >= cpu_slots:
+                    return False
+                dur_ref = _dur_gpu_ref()
+                dn = dur_map.get(next_media, 0.0)
+                return dur_ref > 0.0 and dn > 0.0 and dn <= (dur_ref / 10.0)
+
+            with ThreadPoolExecutor(max_workers=(gpu_slots + cpu_slots)) as pool:
+                # Seed initial GPU jobs
+                while idx < len(files) and _count_running("cuda") < gpu_slots:
+                    media = files[idx]
+                    fut = pool.submit(_job, media, "cuda", idx)
+                    running[fut] = (media, "cuda", idx)
+                    idx += 1
+
+                while running:
+                    if self._cancel:
+                        self.canceled.emit()
+                        return
+                    done, _pending = wait(
+                        list(running.keys()), return_when=FIRST_COMPLETED
+                    )
+                    for fut in done:
+                        media, device, job_index = running.pop(fut)
+                        try:
+                            m_out, outs, view_text_local = fut.result()
+                            outputs_all.extend(outs)
+                            if view_text_local and not view_text_global:
+                                view_text_global = view_text_local
+                            completed_count += 1
+                            try:
+                                self.file_finished.emit(str(m_out.resolve()), outs)
+                            except OSError:
+                                self.file_finished.emit(str(m_out), outs)
+                            # Update overall progress discretely after completion
+                            self._report(
+                                f"[{job_index + 1}/{total}] Exported",
+                                min(0.99, completed_count / total),
+                            )
+                        except CancelledByUserError:
+                            self.canceled.emit()
+                            return
+                        except Exception as ex:  # noqa: BLE001
+                            self.log.emit(f"Skipping '{media}': {ex}")
+                            completed_count += 1
+                            self._report(
+                                f"[{job_index + 1}/{total}] Skipped (error)",
+                                min(0.99, completed_count / total),
+                            )
+
+                    # Fill GPU slots first
+                    while idx < len(files) and _count_running("cuda") < gpu_slots:
+                        media2 = files[idx]
+                        fut2 = pool.submit(_job, media2, "cuda", idx)
+                        running[fut2] = (media2, "cuda", idx)
+                        idx += 1
+
+                    # Then optionally schedule one CPU job based on heuristic
+                    if idx < len(files):
+                        next_media = files[idx]
+                        if _can_schedule_cpu(next_media):
+                            fut3 = pool.submit(_job, next_media, "cpu", idx)
+                            running[fut3] = (next_media, "cpu", idx)
+                            idx += 1
+
+            # Finalize
             self._report("Completed", 1.0)
             self.log.emit("Processing completed successfully")
-            if not outputs:
-                # Emit error directly without raising
+            if not outputs_all:
                 self.error.emit("No valid inputs were processed")
                 return
-            self.finished.emit(outputs, view_text)
+            self.finished.emit(outputs_all, view_text_global)
         except Exception as e:  # noqa: BLE001
             self.error.emit(str(e))
 

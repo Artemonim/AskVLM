@@ -160,6 +160,10 @@
 -   [x] Preview: robust media-to-tab mapping and frame extraction (bugfix)
 -   [x] Preview matches burn styling (font size, outline, autoscale)
 -   [x] Stream transcription text to partial file during ASR
+    -   [x] Clean up partial files after processing/cancel/error
+    -   [x] Apply NoEmpty (stretch cues to next start) option on export
+    -   [x] Update per-file status immediately when each file finishes
+    -   [x] Show 🔁 only for files processing right now (not whole queue)
 
 ## Phase 1.84: Input Status, Autosave, Metadata
 
@@ -168,6 +172,11 @@
 -   [x] Autosave SRT on editor changes with ASK metadata
 -   [x] SRT metadata: tool name, quality (fast/good), completed flag
 -   [x] Scan output folder for ASK metadata to pre-mark input statuses
+
+## Phase 1.845: Queue Parallelism & Scheduling
+
+-   [x] Fast mode: process up to two files in parallel (GPU + CPU)
+-   [x] Heuristic: if next file duration is ≤ 1/10 of current GPU job, run it on CPU in parallel
 
 ## Phase 1.85: Disfluency Cleanup (Auto)
 
