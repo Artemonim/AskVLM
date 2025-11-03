@@ -102,7 +102,12 @@ class WhisperXWrapper:
         # * Try primary load; if OOM, downgrade compute_type/device
         # Allow CPU device for tests/integration when requested
         chosen_model = self.model_name
-        logging.getLogger(__name__).info("Using Whisper model: %s", chosen_model)
+        logging.getLogger(__name__).info(
+            "Using Whisper model: %s (device=%s, compute=%s)",
+            chosen_model,
+            self.device,
+            ct if self.device == "cuda" else "int8",
+        )
         # Force int8 compute when running on CPU to avoid float16 errors
         compute_type_final = ct if self.device == "cuda" else "int8"
         self._model = fw_whisper_cls(
@@ -116,6 +121,42 @@ class WhisperXWrapper:
         if self._align_model is None and whisperx_mod is not None:
             # whisperx module reference
             self._align_model = whisperx_mod
+
+    # * Explicitly release heavy resources to avoid lingering VRAM usage between jobs
+    def unload(self) -> None:
+        """Release loaded models and free GPU memory (best effort).
+
+        This method clears references to the underlying faster-whisper model
+        and alignment backend and triggers Python/torch memory cleanup to reduce
+        the chance of VRAM fragmentation or OOM across sequential jobs.
+        """
+        try:
+            # Drop references to heavy objects
+            if getattr(self, "_model", None) is not None:
+                try:
+                    # Some backends may expose a close()/__del__ cleanup implicitly
+                    del self._model
+                except Exception:  # noqa: BLE001
+                    pass
+            self._model = None
+            self._align_model = None
+        finally:
+            # Encourage memory reclamation
+            try:
+                import gc as _gc
+
+                _gc.collect()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if (
+                    self.device == "cuda"
+                    and torch_mod is not None
+                    and getattr(torch_mod, "cuda", None) is not None
+                ):
+                    torch_mod.cuda.empty_cache()
+            except Exception:  # noqa: BLE001
+                pass
 
     def transcribe(
         self,

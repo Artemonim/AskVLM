@@ -7,7 +7,9 @@ from core import audio_io
 from utils import env as env_utils
 
 
-def test_load_env_file_sets_variables(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_load_env_file_sets_variables(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """load_env_file reads KEY=VALUE pairs and sets os.environ if absent."""
     content = "# comment\nA=1\nB='2'\nC=\"3\"\nNOEQUALS"
     env_path = tmp_path / ".env"

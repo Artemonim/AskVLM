@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import re
 import sys
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast
-from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
+from typing import TYPE_CHECKING, Any, Literal
 
 from PySide6.QtCore import (
     QByteArray,
@@ -236,6 +234,7 @@ class _InlineBurnWorker(QObject):
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from concurrent.futures import Future
     from subprocess import Popen
 
     from PySide6.QtGui import QCloseEvent
@@ -704,6 +703,8 @@ class MainWindow(QMainWindow):
         # Ensure cleanup
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.canceled.connect(self._thread.quit)
+        self._worker.canceled.connect(self._worker.deleteLater)
         self._thread.finished.connect(self._thread.deleteLater)
 
         self._thread.start()
@@ -1803,7 +1804,7 @@ class PipelineWorker(QObject):
 
     def __init__(
         self,
-        pipeline: LocalPipeline,
+        pipeline: Any,
         inputs: list[Path],
         out_dir: Path,
         options: dict[str, object],
@@ -1917,6 +1918,11 @@ class PipelineWorker(QObject):
                 with contextlib.suppress(Exception):
                     dur_map[p] = max(0.0, get_media_duration_seconds(p))
                 dur_map.setdefault(p, 0.0)
+            with contextlib.suppress(Exception):
+                self.log.emit(
+                    "Durations: "
+                    + ", ".join(f"{p.name}={dur_map.get(p, 0.0):.2f}s" for p in files)
+                )
 
             # * Options snapshot
             fmt = str(self._opts.get("export_format", "txt"))
@@ -1930,10 +1936,13 @@ class PipelineWorker(QObject):
 
             # * Helper to clone pipeline for a specific device
             def _make_pipeline_for_device(device: str) -> Any:  # noqa: ANN401
+                if not isinstance(self._pipeline, LocalPipeline):
+                    return self._pipeline
                 base = self._pipeline
-                # Gracefully handle stub/test pipelines that only expose `process`
-                if not isinstance(base, LocalPipeline):
+                # Reuse base pipeline for CUDA jobs to avoid reloading the model
+                if device != "cpu":
                     return base
+                # Create a CPU-only clone when heuristic schedules a CPU job
                 return LocalPipeline(
                     model_root=base.model_root,
                     whisper_model=base.whisperx.model_name,
@@ -1942,7 +1951,7 @@ class PipelineWorker(QObject):
                     enable_diarization=base.enable_diarization,
                     enable_dialog_blocks=base.enable_dialog_blocks,
                     language=base.language,
-                    device=device,
+                    device="cpu",
                     compute_type=base.compute_type,
                 )
 
@@ -1978,6 +1987,10 @@ class PipelineWorker(QObject):
                 local_outputs: list[str] = []
                 try:
                     pl = _make_pipeline_for_device(device)
+                    with contextlib.suppress(Exception):
+                        self.log.emit(
+                            f"Job start: idx={job_index} device={device} media={media.name}"
+                        )
                     cb = make_job_cb(job_index, time.time())
                     doc = pl.process(
                         media,
@@ -1996,14 +2009,31 @@ class PipelineWorker(QObject):
                         if bool(self._opts.get("single_view", False))
                         else ""
                     )
+                    with contextlib.suppress(Exception):
+                        self.log.emit(
+                            f"Job done: idx={job_index} device={device} media={media.name}"
+                        )
                     return media, local_outputs, view_text_local
                 finally:
                     # Always attempt to remove partial file for this media
                     self._cleanup_partial_file(media)
+                    # Proactively unload ASR model only when diarization is enabled
+                    try:
+                        if isinstance(pl, LocalPipeline) and bool(
+                            getattr(pl, "enable_diarization", False)
+                        ):
+                            wx = getattr(pl, "whisperx", None)
+                            unload_fn = getattr(wx, "unload", None)
+                            if callable(unload_fn):
+                                unload_fn()
+                    except Exception:  # noqa: BLE001
+                        pass
 
             # * Scheduler
             idx = 0
-            running: dict[Future[tuple[Path, list[str], str]], tuple[Path, str, int]] = {}
+            running: dict[
+                Future[tuple[Path, list[str], str]], tuple[Path, str, int]
+            ] = {}
 
             def _count_running(device: str) -> int:
                 return sum(1 for _f, (_m, d, _i) in running.items() if d == device)
@@ -2027,22 +2057,25 @@ class PipelineWorker(QObject):
                 return dur_ref > 0.0 and dn > 0.0 and dn <= (dur_ref / 10.0)
 
             with ThreadPoolExecutor(max_workers=(gpu_slots + cpu_slots)) as pool:
+                was_canceled = False
                 # Seed initial GPU jobs
                 while idx < len(files) and _count_running("cuda") < gpu_slots:
                     media = files[idx]
                     fut = pool.submit(_job, media, "cuda", idx)
                     running[fut] = (media, "cuda", idx)
                     idx += 1
+                    with contextlib.suppress(Exception):
+                        self.log.emit(f"Scheduled CUDA: idx={idx} media={media.name}")
 
                 while running:
                     if self._cancel:
-                        self.canceled.emit()
-                        return
+                        was_canceled = True
+                        break
                     done, _pending = wait(
                         list(running.keys()), return_when=FIRST_COMPLETED
                     )
                     for fut in done:
-                        media, device, job_index = running.pop(fut)
+                        media, _device, job_index = running.pop(fut)
                         try:
                             m_out, outs, view_text_local = fut.result()
                             outputs_all.extend(outs)
@@ -2059,9 +2092,13 @@ class PipelineWorker(QObject):
                                 min(0.99, completed_count / total),
                             )
                         except CancelledByUserError:
-                            self.canceled.emit()
-                            return
+                            was_canceled = True
+                            # Do not schedule further tasks; break outer loop soon
                         except Exception as ex:  # noqa: BLE001
+                            with contextlib.suppress(Exception):
+                                self.log.emit(
+                                    f"Job error: idx={job_index} media={media.name} ex={ex}"
+                                )
                             self.log.emit(f"Skipping '{media}': {ex}")
                             completed_count += 1
                             self._report(
@@ -2075,16 +2112,28 @@ class PipelineWorker(QObject):
                         fut2 = pool.submit(_job, media2, "cuda", idx)
                         running[fut2] = (media2, "cuda", idx)
                         idx += 1
+                        with contextlib.suppress(Exception):
+                            self.log.emit(
+                                f"Scheduled CUDA: idx={idx} media={media2.name}"
+                            )
 
                     # Then optionally schedule one CPU job based on heuristic
-                    if idx < len(files):
+                    if idx < len(files) and not was_canceled:
                         next_media = files[idx]
                         if _can_schedule_cpu(next_media):
                             fut3 = pool.submit(_job, next_media, "cpu", idx)
                             running[fut3] = (next_media, "cpu", idx)
                             idx += 1
+                            with contextlib.suppress(Exception):
+                                self.log.emit(
+                                    f"Scheduled CPU: idx={idx} media={next_media.name}"
+                                )
 
             # Finalize
+            if was_canceled or self._cancel:
+                self._report("Canceled", min(0.99, completed_count / max(1, total)))
+                self.canceled.emit()
+                return
             self._report("Completed", 1.0)
             self.log.emit("Processing completed successfully")
             if not outputs_all:

@@ -18,7 +18,9 @@ def test_setup_logging_and_get_logger() -> None:
     assert lg.name == "x"
 
 
-def test_ffmpeg_get_media_duration_seconds_success(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_ffmpeg_get_media_duration_seconds_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """get_media_duration_seconds parses float duration from ffprobe result."""
     monkeypatch.setattr(ffm.ffmpeg, "probe", lambda p: {"format": {"duration": "12.5"}})
     assert ffm.get_media_duration_seconds("file") == pytest.approx(12.5)
