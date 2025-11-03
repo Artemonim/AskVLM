@@ -5,6 +5,7 @@ import os
 import re
 import sys
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -129,8 +130,10 @@ class _InlineBurnWorker(QObject):
     def request_cancel(self) -> None:
         self._cancel = True
         if self._proc is not None:
-            with contextlib.suppress(OSError):
+            with contextlib.suppress(Exception):
                 self._proc.terminate()
+                self._proc.wait(timeout=2)
+            self._proc = None
 
     def run(self) -> None:  # noqa: C901, PLR0912, PLR0915
         try:
@@ -849,15 +852,7 @@ class MainWindow(QMainWindow):
                 get_logger(__name__).debug("Failed to read SRT '%s': %s", p, exc)
                 content = ""
             # Strip ASK metadata lines/cues from viewer text
-            try:
-                content2 = strip_ask_meta_from_srt(content)
-            except Exception:
-                # fallback: filter comment lines only
-                content2 = "\n".join(
-                    line
-                    for line in content.splitlines()
-                    if not line.startswith("# ASK_META:")
-                )
+            content2 = strip_ask_meta_from_srt(content)
             self._add_tab(p.stem, content2, self._find_input_media_by_stem(p.stem))
             return
         if view_text:
@@ -877,14 +872,7 @@ class MainWindow(QMainWindow):
                 get_logger(__name__).debug("Failed to read output '%s': %s", p, exc)
                 content = ""
             # Strip ASK metadata lines/cues from viewer text
-            try:
-                content2 = strip_ask_meta_from_srt(content)
-            except Exception:
-                content2 = "\n".join(
-                    line
-                    for line in content.splitlines()
-                    if not line.startswith("# ASK_META:")
-                )
+            content2 = strip_ask_meta_from_srt(content)
             self._add_tab(p.stem, content2, self._find_input_media_by_stem(p.stem))
 
     def _remove_placeholder_document_tab_if_present(self) -> None:
@@ -1804,7 +1792,7 @@ class PipelineWorker(QObject):
 
     def __init__(
         self,
-        pipeline: Any,
+        pipeline: object,
         inputs: list[Path],
         out_dir: Path,
         options: dict[str, object],
@@ -1894,7 +1882,7 @@ class PipelineWorker(QObject):
         except Exception:  # noqa: BLE001
             return
 
-    def run(self) -> None:  # noqa: C901
+    def run(self) -> None:  # noqa: C901, PLR0912, PLR0915
         """Execute the processing pipeline with optional parallelism.
 
         - In 'fast' quality mode, run up to 2 files in parallel (GPU + CPU).
@@ -1902,8 +1890,6 @@ class PipelineWorker(QObject):
           currently running GPU job, schedule it concurrently on CPU.
         """
         try:
-            from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-
             outputs_all: list[str] = []
             view_text_global: str = ""
             files: list[Path] = list(self._inputs)
@@ -2026,8 +2012,10 @@ class PipelineWorker(QObject):
                             unload_fn = getattr(wx, "unload", None)
                             if callable(unload_fn):
                                 unload_fn()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as _unload_ex:  # noqa: BLE001
+                        get_logger(__name__).debug(
+                            "Unload cleanup ignored: %s", _unload_ex
+                        )
 
             # * Scheduler
             idx = 0

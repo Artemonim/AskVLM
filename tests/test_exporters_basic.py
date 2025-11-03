@@ -5,6 +5,7 @@ from utils import exporters as ex
 
 
 def build_doc() -> Document:
+    """Return a small `Document` with two short segments for tests."""
     doc = Document()
     doc.add_segment(TextSegment("speaker_1", 0.0, 1.0, "Hello world"))
     doc.add_segment(TextSegment("speaker_2", 1.0, 3.0, "How are you doing today?"))

@@ -15,6 +15,7 @@ def _ensure_qapp() -> None:
 
 
 def test_fill_empty_gaps_basic() -> None:
+    """fill_empty_gaps_in_srt closes gaps between consecutive cues."""
     _ensure_qapp()
     # Create three cues with a gap between 1.0..2.0 and 3.0..4.0
     d = Document()
@@ -32,6 +33,7 @@ def test_fill_empty_gaps_basic() -> None:
 
 
 def test_fill_empty_gaps_ignores_meta_json_cue() -> None:
+    """Function ignores trailing JSON meta cue and only adjusts cue timings."""
     _ensure_qapp()
     # SRT with two cues and a trailing JSON meta line; ensure function does not break
     srt = (

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import gc as _gc
 import importlib
 import logging
 import os
@@ -133,30 +135,22 @@ class WhisperXWrapper:
         try:
             # Drop references to heavy objects
             if getattr(self, "_model", None) is not None:
-                try:
-                    # Some backends may expose a close()/__del__ cleanup implicitly
+                # Some backends may expose a close()/__del__ cleanup implicitly
+                with contextlib.suppress(Exception):
                     del self._model
-                except Exception:  # noqa: BLE001
-                    pass
             self._model = None
             self._align_model = None
         finally:
             # Encourage memory reclamation
-            try:
-                import gc as _gc
-
+            with contextlib.suppress(Exception):
                 _gc.collect()
-            except Exception:  # noqa: BLE001
-                pass
-            try:
+            with contextlib.suppress(Exception):
                 if (
                     self.device == "cuda"
                     and torch_mod is not None
                     and getattr(torch_mod, "cuda", None) is not None
                 ):
                     torch_mod.cuda.empty_cache()
-            except Exception:  # noqa: BLE001
-                pass
 
     def transcribe(
         self,

@@ -6,6 +6,7 @@ import pytest
 
 import core.pipelines as pl
 from core.audio_io import prepare_audio
+from core.diarization import DiarizationPipeline
 from core.pipelines import LocalPipeline
 from core.settings import get_project_cache_dir
 from core.whisperx_wrapper import WhisperXWrapper
@@ -73,8 +74,6 @@ def test_real_diarization_pyannote_small(tmp_path: Path) -> None:
     wav = prepare_audio(fixture, tmp_path)
     # Force lazy diarizer init if needed
     if pipeline.diarizer is None:
-        from core.diarization import DiarizationPipeline
-
         pipeline.diarizer = DiarizationPipeline(device="cuda")
     segs = pipeline.diarizer.diarize(str(wav)) if pipeline.diarizer else []
     assert isinstance(segs, list)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
 from editing.text_model import Document, TextSegment
 from gui.main_window import MainWindow, PipelineWorker
@@ -11,6 +11,7 @@ from utils.exporters import (
     append_ask_metadata_to_srt,
     export_srt_with_rules,
     extract_ask_metadata_from_srt,
+    strip_ask_meta_from_srt,
 )
 
 if TYPE_CHECKING:
@@ -18,6 +19,7 @@ if TYPE_CHECKING:
 
 
 def test_srt_metadata_round_trip() -> None:
+    """Append/extract ASK metadata round trip is consistent."""
     # Ensure Qt exists for potential GUI interactions later
     QApplication.instance() or QApplication([])
 
@@ -38,6 +40,7 @@ def test_srt_metadata_round_trip() -> None:
 
 
 def test_input_status_scan_sets_icons(tmp_path: Path) -> None:
+    """Scanning output dir sets expected per-row statuses/icons."""
     # Create a minimal Qt app
     QApplication.instance() or QApplication([])
 
@@ -58,8 +61,6 @@ def test_input_status_scan_sets_icons(tmp_path: Path) -> None:
     for p in (fast_media, good_media, burn_media):
         row = w.input_list.rowCount()
         w.input_list.insertRow(row)
-        from PySide6.QtWidgets import QTableWidgetItem
-
         w.input_list.setItem(row, 1, QTableWidgetItem(str(p)))
 
     # Write SRT files with metadata: fast and good
@@ -78,15 +79,16 @@ def test_input_status_scan_sets_icons(tmp_path: Path) -> None:
     (tmp_path / "burn_input_subbed.mp4").write_bytes(b"")
 
     # Trigger scan
-    w._scan_output_statuses()
+    w._scan_output_statuses()  # noqa: SLF001
 
     # Verify internal statuses
-    assert w._get_input_status(fast_media) == "fast"
-    assert w._get_input_status(good_media) == "good"
-    assert w._get_input_status(burn_media) == "burned"
+    assert w._get_input_status(fast_media) == "fast"  # noqa: SLF001
+    assert w._get_input_status(good_media) == "good"  # noqa: SLF001
+    assert w._get_input_status(burn_media) == "burned"  # noqa: SLF001
 
 
 def test_pipeline_appends_ask_metadata_and_scan(tmp_path: Path) -> None:
+    """Pipeline exports SRT with ASK meta and scanner detects quality."""
     # Ensure Qt exists
     QApplication.instance() or QApplication([])
 
@@ -131,15 +133,13 @@ def test_pipeline_appends_ask_metadata_and_scan(tmp_path: Path) -> None:
     w.out_dir_edit.setText(str(tmp_path))
     row = w.input_list.rowCount()
     w.input_list.insertRow(row)
-    from PySide6.QtWidgets import QTableWidgetItem
-
     w.input_list.setItem(row, 1, QTableWidgetItem(str(media)))
-    w._scan_output_statuses()
-    assert w._get_input_status(media) == "fast"
+    w._scan_output_statuses()  # noqa: SLF001
+    assert w._get_input_status(media) == "fast"  # noqa: SLF001
 
 
 def test_viewer_strips_meta_cue_and_comment(tmp_path: Path) -> None:
-    # Ensure JSON meta cue and comment meta lines are removed for viewer
+    """Viewer text strips JSON meta cue and comment meta lines safely."""
     srt = """1
 00:00:00,000 --> 00:00:01,000
 Hello
@@ -151,8 +151,6 @@ World
 {\"tool\": \"Artemonim's Speech Kit\", \"quality\": \"fast\", \"completed\": true}
 # ASK_META: {"tool": "Artemonim's Speech Kit", "quality": "fast", "completed": true}
 """
-    from utils.exporters import strip_ask_meta_from_srt
-
     stripped = strip_ask_meta_from_srt(srt)
     # Should not contain JSON metadata nor comment meta line
     assert "Artemonim's Speech Kit" not in stripped

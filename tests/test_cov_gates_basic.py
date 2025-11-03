@@ -16,7 +16,7 @@ from utils import downloader
 def test_find_project_root_points_to_repo_root() -> None:
     """Root discovery returns a directory containing pyproject.toml."""
     # Ensure it returns a directory containing pyproject.toml
-    root = core_settings._find_project_root()
+    root = core_settings._find_project_root()  # noqa: SLF001
     assert (root / "pyproject.toml").exists()
 
 
@@ -59,7 +59,7 @@ def test_load_settings_writes_and_reads(
     settings_path.write_text(json.dumps(data), encoding="utf-8")
     monkeypatch.setenv("HF_TOKEN", "TOKEN123")
     s2 = core_settings.load_settings(settings_path)
-    assert s2.hf_token == "TOKEN123"
+    assert s2.hf_token == "TOKEN123"  # noqa: S105
 
 
 def test_downloader_ensure_and_check(tmp_path: Path) -> None:

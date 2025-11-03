@@ -1,4 +1,5 @@
 import io
+import os
 from pathlib import Path
 
 import pytest
@@ -19,14 +20,13 @@ def test_load_env_file_sets_variables(
     monkeypatch.delenv("B", raising=False)
     monkeypatch.delenv("C", raising=False)
     env_utils.load_env_file(env_path)
-    import os
 
     assert os.environ.get("A") == "1"
     assert os.environ.get("B") == "2"
     assert os.environ.get("C") == "3"
 
 
-def test_prepare_audio_cancellable_path_success(
+def test_prepare_audio_cancellable_path_success(  # noqa: C901
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """prepare_audio with should_cancel uses async ffmpeg path and succeeds."""
@@ -36,18 +36,24 @@ def test_prepare_audio_cancellable_path_success(
         def __init__(self) -> None:
             self.stderr = io.StringIO("progress=1\n")
 
-        def output(self, *args, **kwargs):
+        def output(self, *_args: object, **_kwargs: object) -> "FakeStream":
             return self
 
-        def overwrite_output(self):
+        def overwrite_output(self) -> "FakeStream":
             return self
 
-        def global_args(self, *args):
+        def global_args(self, *_args: object) -> "FakeStream":
             return self
 
-        def run_async(self, pipe_stdin=True, pipe_stdout=False, pipe_stderr=True):  # noqa: ARG002
+        def run_async(
+            self,
+            *,
+            pipe_stdin: bool = True,
+            pipe_stdout: bool = False,
+            pipe_stderr: bool = True,
+        ) -> object:
             class Proc:
-                def __init__(self, stderr) -> None:
+                def __init__(self, stderr: io.StringIO) -> None:
                     self.stderr = stderr
 
                 def poll(self) -> int:
@@ -59,10 +65,12 @@ def test_prepare_audio_cancellable_path_success(
                 def kill(self) -> None:
                     return None
 
+            # Touch keyword-only flags to avoid unused-argument warnings
+            _ = (pipe_stdin, pipe_stdout, pipe_stderr)
             return Proc(self.stderr)
 
     class FakeFFMPEG:
-        def input(self, *args, **kwargs):
+        def input(self, *_args: object, **_kwargs: object) -> FakeStream:
             return FakeStream()
 
     # Patch module-level ffmpeg in audio_io

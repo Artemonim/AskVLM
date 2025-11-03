@@ -5,6 +5,7 @@ Includes SRT/VTT exporters with readability rules (CPS/durations/line length).
 """
 
 import json
+import re as _re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -192,8 +193,11 @@ def _parse_ts_srt_to_seconds(ts: str) -> float:
         hms, ms = s.split(",")
         h, m, sec = hms.split(":")
         return int(h) * 3600 + int(m) * 60 + int(sec) + int(ms) / 1000.0
-    except Exception:
+    except ValueError:
         return 0.0
+
+
+SRT_MIN_GAP_LINES = 2
 
 
 def fill_empty_gaps_in_srt(srt_text: str) -> str:
@@ -202,8 +206,6 @@ def fill_empty_gaps_in_srt(srt_text: str) -> str:
     The function scans for SRT timecode lines and adjusts only those lines,
     ignoring any trailing comment or JSON metadata lines.
     """
-    import re as _re
-
     lines = srt_text.splitlines()
     # Capture leading/trailing parts to preserve whitespace
     time_re = _re.compile(
@@ -224,7 +226,7 @@ def fill_empty_gaps_in_srt(srt_text: str) -> str:
                 m.group("suffix"),
             )
         )
-    if len(time_lines) < 2:
+    if len(time_lines) < SRT_MIN_GAP_LINES:
         return srt_text
     # Adjust end time of each cue to next cue's start if gap exists
     for i in range(len(time_lines) - 1):
