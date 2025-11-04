@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import signal
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
@@ -59,7 +60,7 @@ from core.ffmpeg import (
     get_media_duration_seconds,
     start_burn_process,
 )
-from core.pipelines import LocalPipeline
+from core.pipelines import CancelledError, LocalPipeline
 from core.whisperx_wrapper import WhisperXWrapper
 from editing.text_model import Document, TextSegment
 from gui.speaker_sidebar import SpeakerSidebar
@@ -716,6 +717,8 @@ class MainWindow(QMainWindow):
         """Request cancellation from the worker (best effort)."""
         if self._worker is not None:
             self._worker.request_cancel()
+            with contextlib.suppress(Exception):
+                get_logger(__name__).info("Cancel signal forwarded to worker")
             self.status.showMessage("Cancel requested…")
             self.btn_cancel.setEnabled(_UI_UNCHECKED)
         if isinstance(self._burn_worker, _InlineBurnWorker):
@@ -752,6 +755,9 @@ class MainWindow(QMainWindow):
         """Handle processing error."""
         self._set_controls_enabled(enabled=True)
         self.progress.setValue(0)
+        # Ensure spinner stops to avoid timer callbacks during shutdown
+        with contextlib.suppress(Exception):
+            self._spinner_timer.stop()
         # Also print to console for visibility when launched from terminal
         with contextlib.suppress(Exception):
             pass
@@ -761,9 +767,13 @@ class MainWindow(QMainWindow):
 
     def on_canceled(self) -> None:
         """Handle processing cancellation."""
+        # Re-enable controls only after worker reported cancellation completion
         self._set_controls_enabled(enabled=True)
         self.progress.setValue(0)
         self.status.showMessage("Canceled")
+        # Stop spinner once cancellation is fully handled
+        with contextlib.suppress(Exception):
+            self._spinner_timer.stop()
 
     # * Per-file UI updates
     def _on_file_started(self, media_path: str) -> None:
@@ -1188,14 +1198,24 @@ class MainWindow(QMainWindow):
         # Trigger global cancel
         with contextlib.suppress(Exception):
             self.request_cancel()
-            # Give threads time to stop
-            if self._thread is not None and self._thread.isRunning():
-                self._thread.quit()
-                self._thread.wait(2000)
-            if self._burn_thread is not None and self._burn_thread.isRunning():
-                self._burn_thread.quit()
-                self._burn_thread.wait(2000)
+            with contextlib.suppress(Exception):
+                get_logger(__name__).info("Application exit requested")
+            # Stop spinner and wait for worker threads
+            self.await_worker_shutdown()
         event.accept()
+
+    def await_worker_shutdown(self, timeout_ms: int = 10000) -> None:
+        """Stop spinner and await background worker threads termination."""
+        with contextlib.suppress(Exception):
+            self._spinner_timer.stop()
+        # Give threads time to stop
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            # Wait longer to let GPU job acknowledge cancel and free VRAM
+            self._thread.wait(timeout_ms)
+        if self._burn_thread is not None and self._burn_thread.isRunning():
+            self._burn_thread.quit()
+            self._burn_thread.wait(2000)
 
     # * Settings persistence
     def _load_settings(self) -> None:
@@ -1803,10 +1823,18 @@ class PipelineWorker(QObject):
         self._out_dir = out_dir
         self._opts = options
         self._cancel = False
+        # Track live LocalPipeline instances per job index to allow best-effort
+        # resource release on user cancellation.
+        self._live_pipelines: dict[int, object] = {}
 
     def request_cancel(self) -> None:
         """Request cancellation of processing."""
         self._cancel = True
+        # Emit log for visibility in console runs
+        with contextlib.suppress(Exception):
+            get_logger(__name__).info("Cancel requested by user")
+        # Do not unload live models here to avoid races with in-flight kernels.
+        # Unload happens in job's finally block after the model call returns.
 
     def _report(self, msg: str, frac: float) -> None:
         """Emit progress signal."""
@@ -1922,13 +1950,22 @@ class PipelineWorker(QObject):
 
             # * Helper to clone pipeline for a specific device
             def _make_pipeline_for_device(device: str) -> Any:  # noqa: ANN401
+                """Create an isolated pipeline instance for the target device.
+
+                This avoids sharing a single Whisper model object across parallel
+                jobs. In Fast mode, two CUDA jobs run concurrently, each with its
+                own faster-whisper model instance (small), which fits typical VRAM
+                budgets. Diarization remains heavy and is serialized elsewhere.
+                """
                 if not isinstance(self._pipeline, LocalPipeline):
                     return self._pipeline
                 base = self._pipeline
-                # Reuse base pipeline for CUDA jobs to avoid reloading the model
-                if device != "cpu":
+                # * Reuse the base pipeline in non-Fast mode (sequential GPU) to
+                # * avoid unnecessary reloads of large models (good quality).
+                if device != "cpu" and gpu_slots <= 1:
                     return base
-                # Create a CPU-only clone when heuristic schedules a CPU job
+                # * Otherwise (Fast mode CUDA or any CPU job), clone to ensure
+                # * independent model instances per job.
                 return LocalPipeline(
                     model_root=base.model_root,
                     whisper_model=base.whisperx.model_name,
@@ -1937,7 +1974,7 @@ class PipelineWorker(QObject):
                     enable_diarization=base.enable_diarization,
                     enable_dialog_blocks=base.enable_dialog_blocks,
                     language=base.language,
-                    device="cpu",
+                    device=device,
                     compute_type=base.compute_type,
                 )
 
@@ -1957,6 +1994,7 @@ class PipelineWorker(QObject):
                     msg2 = f"[{job_index + 1}/{total}] {msg} (elapsed {_format_eta(elapsed)} • ETA {_format_eta(eta)})"
                     self._report(msg2, frac_overall)
                     if self._cancel:
+                        # Raise cancel via dedicated helper to keep ruff satisfied
                         self._raise_canceled()
 
                 return _cb
@@ -1966,6 +2004,7 @@ class PipelineWorker(QObject):
             ) -> tuple[Path, list[str], str]:
                 """Run end-to-end processing for one media on the given device."""
                 # Emit start
+                t_start = time.time()
                 try:
                     self.file_started.emit(str(media.resolve()))
                 except OSError:
@@ -1973,6 +2012,8 @@ class PipelineWorker(QObject):
                 local_outputs: list[str] = []
                 try:
                     pl = _make_pipeline_for_device(device)
+                    # Register live pipeline for potential Cancel-time cleanup
+                    self._live_pipelines[job_index] = pl
                     with contextlib.suppress(Exception):
                         self.log.emit(
                             f"Job start: idx={job_index} device={device} media={media.name}"
@@ -1996,18 +2037,21 @@ class PipelineWorker(QObject):
                         else ""
                     )
                     with contextlib.suppress(Exception):
+                        elapsed = max(0.0, time.time() - t_start)
                         self.log.emit(
-                            f"Job done: idx={job_index} device={device} media={media.name}"
+                            f"Job done: idx={job_index} device={device} media={media.name} elapsed={_format_eta(elapsed)}"
                         )
                     return media, local_outputs, view_text_local
                 finally:
                     # Always attempt to remove partial file for this media
                     self._cleanup_partial_file(media)
-                    # Proactively unload ASR model only when diarization is enabled
+                    # Remove from live pipelines registry
+                    with contextlib.suppress(Exception):
+                        self._live_pipelines.pop(job_index, None)
+                    # * Unload Whisper model only for cloned pipelines to keep
+                    # * the base pipeline (good quality) resident and stable.
                     try:
-                        if isinstance(pl, LocalPipeline) and bool(
-                            getattr(pl, "enable_diarization", False)
-                        ):
+                        if isinstance(pl, LocalPipeline) and pl is not self._pipeline:
                             wx = getattr(pl, "whisperx", None)
                             unload_fn = getattr(wx, "unload", None)
                             if callable(unload_fn):
@@ -2044,7 +2088,8 @@ class PipelineWorker(QObject):
                 dn = dur_map.get(next_media, 0.0)
                 return dur_ref > 0.0 and dn > 0.0 and dn <= (dur_ref / 10.0)
 
-            with ThreadPoolExecutor(max_workers=(gpu_slots + cpu_slots)) as pool:
+            pool = ThreadPoolExecutor(max_workers=(gpu_slots + cpu_slots))
+            try:
                 was_canceled = False
                 # Seed initial GPU jobs
                 while idx < len(files) and _count_running("cuda") < gpu_slots:
@@ -2055,12 +2100,28 @@ class PipelineWorker(QObject):
                     with contextlib.suppress(Exception):
                         self.log.emit(f"Scheduled CUDA: idx={idx} media={media.name}")
 
+                # One-time early CPU scheduling attempt while GPU is running
+                if (
+                    idx < len(files)
+                    and _count_running("cuda") > 0
+                    and _count_running("cpu") < cpu_slots
+                ):
+                    next_media0 = files[idx]
+                    if _can_schedule_cpu(next_media0):
+                        fut0 = pool.submit(_job, next_media0, "cpu", idx)
+                        running[fut0] = (next_media0, "cpu", idx)
+                        idx += 1
+                        with contextlib.suppress(Exception):
+                            self.log.emit(
+                                f"Scheduled CPU (early): idx={idx} media={next_media0.name}"
+                            )
+
                 while running:
                     if self._cancel:
                         was_canceled = True
-                        break
+                        # Do not break here; keep draining running jobs without scheduling new ones
                     done, _pending = wait(
-                        list(running.keys()), return_when=FIRST_COMPLETED
+                        list(running.keys()), return_when=FIRST_COMPLETED, timeout=0.5
                     )
                     for fut in done:
                         media, _device, job_index = running.pop(fut)
@@ -2079,7 +2140,7 @@ class PipelineWorker(QObject):
                                 f"[{job_index + 1}/{total}] Exported",
                                 min(0.99, completed_count / total),
                             )
-                        except CancelledByUserError:
+                        except (CancelledByUserError, CancelledError):
                             was_canceled = True
                             # Do not schedule further tasks; break outer loop soon
                         except Exception as ex:  # noqa: BLE001
@@ -2094,19 +2155,20 @@ class PipelineWorker(QObject):
                                 min(0.99, completed_count / total),
                             )
 
-                    # Fill GPU slots first
-                    while idx < len(files) and _count_running("cuda") < gpu_slots:
-                        media2 = files[idx]
-                        fut2 = pool.submit(_job, media2, "cuda", idx)
-                        running[fut2] = (media2, "cuda", idx)
-                        idx += 1
-                        with contextlib.suppress(Exception):
-                            self.log.emit(
-                                f"Scheduled CUDA: idx={idx} media={media2.name}"
-                            )
+                    # Fill GPU slots first (skip scheduling after cancel)
+                    if not was_canceled and not self._cancel:
+                        while idx < len(files) and _count_running("cuda") < gpu_slots:
+                            media2 = files[idx]
+                            fut2 = pool.submit(_job, media2, "cuda", idx)
+                            running[fut2] = (media2, "cuda", idx)
+                            idx += 1
+                            with contextlib.suppress(Exception):
+                                self.log.emit(
+                                    f"Scheduled CUDA: idx={idx} media={media2.name}"
+                                )
 
                     # Then optionally schedule one CPU job based on heuristic
-                    if idx < len(files) and not was_canceled:
+                    if idx < len(files) and not was_canceled and not self._cancel:
                         next_media = files[idx]
                         if _can_schedule_cpu(next_media):
                             fut3 = pool.submit(_job, next_media, "cpu", idx)
@@ -2116,9 +2178,21 @@ class PipelineWorker(QObject):
                                 self.log.emit(
                                     f"Scheduled CPU: idx={idx} media={next_media.name}"
                                 )
+            finally:
+                # Always shutdown pool after draining. When canceled, we already avoided scheduling
+                # and drained running tasks above.
+                with contextlib.suppress(Exception):
+                    pool.shutdown(wait=True, cancel_futures=True)
 
             # Finalize
             if was_canceled or self._cancel:
+                # After cancel & drain, free base Whisper model (Good mode) to release VRAM
+                with contextlib.suppress(Exception):
+                    if isinstance(self._pipeline, LocalPipeline):
+                        wxb = getattr(self._pipeline, "whisperx", None)
+                        unload_b = getattr(wxb, "unload", None)
+                        if callable(unload_b):
+                            unload_b()
                 self._report("Canceled", min(0.99, completed_count / max(1, total)))
                 self.canceled.emit()
                 return
@@ -2139,7 +2213,25 @@ def main() -> int:
     w = MainWindow()
     w.show()
     get_logger(__name__).info("MainWindow shown successfully")
-    return app.exec()
+
+    # Handle Ctrl+C (SIGINT): trigger Cancel instead of raising KeyboardInterrupt
+    def _on_sigint(_sig: int, _frame: object) -> None:
+        with contextlib.suppress(Exception):
+            get_logger(__name__).info("SIGINT received -> requesting Cancel")
+            w.request_cancel()
+
+    with contextlib.suppress(Exception):
+        signal.signal(signal.SIGINT, _on_sigint)
+
+    try:
+        return app.exec()
+    except KeyboardInterrupt:
+        # Graceful shutdown on Ctrl+C from console
+        with contextlib.suppress(Exception):
+            get_logger(__name__).info("KeyboardInterrupt: graceful shutdown")
+            w.request_cancel()
+            w.await_worker_shutdown(10000)
+        return 130
 
 
 if __name__ == "__main__":  # pragma: no cover - manual run path

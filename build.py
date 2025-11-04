@@ -779,6 +779,9 @@ def main() -> None:
             # * Launch GUI application in the foreground
             code = subprocess.call([sys.executable, "-m", "gui.main_window"])  # noqa: S603
             sys.exit(code)
+        except KeyboardInterrupt:
+            print("Interrupted by user (Ctrl+C)")
+            sys.exit(130)
         except FileNotFoundError:
             print("Error: Python interpreter not found.", file=sys.stderr)
             sys.exit(127)
@@ -809,6 +812,9 @@ def main() -> None:
             print("Launching GUI application...")
             code = subprocess.call([sys.executable, "-m", "gui.main_window"])  # noqa: S603
             sys.exit(code)
+        except KeyboardInterrupt:
+            print("Interrupted by user (Ctrl+C)")
+            sys.exit(130)
         except FileNotFoundError:
             print("Error: Python interpreter not found.", file=sys.stderr)
             sys.exit(127)

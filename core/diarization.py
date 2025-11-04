@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import importlib
 import os
+import threading
 from dataclasses import dataclass
 from typing import Any
 
 from utils.logging import get_logger
+
+# * Global limiter: only one diarization runs at a time to protect VRAM
+_DIARIZATION_SEMAPHORE = threading.Semaphore(1)
 
 
 # * Represent a single speaker segment
@@ -117,8 +121,16 @@ class DiarizationPipeline:
         pipe = self._pipeline
         if pipe is None:
             return []
+        # * Serialize heavy diarization to avoid VRAM spikes when multiple
+        # * jobs run in parallel (Fast mode). This limits concurrency to 1.
         try:
-            annotation = pipe(audio_path)
+            _diar_lock_acquire = _DIARIZATION_SEMAPHORE.acquire
+            _diar_lock_release = _DIARIZATION_SEMAPHORE.release
+            _diar_lock_acquire()
+            try:
+                annotation = pipe(audio_path)
+            finally:
+                _diar_lock_release()
         except Exception as exc:  # noqa: BLE001
             # ! Runtime failure (e.g., missing backends), return empty
             self._log.warning("Diarization failed at runtime: %s", exc)

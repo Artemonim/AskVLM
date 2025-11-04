@@ -13,10 +13,11 @@ def build_doc() -> Document:
 
 
 def test_export_txt_and_json(tmp_path: Path) -> None:
-    """TXT concatenates with speakers; JSON contains segments array."""
+    """TXT prefixes speakers when multiple are present; JSON contains segments array."""
     doc = build_doc()
     txt = ex.export_txt(doc)
     assert "speaker_1: Hello world" in txt
+    assert "speaker_2:" in txt
     data = ex.export_json(doc)
     assert isinstance(data, dict)
     assert "segments" in data

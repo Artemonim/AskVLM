@@ -143,6 +143,15 @@ class WhisperXWrapper:
         finally:
             # Encourage memory reclamation
             with contextlib.suppress(Exception):
+                # Synchronize device to ensure no in-flight kernels access freed memory
+                if (
+                    self.device == "cuda"
+                    and torch_mod is not None
+                    and getattr(torch_mod, "cuda", None) is not None
+                    and hasattr(torch_mod.cuda, "synchronize")
+                ):
+                    torch_mod.cuda.synchronize()
+            with contextlib.suppress(Exception):
                 _gc.collect()
             with contextlib.suppress(Exception):
                 if (

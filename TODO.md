@@ -175,9 +175,11 @@
 
 ## Phase 1.845: Queue Parallelism & Scheduling
 
--   [x] Fast mode: process up to two files in parallel (GPU + CPU)
+-   [x] Fast mode: process up to two files in parallel (GPU + GPU)
+-   [x] WhisperX: independent model instance per parallel job (no sharing)
+-   [x] Diarization: serialize across jobs via a global queue (limit=1)
 -   [x] Heuristic: if next file duration is ≤ 1/10 of current GPU job, run it on CPU in parallel
-
+ 
 ## Phase 1.85: Disfluency Cleanup (Auto)
 
 -   [ ] Core detection & cutlist

@@ -29,14 +29,16 @@ def test_ffmpeg_get_media_duration_seconds_success(
 
 
 def test_parse_ts_and_export_document_txt(tmp_path: Path) -> None:
-    """_parse_ts_srt_to_seconds parses ms; export_document('txt') writes speaker text."""
+    """_parse_ts_srt_to_seconds parses ms; export_document('txt') omits default speaker."""
     # _parse_ts_srt_to_seconds is used via public exporters; sanity-check indirectly
     assert ex._parse_ts_srt_to_seconds("00:00:00,500") == pytest.approx(0.5)  # type: ignore[attr-defined]  # noqa: SLF001
     assert ex._parse_ts_srt_to_seconds("bad") == 0.0  # type: ignore[attr-defined]  # noqa: SLF001
     doc = Document([TextSegment("speaker_1", 0.0, 0.0, "Hi")])
     out = tmp_path / "a.txt"
     ex.export_document(doc, "txt", out)
-    assert "speaker_1: Hi" in out.read_text(encoding="utf-8")
+    txt = out.read_text(encoding="utf-8")
+    assert txt.strip() == "Hi"
+    assert "speaker_1:" not in txt
 
 
 def test_downloader_download_model_not_implemented(tmp_path: Path) -> None:

@@ -1,8 +1,11 @@
+import threading as _th
+import time as _t
 from pathlib import Path
 
 import pytest
 from PySide6.QtWidgets import QApplication
 
+from core.pipelines import CancelledError
 from editing.text_model import Document, TextSegment
 from gui import main_window as gw
 from gui.main_window import PipelineWorker
@@ -88,3 +91,72 @@ def test_queue_processing_good_and_fast(
     worker_fast.error.connect(lambda m: errs.append(str(m)))
     worker_fast.run()
     assert not errs, f"Errors occurred in FAST queue: {errs}"
+
+
+@pytest.mark.integration
+def test_cancel_stops_scheduling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancel flag prevents scheduling of new jobs; running job aborts promptly."""
+    QApplication.instance() or QApplication([])
+
+    # Prepare three inputs (names only)
+    files = [
+        Path("tests/fixtures/test_video_first.mp4").resolve(),
+        Path("tests/fixtures/test_video_second.mp4").resolve(),
+        Path("tests/fixtures/test_video_third.mp4").resolve(),
+    ]
+
+    # Slow stub to simulate long-running process with cancel checks
+    class _SlowCancelPipeline:
+        enable_diarization = False
+        enable_dialog_blocks = False
+
+        def process(self, _inp: Path, _out: Path, **kwargs: object) -> Document:
+            should_cancel = kwargs.get("should_cancel")
+            # Emit a few progress callbacks
+            cb = kwargs.get("progress")
+            if callable(cb):
+                cb("prepare", 0.1)
+            # Spin and respect cancel
+            t0 = _t.time()
+            while _t.time() - t0 < 0.5:
+                if callable(should_cancel) and should_cancel():
+                    msg = "Canceled"
+                    raise CancelledError(msg)
+                _t.sleep(0.05)
+                if callable(cb):
+                    cb("transcribe", 0.2)
+            # Return a trivial document if not canceled
+            d = Document()
+            d.add_segment(TextSegment("speaker_1", 0.0, 1.0, "ok"))
+            return d
+
+    opts = {
+        "export_format": "txt",
+        "single_view": False,
+        "save_srt": False,
+        "subtitle_max_line_width": 42,
+        "subtitle_max_lines": 2,
+        "quality": "good",
+        "no_empty": False,
+    }
+
+    # Collect scheduled CUDA messages to ensure no post-cancel scheduling
+    scheduled: list[str] = []
+
+    worker = PipelineWorker(_SlowCancelPipeline(), files, tmp_path, opts)
+    worker.log.connect(lambda m: scheduled.append(m) if "Scheduled CUDA" in m else None)
+
+    # Monkeypatch: request cancel shortly after starting
+    def _cancel_soon() -> None:
+        worker.request_cancel()
+
+    # Run synchronously: trigger cancel after brief delay
+    t = _th.Timer(0.1, _cancel_soon)
+    t.start()
+    worker.run()
+    t.cancel()
+
+    # Ensure no scheduling after cancel
+    assert not any("Scheduled CUDA" in m for m in scheduled[1:]), scheduled

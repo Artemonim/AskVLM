@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from .diarization import Segment
 
 
+# * Cancellation sentinel used across pipeline layers
+class CancelledError(RuntimeError):
+    """Raised to indicate user-requested cancellation during processing."""
+
+
 # * Orchestrate local speech-to-text processing pipeline
 class LocalPipeline:
     """Pipeline for local processing: FFmpeg -> STT (Whisper/WhisperX) -> Diarization -> LLM formatting."""
@@ -143,7 +148,7 @@ class LocalPipeline:
             # Responsive cancellation during ASR
             if should_cancel is not None and should_cancel():
                 msg = "Canceled"
-                raise RuntimeError(msg)
+                raise CancelledError(msg)
             # Update transcription progress progressively within [0.2, 0.6]
             if duration_s > 0:
                 inner = max(0.0, min(1.0, e / duration_s))
