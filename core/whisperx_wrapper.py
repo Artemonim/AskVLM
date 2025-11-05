@@ -125,7 +125,7 @@ class WhisperXWrapper:
             self._align_model = whisperx_mod
 
     # * Explicitly release heavy resources to avoid lingering VRAM usage between jobs
-    def unload(self) -> None:
+    def unload(self, *, safe: bool = True) -> None:
         """Release loaded models and free GPU memory (best effort).
 
         This method clears references to the underlying faster-whisper model
@@ -142,24 +142,26 @@ class WhisperXWrapper:
             self._align_model = None
         finally:
             # Encourage memory reclamation
-            with contextlib.suppress(Exception):
-                # Synchronize device to ensure no in-flight kernels access freed memory
-                if (
-                    self.device == "cuda"
-                    and torch_mod is not None
-                    and getattr(torch_mod, "cuda", None) is not None
-                    and hasattr(torch_mod.cuda, "synchronize")
-                ):
-                    torch_mod.cuda.synchronize()
+            if not safe:
+                with contextlib.suppress(Exception):
+                    # Synchronize device to ensure no in-flight kernels access freed memory
+                    if (
+                        self.device == "cuda"
+                        and torch_mod is not None
+                        and getattr(torch_mod, "cuda", None) is not None
+                        and hasattr(torch_mod.cuda, "synchronize")
+                    ):
+                        torch_mod.cuda.synchronize()
             with contextlib.suppress(Exception):
                 _gc.collect()
-            with contextlib.suppress(Exception):
-                if (
-                    self.device == "cuda"
-                    and torch_mod is not None
-                    and getattr(torch_mod, "cuda", None) is not None
-                ):
-                    torch_mod.cuda.empty_cache()
+            if not safe:
+                with contextlib.suppress(Exception):
+                    if (
+                        self.device == "cuda"
+                        and torch_mod is not None
+                        and getattr(torch_mod, "cuda", None) is not None
+                    ):
+                        torch_mod.cuda.empty_cache()
 
     def transcribe(
         self,

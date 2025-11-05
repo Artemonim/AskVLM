@@ -272,7 +272,7 @@
         -   [ ] Integration tests (WAV -> JSON comparison).
         -   [ ] GUI autotests (`pyside-tester`, signal/slot checks).
     -   [x] Enable code coverage gates (FAIL <65%, WARN <75%).
-    -   [ ] `tools/benchmark.py` script.
+    -   [x] `tools/benchmark_stt.py` (research benchmark for GPU/CPU, WER).
 -   [x] **CI/CD (GitHub Actions)**
     -   [x] Linting (`ruff`).
     -   [x] Run tests.

@@ -81,3 +81,5 @@ def test_queue_real_good_and_fast(tmp_path: Path) -> None:
     w_fast.error.connect(lambda m: errs.append(str(m)))
     w_fast.run()
     assert not errs, f"Errors in real FAST queue: {errs}"
+
+

@@ -174,6 +174,7 @@ output/
 exports/
 transcriptions/
 htmlcov/
+tools_out/
 
 # ! Configuration files that may contain sensitive data
 config.json
