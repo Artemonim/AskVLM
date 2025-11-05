@@ -100,18 +100,18 @@ class WhisperXWrapper:
             ):
                 ct = "float16"
             else:
-                ct = "int8"  # CPU fallback for tests
+                ct = "int8_float16"  # CPU hybrid computation
         # * Try primary load; if OOM, downgrade compute_type/device
-        # Allow CPU device for tests/integration when requested
+        # Allow CPU device for hybrid computation
         chosen_model = self.model_name
         logging.getLogger(__name__).info(
             "Using Whisper model: %s (device=%s, compute=%s)",
             chosen_model,
             self.device,
-            ct if self.device == "cuda" else "int8",
+            ct if self.device == "cuda" else "int8_float16",
         )
-        # Force int8 compute when running on CPU to avoid float16 errors
-        compute_type_final = ct if self.device == "cuda" else "int8"
+        # Force int8_float16 compute when running on CPU as most optimal hybrid compute type
+        compute_type_final = ct if self.device == "cuda" else "int8_float16"
         self._model = fw_whisper_cls(
             chosen_model,
             device=self.device,
