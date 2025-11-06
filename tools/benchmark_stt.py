@@ -696,24 +696,29 @@ def _run_phase_subprocess(
         sys.stdout.flush()
     except Exception:
         pass
+    # * Always inspect sentinel; if it indicates outputs incomplete, treat as failure
+    try:
+        sentinel = out_dir / ".phase_ok.json"
+        if sentinel.exists():
+            try:
+                info = _json.loads(sentinel.read_text(encoding="utf-8"))
+            except Exception:
+                info = None
+            if isinstance(info, dict):
+                if "elapsed_s" in info:
+                    try:
+                        elapsed = float(info.get("elapsed_s", elapsed))
+                    except Exception:
+                        pass
+                if info.get("ok") is False:
+                    # Force failure path: outputs incomplete
+                    rc = rc if rc is not None else 1
+    except Exception:
+        pass
+
     if rc != 0:
         tail = "".join(captured[-50:])
-        # * Soft-success detection: if child left a success sentinel or all targets exist, accept as success
-        try:
-            sentinel = out_dir / ".phase_ok.json"
-            if sentinel.exists():
-                # Prefer child's own elapsed value if present
-                try:
-                    info = _json.loads(sentinel.read_text(encoding="utf-8"))
-                    if isinstance(info, dict) and "elapsed_s" in info:
-                        elapsed = float(info.get("elapsed_s", elapsed))
-                except Exception:
-                    pass
-                return elapsed
-        except Exception:
-            pass
-
-        # * If all expected transcript files are present, consider the phase successful
+        # * If all expected transcript files are present and non-empty, consider the phase successful
         try:
             files_list = _json.loads(filelist_path.read_text(encoding="utf-8"))
             target_stems = {Path(p).stem for p in files_list}
@@ -721,7 +726,16 @@ def _run_phase_subprocess(
             target_stems = set()
         if target_stems:
             try:
-                all_present = all((out_dir / f"{s}.txt").exists() for s in target_stems)
+                def _nonempty(p: Path) -> bool:
+                    try:
+                        if not p.exists():
+                            return False
+                        # Treat whitespace-only as empty
+                        txt = p.read_text(encoding="utf-8", errors="ignore")
+                        return bool(txt.strip())
+                    except Exception:
+                        return False
+                all_present = all(_nonempty(out_dir / f"{s}.txt") for s in target_stems)
             except Exception:
                 all_present = False
             if all_present:
@@ -729,7 +743,7 @@ def _run_phase_subprocess(
                 try:
                     for line in reversed(captured[-100:]):
                         line_s = line.strip()
-                        if line_s.startswith("{") and "elapsed_s" in line_s:
+                        if line_s.startswith("{") and ("elapsed_s" in line_s):
                             data = _json.loads(line_s)
                             if isinstance(data, dict) and "elapsed_s" in data:
                                 elapsed = float(data.get("elapsed_s", elapsed))
@@ -992,6 +1006,22 @@ def benchmark(
         if verbose:
             typer.echo(f"  DEBUG: Starting UV processing, {len(uv_files)} files")
             sys.stdout.flush()
+        # * Helper: classify child failure by captured text to avoid mislabeling as incompatible
+        def _classify_failure(msg: str) -> tuple[str, str]:
+            m = msg.lower()
+            if ("out of memory" in m) or ("cuda failed with error out of memory" in m) or ("cuda out of memory" in m):
+                return ("skipped-oom", "Out of memory detected; marking as skipped-oom.")
+            if ("requested int8_float16 compute type" in m) or ("not support efficient int8_float16" in m):
+                return ("unsupported-compute", "Unsupported compute type (int8_float16); marking as unsupported-compute.")
+            if (
+                ("status_stack_buffer_overrun" in m)
+                or ("status_access_violation" in m)
+                or ("code=3221226505" in m)
+                or ("code=3221225477" in m)
+            ):
+                return ("skipped-incompatible", "Incompatible runtime crash signature; marking as skipped-incompatible.")
+            return ("failed", "Phase failed; marking as failed.")
+
         try:
             if uv_files:
                 uv_out_dir = output_root / "unverified" / _sanitize_name(var_name)
@@ -1037,20 +1067,11 @@ def benchmark(
                 sys.stdout.flush()
         except Exception as ex:  # noqa: BLE001
             typer.echo(f"ERROR uv: {var_name}: {ex}")
-            # ! Check for known problematic configurations
             exs = str(ex)
-            if (
-                ("STATUS_STACK_BUFFER_OVERRUN" in exs)
-                or ("STATUS_ACCESS_VIOLATION" in exs)
-                or ("code=3221226505" in exs)
-                or ("code=3221225477" in exs)
-            ):
-                typer.secho(
-                    "  WARNING: Incompatible runtime detected (crash signature). Skipping variant.",
-                    fg="yellow",
-                )
-                variant_status = "skipped-incompatible"
-                skip_rest = True
+            status, note = _classify_failure(exs)
+            typer.secho(f"  WARNING: {note}", fg="yellow")
+            variant_status = status
+            skip_rest = True
             import traceback
             traceback.print_exc()
             uv_out, uv_elapsed = ([], 0.0)
@@ -1116,19 +1137,10 @@ def benchmark(
                     sys.stdout.flush()
             except Exception as ex:  # noqa: BLE001
                 typer.echo(f"ERROR ver: {var_name}: {ex}")
-                # ! Check for known problematic configurations
                 exs = str(ex)
-                if (
-                    ("STATUS_STACK_BUFFER_OVERRUN" in exs)
-                    or ("STATUS_ACCESS_VIOLATION" in exs)
-                    or ("code=3221226505" in exs)
-                    or ("code=3221225477" in exs)
-                ):
-                    typer.secho(
-                        "  WARNING: Incompatible runtime detected (crash signature). Skipping variant.",
-                        fg="yellow",
-                    )
-                    variant_status = "skipped-incompatible"
+                status, note = _classify_failure(exs)
+                typer.secho(f"  WARNING: {note}", fg="yellow")
+                variant_status = status
                 import traceback
                 traceback.print_exc()
                 ver_out, ver_elapsed = ([], 0.0)
@@ -1464,14 +1476,44 @@ def phase(
         verbose=verbose,
         silent_progress=silent_progress,
     ) if files else ([], 0.0)
-    # * Write a phase-success sentinel for the parent in case the interpreter crashes during teardown
+    # * Validate outputs: require that all expected transcripts exist and are non-empty
+    ok = True
+    missing: list[str] = []
+    empty: list[str] = []
+    try:
+        stems = [p.stem for p in files]
+        for s in stems:
+            path = out / f"{s}.txt"
+            if not path.exists():
+                ok = False
+                missing.append(s)
+                continue
+            try:
+                content = path.read_text(encoding="utf-8", errors="ignore")
+                if not content.strip():
+                    ok = False
+                    empty.append(s)
+            except Exception:
+                ok = False
+                empty.append(s)
+    except Exception:
+        ok = False
+    # * Write sentinel with validation details
     try:
         sentinel = out / ".phase_ok.json"
-        payload = {"elapsed_s": elapsed, "files": [str(p) for p in files]}
+        payload = {
+            "elapsed_s": elapsed,
+            "ok": ok,
+            "missing": missing,
+            "empty": empty,
+            "files": [str(p) for p in files],
+        }
         sentinel.write_text(_json.dumps(payload), encoding="utf-8")
     except Exception:  # noqa: BLE001
         pass
-    print(_json.dumps({"elapsed_s": elapsed}))
+    print(_json.dumps({"elapsed_s": elapsed, "ok": ok, "missing": missing, "empty": empty}))
+    if not ok:
+        raise typer.Exit(code=3)
 
 
 @app.command()
