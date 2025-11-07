@@ -17,7 +17,7 @@ import subprocess as _subprocess
 import json as _json
 
 import typer
-from core.audio_io import prepare_audio
+from core.audio_io import prepare_audio, cleanup_intermediate_audio
 from core.ffmpeg import get_media_duration_seconds
 from core.whisperx_wrapper import WhisperXWrapper
 
@@ -298,9 +298,8 @@ def run_variant_on_files(
                 eta_s = avg_per_item * float(remaining)
             else:
                 eta_s = 0.0
-            eta_str = (
-                time.strftime("%M:%S", time.gmtime(eta_s)) if eta_s > 0 else "--:--"
-            )
+            # Format ETA as hhh:mm:ss instead of minutes-only
+            eta_str = _format_hms(eta_s) if eta_s > 0 else "--:--:--"
             label = f"{variant_label} | " if variant_label else ""
             line = f"    ... {label}progress {pc}/{total}, elapsed {elapsed:.1f}s, ETA {eta_str}"
             if line != last_line:
@@ -375,6 +374,31 @@ def run_variant_on_files(
         if verbose:
             typer.echo(f"  DEBUG: Returning from run_variant_on_files, elapsed={elapsed:.1f}s")
             sys.stdout.flush()
+        # * Best-effort cleanup of temporary work folder created by prepare_audio
+        try:
+            work_subdir = out_dir / "_work"
+            if work_subdir.exists():
+                for p in list(work_subdir.iterdir()):
+                    try:
+                        if p.is_file():
+                            p.unlink()
+                        elif p.is_dir():
+                            # remove nested files if any
+                            for sub in list(p.rglob("*")):
+                                try:
+                                    if sub.is_file():
+                                        sub.unlink()
+                                except Exception:
+                                    pass
+                            with contextlib.suppress(Exception):
+                                p.rmdir()
+                    except Exception:
+                        pass
+                with contextlib.suppress(Exception):
+                    work_subdir.rmdir()
+        except Exception:
+            # Best-effort only; ignore failures
+            pass
         return outcomes, elapsed
 
 
@@ -383,6 +407,24 @@ def _sum_duration(files: Iterable[Path]) -> float:
     for f in files:
         total += max(0.0, get_media_duration_seconds(f))
     return total
+
+
+# Helper: format seconds into HHH:MM:SS string (hours zero-padded to 3 digits)
+def _format_hms(total_seconds: float | None, hours_pad: int = 3) -> str:
+    """
+    * Convert seconds to a string "hhh:mm:ss".
+    Returns placeholder "--:--:--" for non-positive or None input.
+    """
+    try:
+        if total_seconds is None or total_seconds <= 0:
+            return "--:--:--"
+        secs = int(round(total_seconds))
+        hours = secs // 3600
+        minutes = (secs % 3600) // 60
+        seconds = secs % 60
+        return f"{hours:0{hours_pad}d}:{minutes:02d}:{seconds:02d}"
+    except Exception:
+        return "--:--:--"
 
 
 def _collect_all_texts(outcomes: list[FileOutcome]) -> list[str]:
@@ -405,6 +447,34 @@ def _signal_system_sound() -> None:
             print("\a", end="", flush=True)
     except Exception:  # noqa: BLE001
         # Best-effort signal; ignore failures
+        pass
+
+
+def _cleanup_work_subdir(out_dir: Path) -> None:
+    """Best-effort remove the hidden `_work` subdirectory under `out_dir`."""
+    try:
+        work_subdir = out_dir / "_work"
+        if not work_subdir.exists():
+            return
+        for p in list(work_subdir.iterdir()):
+            try:
+                if p.is_file():
+                    p.unlink()
+                elif p.is_dir():
+                    for sub in list(p.rglob("*")):
+                        try:
+                            if sub.is_file():
+                                sub.unlink()
+                        except Exception:
+                            pass
+                    with contextlib.suppress(Exception):
+                        p.rmdir()
+            except Exception:
+                pass
+        with contextlib.suppress(Exception):
+            work_subdir.rmdir()
+    except Exception:
+        # Best-effort; ignore failures
         pass
 
 
@@ -572,8 +642,8 @@ def _run_phase_subprocess(
                 eta_global_s = max(0.0, last_recalc_eta_global_s - dt)
 
         # Fallbacks
-        eta_phase = time.strftime("%M:%S", time.gmtime(eta_phase_s)) if (eta_phase_s is not None) else "--:--"
-        eta_global = time.strftime("%M:%S", time.gmtime(eta_global_s)) if (eta_global_s is not None) else "--:--"
+        eta_phase = _format_hms(eta_phase_s) if (eta_phase_s is not None) else "--:--:--"
+        eta_global = _format_hms(eta_global_s) if (eta_global_s is not None) else "--:--:--"
         return eta_phase, eta_global
 
     def _render_progress() -> None:
@@ -1001,6 +1071,9 @@ def benchmark(
             started_f.write_text("", encoding="utf-8")
         variant_status = "ok"
         skip_rest = False
+        # Track if a phase failed and capture its error message for richer status reporting
+        failed_phase: str | None = None
+        failed_ex_msg: str = ""
 
         # Unverified
         if verbose:
@@ -1068,6 +1141,8 @@ def benchmark(
         except Exception as ex:  # noqa: BLE001
             typer.echo(f"ERROR uv: {var_name}: {ex}")
             exs = str(ex)
+            failed_phase = "uv"
+            failed_ex_msg = exs
             status, note = _classify_failure(exs)
             typer.secho(f"  WARNING: {note}", fg="yellow")
             variant_status = status
@@ -1075,6 +1150,12 @@ def benchmark(
             import traceback
             traceback.print_exc()
             uv_out, uv_elapsed = ([], 0.0)
+            # Best-effort cleanup of child temporary work folder for this UV phase
+            try:
+                with contextlib.suppress(Exception):
+                    _cleanup_work_subdir(uv_out_dir)
+            except Exception:
+                pass
         if verbose:
             typer.echo(f"  DEBUG: UV done, outcomes={len(uv_out)}")
             sys.stdout.flush()
@@ -1138,12 +1219,20 @@ def benchmark(
             except Exception as ex:  # noqa: BLE001
                 typer.echo(f"ERROR ver: {var_name}: {ex}")
                 exs = str(ex)
+                failed_phase = "ver"
+                failed_ex_msg = exs
                 status, note = _classify_failure(exs)
                 typer.secho(f"  WARNING: {note}", fg="yellow")
                 variant_status = status
                 import traceback
                 traceback.print_exc()
                 ver_out, ver_elapsed = ([], 0.0)
+                # Best-effort cleanup of child temporary work folder for this VER phase
+                try:
+                    with contextlib.suppress(Exception):
+                        _cleanup_work_subdir(ver_out_dir)
+                except Exception:
+                    pass
         if variant_status == "skipped-incompatible":
             # Full variant skip: do not use partial UV results if any
             uv_out, uv_elapsed, uv_dur, uv_rtf = ([], 0.0, 0.0, 0.0)
@@ -1159,6 +1248,93 @@ def benchmark(
 
         if verbose:
             typer.echo(f"  DEBUG: Storing results for {var_name}")
+
+        # Enhance non-ok statuses with context: initialization vs per-file failure index+duration
+        try:
+            if variant_status != "ok" and not str(variant_status).upper().startswith("ERR"):
+                reason = (failed_ex_msg.splitlines()[0] if failed_ex_msg else "unknown").strip()
+                short_reason = reason[:200]
+                if failed_phase == "uv":
+                    try:
+                        stems = [p.stem for p in uv_files]
+                    except Exception:
+                        stems = []
+                    present: set[str] = set()
+                    try:
+                        uod = uv_out_dir
+                        if uod.exists():
+                            for s in stems:
+                                p = uod / f"{s}.txt"
+                                try:
+                                    if p.exists() and p.read_text(encoding="utf-8", errors="ignore").strip():
+                                        present.add(s)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    if not present:
+                        variant_status = f'ERR INIT [{short_reason}]'
+                    else:
+                        # find first missing/empty transcript
+                        first_missing_idx = None
+                        first_missing_stem = None
+                        for idxi, s in enumerate(stems, start=1):
+                            if s not in present:
+                                first_missing_idx = idxi
+                                first_missing_stem = s
+                                break
+                        if first_missing_idx is None:
+                            variant_status = f'ERR [{short_reason}]'
+                        else:
+                            dur = uv_durs.get(first_missing_stem, 0.0)
+                            secs = int(round(dur))
+                            h = secs // 3600
+                            m = (secs % 3600) // 60
+                            sec = secs % 60
+                            dur_str = f"{h}:{m:02d}:{sec:02d}"
+                            variant_status = f'ERR [{short_reason}] #{first_missing_idx} [{dur_str}]'
+                elif failed_phase == "ver":
+                    try:
+                        stems = [p.stem for p in ver_files_only]
+                    except Exception:
+                        stems = []
+                    present = set()
+                    try:
+                        vod = ver_out_dir
+                        if vod.exists():
+                            for s in stems:
+                                p = vod / f"{s}.txt"
+                                try:
+                                    if p.exists() and p.read_text(encoding="utf-8", errors="ignore").strip():
+                                        present.add(s)
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    if not present:
+                        variant_status = f'ERR INIT [{short_reason}]'
+                    else:
+                        first_missing_idx = None
+                        first_missing_stem = None
+                        for idxi, s in enumerate(stems, start=1):
+                            if s not in present:
+                                first_missing_idx = idxi
+                                first_missing_stem = s
+                                break
+                        if first_missing_idx is None:
+                            variant_status = f'ERR [{short_reason}]'
+                        else:
+                            dur = ver_durs.get(first_missing_stem, 0.0)
+                            secs = int(round(dur))
+                            h = secs // 3600
+                            m = (secs % 3600) // 60
+                            sec = secs % 60
+                            dur_str = f"{h}:{m:02d}:{sec:02d}"
+                            variant_status = f'ERR [{short_reason}] #{first_missing_idx} [{dur_str}]'
+        except Exception:
+            # If anything goes wrong enriching status, keep original variant_status
+            pass
+
         variant_results[var_name] = {
             "unverified": {
                 "outcomes": uv_out,
