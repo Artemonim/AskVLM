@@ -32,7 +32,7 @@ class DiarizationPipeline:
 
     def __init__(
         self,
-        model_name: str = "pyannote/speaker-diarization-community-1",
+        model_name: str = "pyannote/speaker-diarization-3.0",
         *,
         hf_token: str | None = None,
         device: str = "auto",  # "auto" | "cuda" | "cpu"
@@ -60,8 +60,61 @@ class DiarizationPipeline:
         self._log = get_logger(__name__)
         self._try_load()
 
+    def _apply_torchaudio_shim(self) -> None:
+        """Apply compatibility shim for torchaudio >= 2.1."""
+        try:
+            import sys  # noqa: PLC0415
+            import types  # noqa: PLC0415
+            from dataclasses import dataclass  # noqa: PLC0415
+            from typing import cast  # noqa: PLC0415
+
+            import torchaudio  # noqa: PLC0415
+
+            if not hasattr(torchaudio, "list_audio_backends"):
+                torchaudio.list_audio_backends = lambda: ["soundfile"]
+
+            if not hasattr(torchaudio, "set_audio_backend"):
+                torchaudio.set_audio_backend = lambda _: None
+
+            if not hasattr(torchaudio, "get_audio_backend"):
+                torchaudio.get_audio_backend = lambda: "soundfile"
+
+            if "torchaudio.backend" not in sys.modules:
+                sys.modules["torchaudio.backend"] = types.ModuleType(
+                    "torchaudio.backend"
+                )
+                # Inject into torchaudio namespace as well
+                torchaudio.backend = sys.modules["torchaudio.backend"]
+
+            if "torchaudio.backend.common" not in sys.modules:
+                common = types.ModuleType("torchaudio.backend.common")
+                sys.modules["torchaudio.backend.common"] = common
+                torchaudio.backend.common = common
+
+            # Define AudioMetaData if missing
+            if not hasattr(torchaudio, "AudioMetaData"):
+
+                @dataclass
+                class AudioMetaData:
+                    sample_rate: int
+                    num_frames: int
+                    num_channels: int
+                    bits_per_sample: int
+                    encoding: str
+
+                torchaudio.AudioMetaData = AudioMetaData
+                # Also inject into backend.common where it used to be
+                cast(
+                    "Any", sys.modules["torchaudio.backend.common"]
+                ).AudioMetaData = AudioMetaData
+
+        except ImportError:
+            pass
+
     def _try_load(self) -> None:
         """Attempt to load pyannote pipeline lazily with safe fallbacks."""
+        self._apply_torchaudio_shim()
+
         try:
             pa = importlib.import_module("pyannote.audio")
         except ModuleNotFoundError:
@@ -100,9 +153,25 @@ class DiarizationPipeline:
             self._pipeline = None
             return
 
-        # * Move to device if possible
+        self._move_to_device(pipe)
+        self._pipeline = pipe
+
+    def _move_to_device(self, pipe: Any) -> None:  # noqa: ANN401
+        """Move pipeline to requested device (best effort)."""
         try:
+            use_cuda = False
             if self.device == "cuda":
+                use_cuda = True
+            elif self.device == "auto":
+                try:
+                    import torch  # noqa: PLC0415
+
+                    if torch.cuda.is_available():
+                        use_cuda = True
+                except ImportError:
+                    pass
+
+            if use_cuda:
                 pipe.to("cuda")
             elif self.device == "cpu":
                 # * Enforce CUDA-only ML processing
@@ -111,7 +180,6 @@ class DiarizationPipeline:
         except Exception as exc:  # noqa: BLE001
             # * Device move is best-effort; log minimal info
             self._log.debug("Diarization device move failed: %s", exc)
-        self._pipeline = pipe
 
     def diarize(self, audio_path: str) -> list[Segment]:
         """Perform diarization on audio and return list of segments.

@@ -1,4 +1,9 @@
-# * Local CI thick wrapper (with venv + simple help)
+# * Local CI thick wrapper (System Builder)
+# * Responsibilities:
+# * 1. Prepare Python environment (venv, python version)
+# * 2. Install system/pip dependencies (requirements.txt, torch, cuda)
+# * 3. Delegate to build.py for app-level logic (models, linting, testing)
+
 param(
     [switch]$Help,
     [string]$Tool,
@@ -44,6 +49,7 @@ $dashdashIndex = $args.IndexOf("--")
 $forward = @()
 if ($dashdashIndex -ge 0) { $forward = $args[($dashdashIndex + 1)..($args.Length - 1)] }
 
+# * 1. Venv Setup
 $activate = Join-Path -Path ".venv" -ChildPath "Scripts/Activate.ps1"
 if ($RecreateVenv -and (Test-Path ".venv")) {
     Write-Host "Recreating virtual environment..." -ForegroundColor Yellow
@@ -79,95 +85,60 @@ try {
     }
 } catch {}
 
-# * Ensure core dev deps exist
-try {
-    python -c "import importlib.util,sys;mods=['ruff','mypy','pytest','pytest_cov','pip_audit'];sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)" | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "Installing dev dependencies..." -ForegroundColor Yellow
-        if (Test-Path "requirements-dev.txt") { python -m pip install -r requirements-dev.txt | Out-Null }
-        if (Test-Path "requirements.txt") { python -m pip install -r requirements.txt | Out-Null }
-        # Ensure pip-audit present if not via requirements
-        try { python -m pip install -q pip-audit | Out-Null } catch {}
-        # Ensure pytest-cov present if not via requirements
-        try { python -m pip install -q pytest-cov | Out-Null } catch {}
-    }
-} catch {}
-
-# * Helper: quick silent module existence check
+# * 2. Dependency Setup
+# Helper: quick silent module existence check
 function Test-Module {
     param([string]$Name)
     python -c "import importlib.util,sys;sys.exit(0 if importlib.util.find_spec('$Name') else 1)" | Out-Null
     return $LASTEXITCODE -eq 0
 }
-
-# * Helper: check numpy major version == 1
+# Helper: check numpy major version == 1
 function Test-NumpyV1 {
     python -c "import sys;import numpy as np;sys.exit(0 if str(np.__version__).split('.')[0]=='1' else 1)" | Out-Null
     return $LASTEXITCODE -eq 0
 }
-
-# * Helper: check CUDA availability
+# Helper: check CUDA availability
 function Test-CUDA {
     python -c "import sys; import torch; ok = bool(getattr(torch,'cuda',None) and torch.cuda.is_available()); print('[CUDA CHECK] available=' + str(ok)); sys.exit(0 if ok else 1)" | Out-Null
     return $LASTEXITCODE -eq 0
 }
 
-# ! Function to check and fix CUDA support
-function Check-CUDA {
-    Write-Host "🔍 Checking CUDA availability..." -ForegroundColor Cyan
-    
-    $cudaCheck = & python -c "import torch; print('CUDA' if torch.cuda.is_available() else 'CPU')" 2>$null
-    
-    if ($cudaCheck -eq "CUDA") {
-        Write-Host "✅ CUDA is available in PyTorch" -ForegroundColor Green
-        return $true
+try {
+    python -c "import importlib.util,sys;mods=['ruff','mypy','pytest','pytest_cov','pip_audit','tqdm','huggingface_hub'];sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)" | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Installing dev dependencies..." -ForegroundColor Yellow
+        if (Test-Path "requirements-dev.txt") { python -m pip install -r requirements-dev.txt | Out-Null }
+        if (Test-Path "requirements.txt") { python -m pip install -r requirements.txt | Out-Null }
+        # Ensure tools present
+        try { python -m pip install -q pip-audit pytest-cov tqdm "huggingface_hub<0.20.0" | Out-Null } catch {}
     }
-    else {
-        Write-Host "❌ PyTorch CPU-only version detected" -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "ℹ️  Your system has CUDA, but PyTorch CPU-only version is installed." -ForegroundColor Yellow
-        Write-Host "To fix this, run:" -ForegroundColor Yellow
-        Write-Host ""
-        Write-Host "  pip uninstall torch -y && pip install torch --index-url https://download.pytorch.org/whl/cu121" -ForegroundColor Green
-        Write-Host ""
-        Write-Host "Or for other CUDA versions, visit: https://pytorch.org/get-started/locally/" -ForegroundColor Cyan
-        Write-Host ""
-        return $false
-    }
-}
+} catch {}
 
-# * Ensure ML deps exist (only when requested)
+# Ensure ML deps exist (only when requested)
 if ($EnsureML) {
     try {
         $needMl = (-not (Test-Module numpy)) -or (-not (Test-Module torch)) -or (-not (Test-Module whisper)) -or (-not (Test-Module faster_whisper)) -or (-not (Test-Module whisperx)) -or (-not (Test-Module pyannote.audio))
         if ($needMl) {
             Write-Host "Installing ML dependencies (extras: ml)..." -ForegroundColor Yellow
             try { python -m pip install -q -U pip wheel setuptools } catch {}
-            # * numpy<2 for pyannote compatibility (skip if unavailable)
+            # * numpy<2 for pyannote compatibility
             try { python -m pip install -q --only-binary=:all: "numpy<2.0" } catch {}
             python -m pip install -q -e .[ml]
         }
-        # * Enforce numpy<2 even if extras upgraded it
         if (-not (Test-NumpyV1)) {
             try { python -m pip install -q --only-binary=:all: "numpy<2.0" } catch {}
         }
     } catch {}
 }
 
-# * Ensure CUDA-enabled torch; attempt known CUDA indices if unavailable
+# Ensure CUDA-enabled torch
 if ($EnsureCUDA -and -not (Test-CUDA)) {
     Write-Host "Attempting to install CUDA-enabled PyTorch wheels..." -ForegroundColor Yellow
-    
-    # * Define CUDA versions to try with their explicit version specifiers
-    # ! IMPORTANT: Must specify version with +cuXXX suffix to avoid CPU fallback
     $cudaConfigs = @(
-        @{index="https://download.pytorch.org/whl/cu128"; torch="2.9.0+cu128"; vision="0.24.0+cu128"; audio="2.9.0+cu128"},
-        @{index="https://download.pytorch.org/whl/cu124"; torch="2.6.0+cu124"; vision="0.21.0+cu124"; audio="2.6.0+cu124"},
+        @{index="https://download.pytorch.org/whl/cu124"; torch="2.5.1+cu124"; vision="0.20.1+cu124"; audio="2.5.1+cu124"},
         @{index="https://download.pytorch.org/whl/cu121"; torch="2.5.1+cu121"; vision="0.20.1+cu121"; audio="2.5.1+cu121"},
         @{index="https://download.pytorch.org/whl/cu118"; torch="2.5.1+cu118"; vision="0.20.1+cu118"; audio="2.5.1+cu118"}
     )
-    
-    # * Remove CPU-only installs and clear cache to avoid reuse of cached wheels
     try { python -m pip uninstall -y torch torchvision torchaudio | Out-Null } catch {}
     try { python -m pip cache purge | Out-Null } catch {}
     
@@ -175,7 +146,6 @@ if ($EnsureCUDA -and -not (Test-CUDA)) {
         $cudaTag = $cfg.index.Split('/')[-1]
         Write-Host ("Trying PyTorch {0} from: {1}" -f $cudaTag, $cfg.index) -ForegroundColor Yellow
         try {
-            # * Explicitly specify version with CUDA suffix to prevent CPU fallback
             python -m pip install --no-cache-dir `
                 --index-url $cfg.index `
                 --extra-index-url https://pypi.org/simple `
@@ -187,7 +157,6 @@ if ($EnsureCUDA -and -not (Test-CUDA)) {
             Write-Host ("✓ Successfully installed PyTorch with {0}" -f $cudaTag) -ForegroundColor Green
             break
         }
-        # If still CPU, try uninstall again before next index
         try { python -m pip uninstall -y torch torchvision torchaudio | Out-Null } catch {}
     }
     if (-not (Test-CUDA)) {
@@ -195,19 +164,17 @@ if ($EnsureCUDA -and -not (Test-CUDA)) {
     }
 }
 
-$cmd = "python build.py"
-# * Add flags from parameters
-if ($Tool) { $cmd = "{0} --tool {1}" -f $cmd, $Tool }
-if ($Path) { $cmd = "{0} --path {1}" -f $cmd, ([string]::Join(' ', $Path)) }
-if ($Verbose) { $cmd += " --verbose" }
-if ($Json) { $cmd += " --json" }
-if ($NoFix) { $cmd += " --no-fix" }
-# * Launch control flags
-if ($SkipLaunch) { $cmd += " --skip-launch" }
-if ($FastLaunch) { $cmd += " --fast-launch" }
-# * Add forwarded arguments
-if ($forward.Count -gt 0) { $cmd = "{0} {1}" -f $cmd, ([string]::Join(' ', $forward)) }
-Invoke-Expression $cmd
+# * 3. Handover to Python Build System
+$pyArgs = @("build.py")
+if ($Tool) { $pyArgs += "--tool"; $pyArgs += $Tool }
+if ($Path) { $pyArgs += "--path"; $pyArgs += $Path }
+if ($Verbose) { $pyArgs += "--verbose" }
+if ($Json) { $pyArgs += "--json" }
+if ($NoFix) { $pyArgs += "--no-fix" }
+if ($SkipLaunch) { $pyArgs += "--skip-launch" }
+if ($FastLaunch) { $pyArgs += "--fast-launch" }
+if ($forward.Count -gt 0) { $pyArgs += $forward }
+
+Write-Host "DEBUG: Running python with args: $($pyArgs -join ' ')" -ForegroundColor DarkGray
+python @pyArgs
 exit $LASTEXITCODE
-
-

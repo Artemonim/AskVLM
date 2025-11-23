@@ -27,6 +27,54 @@ def test_export_txt_and_json(tmp_path: Path) -> None:
     assert out.read_text(encoding="utf-8").strip().startswith("{")
 
 
+def test_dialog_blocks_merge_consecutive_segments_for_txt_and_json(
+    tmp_path: Path,
+) -> None:
+    """Dialog Blocks merge adjacent segments of the same speaker for TXT/JSON exports."""
+    doc = Document()
+    # * Two blocks for speaker_1 and speaker_2 with two segments each
+    doc.add_segment(TextSegment("speaker_1", 0.0, 1.0, "Hello"))
+    doc.add_segment(TextSegment("speaker_1", 1.0, 2.0, "world"))
+    doc.add_segment(TextSegment("speaker_2", 2.0, 3.0, "Second"))
+    doc.add_segment(TextSegment("speaker_2", 3.0, 4.0, "block"))
+    doc.dialog_blocks_enabled = True
+
+    # * TXT: expect two lines, one per speaker, with merged text per speaker
+    txt = ex.export_txt(doc)
+    lines = [ln for ln in txt.splitlines() if ln.strip()]
+    assert len(lines) == 2
+    assert lines[0].startswith("speaker_1:")
+    assert "Hello" in lines[0]
+    assert "world" in lines[0]
+    assert lines[1].startswith("speaker_2:")
+    assert "Second" in lines[1]
+    assert "block" in lines[1]
+
+    # * JSON: expect two segments with merged timings and text
+    data = ex.export_json(doc)
+    segs = data.get("segments", [])
+    assert isinstance(segs, list)
+    assert len(segs) == 2
+    s1, s2 = segs
+    assert s1["speaker_id"] == "speaker_1"
+    assert s1["start_time"] == 0.0
+    assert s1["end_time"] == 2.0
+    assert "Hello" in str(s1["text"])
+    assert "world" in str(s1["text"])
+    assert s2["speaker_id"] == "speaker_2"
+    assert s2["start_time"] == 2.0
+    assert s2["end_time"] == 4.0
+    assert "Second" in str(s2["text"])
+    assert "block" in str(s2["text"])
+
+    # * Ensure export_document writes merged JSON structure
+    out = tmp_path / "dialog_blocks.json"
+    ex.export_document(doc, "json", out)
+    content = out.read_text(encoding="utf-8")
+    assert '"speaker_1"' in content
+    assert '"speaker_2"' in content
+
+
 def test_export_srt_and_vtt_formats(tmp_path: Path) -> None:
     """SRT and VTT formats produce time-coded outputs."""
     doc = build_doc()

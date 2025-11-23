@@ -4,7 +4,6 @@ import pytest
 
 from core import ffmpeg as ffm
 from editing.text_model import Document, TextSegment
-from utils import downloader
 from utils import exporters as ex
 from utils import logging as logutils
 
@@ -39,9 +38,3 @@ def test_parse_ts_and_export_document_txt(tmp_path: Path) -> None:
     txt = out.read_text(encoding="utf-8")
     assert txt.strip() == "Hi"
     assert "speaker_1:" not in txt
-
-
-def test_downloader_download_model_not_implemented(tmp_path: Path) -> None:
-    """download_model is not implemented and raises NotImplementedError."""
-    with pytest.raises(NotImplementedError):
-        downloader.download_model("m", "u", tmp_path)

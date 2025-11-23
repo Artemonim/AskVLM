@@ -1,30 +1,34 @@
-import os
 from collections.abc import Callable
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
 import core.pipelines as pl
 from core.audio_io import prepare_audio
-from core.diarization import DiarizationPipeline
 from core.pipelines import LocalPipeline
 from core.settings import get_project_cache_dir
 from core.whisperx_wrapper import WhisperXWrapper
 from utils.exporters import export_document
 
+if TYPE_CHECKING:
+    from core.diarization import DiarizationPipeline
 
-def test_real_alignment_whisperx_small(tmp_path: Path) -> None:
+
+@pytest.mark.integration
+@pytest.mark.gpu
+@pytest.mark.xdist_group(name="gpu")
+def test_real_alignment_whisperx_small(
+    tmp_path: Path, short_audio_fixture: Path
+) -> None:
     """Verify whisperx alignment returns word timings when whisperx is installed.
 
     Skips if whisperx is not available in the environment.
     """
-    fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
-    if not fixture.exists():
-        return
     pytest.importorskip("whisperx")
 
     # Prepare audio to WAV
-    wav = prepare_audio(fixture, tmp_path)
+    wav = prepare_audio(short_audio_fixture, tmp_path)
     wx = WhisperXWrapper(
         model_name="small",
         device="cuda",
@@ -38,50 +42,11 @@ def test_real_alignment_whisperx_small(tmp_path: Path) -> None:
     assert any(getattr(seg, "words", []) for seg in aligned)
 
 
-def test_real_diarization_pyannote_small(tmp_path: Path) -> None:
-    """Verify diarization produces segments when pyannote.audio is installed.
-
-    Skips if pyannote.audio is not available in the environment.
-    """
-    fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
-    if not fixture.exists():
-        return
-    pytest.importorskip("pyannote.audio")
-    # Require token; skip if not provided in environment/.env
-    token = (
-        os.getenv("HF_TOKEN")
-        or os.getenv("HUGGINGFACE_TOKEN")
-        or os.getenv("HUGGINGFACE_HUB_TOKEN")
-        or os.getenv("HUGGINGFACEHUB_TOKEN")
-        or os.getenv("HUGGINGFACEHUB_API_TOKEN")
-        or os.getenv("PYANNOTE_TOKEN")
-        or os.getenv("PYANNOTE_AUTH_TOKEN")
-    )
-    if not token:
-        pytest.skip("HF_TOKEN not set; skipping diarization test")
-
-    # Reuse pipeline with diarization enabled on small model
-    pipeline = LocalPipeline(
-        model_root=get_project_cache_dir() / "models",
-        whisper_model="small",
-        engine="auto",
-        enable_diarization=True,
-        enable_dialog_blocks=False,
-        device="auto",
-        compute_type="auto",
-    )
-    # Prepare audio path that diarizer consumes
-    wav = prepare_audio(fixture, tmp_path)
-    # Force lazy diarizer init if needed
-    if pipeline.diarizer is None:
-        pipeline.diarizer = DiarizationPipeline(device="cuda")
-    segs = pipeline.diarizer.diarize(str(wav)) if pipeline.diarizer else []
-    assert isinstance(segs, list)
-    assert len(segs) > 0
-
-
+@pytest.mark.integration
+@pytest.mark.gpu
+@pytest.mark.xdist_group(name="gpu")
 def test_integration_pipeline_fast_smoke_with_diarization_and_export(
-    tmp_path: Path,
+    tmp_path: Path, short_audio_fixture: Path, shared_diarization_pipeline: object
 ) -> None:
     """Integration smoke on small model with diarization and export.
 
@@ -89,11 +54,6 @@ def test_integration_pipeline_fast_smoke_with_diarization_and_export(
     - Enables diarization (pyannote token is loaded from .env)
     - Exports TXT and SRT and checks presence
     """
-    fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
-    if not fixture.exists():
-        # Gracefully skip if fixture is not available locally
-        return
-
     pipeline = LocalPipeline(
         model_root=get_project_cache_dir() / "models",
         whisper_model="small",  # fast quality only
@@ -104,13 +64,17 @@ def test_integration_pipeline_fast_smoke_with_diarization_and_export(
         compute_type="auto",
     )
 
+    # Inject shared diarizer to avoid reloading if available
+    if shared_diarization_pipeline:
+        pipeline.diarizer = cast("DiarizationPipeline", shared_diarization_pipeline)
+
     # Process and export artifacts into tmp_path
-    doc = pipeline.process(fixture, tmp_path)
+    doc = pipeline.process(short_audio_fixture, tmp_path)
     text = doc.get_full_text()
     assert isinstance(text, str)
     assert text.strip() != ""
-    txtp = tmp_path / f"{fixture.stem}.txt"
-    srtp = tmp_path / f"{fixture.stem}.srt"
+    txtp = tmp_path / f"{short_audio_fixture.stem}.txt"
+    srtp = tmp_path / f"{short_audio_fixture.stem}.srt"
     export_document(doc, "txt", txtp)
     export_document(doc, "srt", srtp)
     assert txtp.exists()

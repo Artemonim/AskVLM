@@ -1,0 +1,5 @@
+{
+    "systran/faster-whisper-small": "huggingface",
+    "systran/faster-whisper-large-v3": "huggingface"
+}
+

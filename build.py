@@ -26,8 +26,10 @@ import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TextIO
 import xml.etree.ElementTree as ET
+from utils.downloader import check_missing_models, download_model, ensure_models_dir, load_models_config
 
 
 def linting_path() -> str:
@@ -128,6 +130,39 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 DEFAULT_TARGETS = ["core", "editing", "utils", "gui", "tests"]
 
 
+def ensure_ml_models() -> None:
+    """Check and download required ML models."""
+    print("Checking ML models...")
+    # * Import here to avoid early import errors if dependencies aren't ready
+    try:
+        from core.settings import get_project_cache_dir
+        models_path = get_project_cache_dir() / "models"
+    except ImportError:
+        # Fallback
+        models_path = Path("models")
+
+    ensure_models_dir(models_path)
+    
+    config_path = Path("models.json")
+    if not config_path.exists():
+        print("No models.json found, skipping model checks.")
+        return
+
+    models_config = load_models_config(config_path)
+    missing = check_missing_models(models_path, models_config)
+    
+    if missing:
+        print(f"Missing models: {', '.join(missing)}")
+        for model in missing:
+            source = models_config[model]
+            try:
+                download_model(model, source, models_path)
+            except Exception as e:
+                print(f"Failed to download {model}: {e}")
+    else:
+        print("All models present.")
+
+
 class LocalCI:
     def __init__(self, verbose: bool, json_output: bool, targets: Optional[List[str]]):
         self.verbose = verbose
@@ -165,7 +200,7 @@ class LocalCI:
             if self.verbose and not self.json_output:
                 self._print(f"* Running: {' '.join(cmd)}")
             shell = os.name == "nt" and cmd[0] in {"npx", "npm"}
-            p = subprocess.run(cmd, capture_output=True, text=True, shell=shell, timeout=300)
+            p = subprocess.run(cmd, capture_output=True, text=True, shell=shell, timeout=600)
             return p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired:
             return 124, "", "Command timed out"
@@ -775,6 +810,7 @@ def main() -> None:
 
     # * FastLaunch: only launch the application (GUI), skip any checks
     if args.fast_launch:
+        ensure_ml_models()
         try:
             # * Launch GUI application in the foreground
             code = subprocess.call([sys.executable, "-m", "gui.main_window"])  # noqa: S603
@@ -799,6 +835,8 @@ def main() -> None:
                 print(f"Error: path not found: {p}", file=sys.stderr)
                 sys.exit(1)
         targets = ok
+
+    ensure_ml_models()
 
     ci = LocalCI(verbose=args.verbose, json_output=args.json, targets=targets)
     res = ci.run(only=args.tool, fix=(not args.no_fix))

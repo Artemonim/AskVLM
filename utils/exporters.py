@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from editing.text_model import Document
+from editing.text_model import Document, merge_consecutive_segments_by_speaker
 
 
 # * Readability constraints for subtitles
@@ -269,6 +269,10 @@ def export_vtt(doc: Document) -> str:
 # * JSON exporter
 def export_json(doc: Document) -> dict[str, list[dict[str, object]]]:
     """Return JSON-serializable structure for a `Document`."""
+    if getattr(doc, "dialog_blocks_enabled", False):
+        segments = merge_consecutive_segments_by_speaker(doc.segments)
+    else:
+        segments = doc.segments
     return {
         "segments": [
             {
@@ -277,9 +281,18 @@ def export_json(doc: Document) -> dict[str, list[dict[str, object]]]:
                 "end_time": seg.end_time,
                 "text": seg.text,
             }
-            for seg in doc.segments
+            for seg in segments
         ]
     }
+
+
+# * CSV exporter
+def export_csv(doc: Document) -> str:
+    """Return CSV string for a `Document` (speaker,start,end,text)."""
+    return "\n".join(
+        f"{seg.speaker_id},{seg.start_time},{seg.end_time},{seg.text}"
+        for seg in doc.segments
+    )
 
 
 EXPORTERS = {
@@ -287,6 +300,7 @@ EXPORTERS = {
     "srt": export_srt,
     "vtt": export_vtt,
     "json": export_json,
+    "csv": export_csv,
 }
 
 

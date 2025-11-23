@@ -60,11 +60,12 @@
     -   [x] Integrate `pyannote.audio` (community pipeline); manage HF token via ENV.
 -   [x] **Speach Kit Backend Integration**
     -   [x] Add `core/whisperx_wrapper.py` with load/transcribe/align API.
-    -   [x] Implement `core/diarization.py` using `pyannote/speaker-diarization-community-1`.
+    -   [x] Implement `core/diarization.py` using `pyannote/speaker-diarization-3.1`.
     -   [x] Implement `core/llm_formatter.py` (llama-cpp, 3B/7B GGUF) for dialog blocks.
     -   [x] Update `core/pipelines.py` to support engine switch (whisper/whisperx).
     -   [x] Add options: diarization on/off, dialog-blocks on/off, batch params.
     -   [x] Exporters: TXT, SRT, VTT, JSON (timestamps, speakers, text).
+    -   [x] Dialog Blocks: merge consecutive same-speaker segments into blocks for TXT/JSON exports.
 -   [x] **CLI for Batch Processing**
     -   [x] Add Typer-based CLI in Speach Kit for folders/files.
     -   [x] Support recursive mode, overwrite policy, language, device, formats.
@@ -87,7 +88,7 @@
     -   [ ] Batch size control and OOM handling guidance.
 -   [ ] **Testing**
     -   [x] Unit tests for wrappers (whisperx, diarization, formatter) — minimal.
-    -   [ ] Integration test: WAV ➜ segments+speakers ➜ dialog blocks export.
+    -   [x] Integration test: WAV ➜ segments+speakers ➜ dialog blocks export.
 
 ## Phase 1.7: Simple GUI MVP (Quick Transcribe)
 

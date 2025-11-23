@@ -14,6 +14,7 @@ dependencies = [
     "pydantic>=2.0.0",
     "tqdm>=4.65.0",
     "typer>=0.12.0",
+    "numpy<2.0",
     # ! ML dependencies will be added in Phase 2
     # "openai-whisper>=20231117",
     # "pyannote.audio>=3.1.0,<3.3.0",
@@ -47,7 +48,8 @@ ml = [
     "torch>=2.5.0",
     "openai-whisper>=20231117",
     "faster-whisper>=1.0.0",
-    "pyannote.audio>=3.1.0,<3.3.0",
+    "pyannote.audio>=3.3.0",
+    "matplotlib>=3.7.0",
     "llama-cpp-python>=0.2.0,<0.3.0",
     "python-docx>=1.1.0",
     "odfpy>=1.4.0",
@@ -186,6 +188,9 @@ addopts = [
     "--cov-report=xml",
     "-m",
     "not slow",
+    "-n",
+    "auto",
+    "--dist=loadgroup",
 ]
 testpaths = ["tests"]
 markers = [

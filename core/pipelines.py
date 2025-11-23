@@ -214,6 +214,8 @@ class LocalPipeline:
             enable_dialog_blocks=self.enable_dialog_blocks,
             format_text_fn=self.formatter.format_text,
         )
+        # * Mark document so text/JSON exporters can build dialog blocks when enabled
+        doc.dialog_blocks_enabled = bool(self.enable_dialog_blocks)
         report("Document built", 0.98)
         # * Export subtitle artifacts are configured later using options passed from GUI
         # * Export-time subtitle layout rules are applied by exporters

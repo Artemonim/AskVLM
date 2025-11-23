@@ -37,27 +37,23 @@ function Show-Help {
 
 if ($Help) { Show-Help; exit 0 }
 
+# Forward known arguments to build.ps1
+$buildParams = @{}
+if ($Tool) { $buildParams['Tool'] = $Tool }
+if ($Path) { $buildParams['Path'] = $Path }
+if ($Verbose) { $buildParams['Verbose'] = $true }
+if ($Json) { $buildParams['Json'] = $true }
+if ($NoFix) { $buildParams['NoFix'] = $true }
+if ($SkipLaunch) { $buildParams['SkipLaunch'] = $true }
+if ($FastLaunch) { $buildParams['FastLaunch'] = $true }
+
+# Handle remaining arguments (forwarded via --)
 $dashdashIndex = $args.IndexOf("--")
-$forward = @()
-if ($dashdashIndex -ge 0) { $forward = $args[($dashdashIndex + 1)..($args.Length - 1)] }
-
-$activate = Join-Path -Path ".venv" -ChildPath "Scripts/Activate.ps1"
-if (-not (Test-Path $activate)) { python -m venv .venv }
-& $activate
-
-$cmd = "python build.py"
-# * Add flags from parameters
-if ($Tool) { $cmd = "{0} --tool {1}" -f $cmd, $Tool }
-if ($Path) { $cmd = "{0} --path {1}" -f $cmd, ([string]::Join(' ', $Path)) }
-if ($Verbose) { $cmd += " --verbose" }
-if ($Json) { $cmd += " --json" }
-if ($NoFix) { $cmd += " --no-fix" }
-# * Launch control flags
-if ($SkipLaunch) { $cmd += " --skip-launch" }
-if ($FastLaunch) { $cmd += " --fast-launch" }
-# * Add forwarded arguments
-if ($forward.Count -gt 0) { $cmd = "{0} {1}" -f $cmd, ([string]::Join(' ', $forward)) }
-Invoke-Expression $cmd
+if ($dashdashIndex -ge 0) {
+    $forward = $args[($dashdashIndex + 1)..($args.Length - 1)]
+    # Pass explicit '--' so build.ps1 detects them correctly
+    & ./build.ps1 @buildParams -- $forward
+} else {
+    & ./build.ps1 @buildParams
+}
 exit $LASTEXITCODE
-
-
