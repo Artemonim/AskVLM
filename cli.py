@@ -13,7 +13,7 @@ from utils.exporters import export_document, export_srt_with_rules, SubtitleRule
 from core.audio_io import prepare_audio
 
 
-app = typer.Typer(help="Artemonim's Speech Kit CLI")
+app = typer.Typer(help="AskVLM CLI")
 
 
 @app.command()

@@ -2,32 +2,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import pytest
 from PySide6.QtCore import QSettings
 
 from gui.main_window import MainWindow
-from gui.video_qa import LocalFileProvider
 
 if TYPE_CHECKING:
     from pathlib import Path
 
+    import pytest
     from pytestqt.qtbot import QtBot
-
-
-def test_local_file_provider_resolves_local_file(tmp_path: Path) -> None:
-    """LocalFile provider resolves an existing file and rejects a missing one."""
-    media = tmp_path / "clip.mp4"
-    media.write_bytes(b"abc")
-
-    provider = LocalFileProvider()
-    source = provider.resolve(media)
-
-    assert source.path == media.resolve()
-    assert source.size_bytes == 3
-    assert source.suffix == ".mp4"
-
-    with pytest.raises(FileNotFoundError):
-        provider.resolve(tmp_path / "missing.mp4")
 
 
 def test_video_qa_shell_restores_screen_and_source(

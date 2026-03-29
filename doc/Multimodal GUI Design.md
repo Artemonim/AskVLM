@@ -1,4 +1,4 @@
-### Artemonim's Speech Kit — Мультимодальный GUI: текст, субтитры и ответы по видео
+### AskVLM — Мультимодальный GUI: текст, субтитры и ответы по видео
 
 Дата: 2026-03-29
 
@@ -183,15 +183,15 @@ OCR не включается в обязательный путь.
 
 ### 7. Нейминг и продуктовая рамка
 
-Нынешнее имя репозитория допустимо как рабочее, но как публичный бренд оно уже не идеально.
+Публичный бренд проекта уже выровнен на **AskVLM**.
 
-Предлагаемая последовательность:
+Дальнейшие шаги по техническому неймингу, если они понадобятся, могут идти отдельно:
 
-1. Сначала выровнять UX и документацию.
-2. Потом выбрать более точное публичное имя продукта.
-3. И только после этого решать, нужен ли физический rename репозитория.
+1. Довести migration-sensitive identifiers до нового бренда без потери совместимости.
+2. Сохранить исторические ключи и метаданные там, где это нужно для прошлых сессий и артефактов.
+3. Не смешивать физический rename репозитория с продуктовым именем в GUI и документации.
 
-Это снижает риск того, что сначала будет переименован кодовый базис, а потом придётся ещё раз переписывать UX и документацию.
+Это позволяет удерживать UX и документацию под единым брендом, не ломая совместимость старых данных.
 
 ---
 
@@ -220,10 +220,10 @@ OCR не включается в обязательный путь.
 
 ### 10. Связанные файлы
 
-- [gui/main_window.py](g:\GitHub\Artemonim's Speach Kit\gui\main_window.py)
-- [core/pipelines.py](g:\GitHub\Artemonim's Speach Kit\core\pipelines.py)
-- [core/ffmpeg.py](g:\GitHub\Artemonim's Speach Kit\core\ffmpeg.py)
-- [editing/text_model.py](g:\GitHub\Artemonim's Speach Kit\editing\text_model.py)
-- [utils/exporters.py](g:\GitHub\Artemonim's Speach Kit\utils\exporters.py)
-- [TODO.md](g:\GitHub\Artemonim's Speach Kit\TODO.md)
+- [gui/main_window.py](../gui/main_window.py)
+- [core/pipelines.py](../core/pipelines.py)
+- [core/ffmpeg.py](../core/ffmpeg.py)
+- [editing/text_model.py](../editing/text_model.py)
+- [utils/exporters.py](../utils/exporters.py)
+- [TODO.md](../TODO.md)
 

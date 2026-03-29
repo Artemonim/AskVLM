@@ -1,11 +1,11 @@
-# Makefile for Artemonim's Speech Kit
+# Makefile for AskVLM
 # Provides convenient commands for development workflow
 
 .PHONY: help install install-dev clean clean-all clean-verbose clean-deep-verbose test test-quick lint format type-check security check-all fix setup-dev
 
 # * Default target
 help:
-	@echo "Artemonim's Speech Kit - Development Commands"
+	@echo "AskVLM - Development Commands"
 	@echo "============================================="
 	@echo ""
 	@echo "Setup Commands:"

@@ -1,4 +1,4 @@
-# CUDA Setup Guide for Artemonim's Speech Kit
+# CUDA Setup Guide for AskVLM
 
 ## Problem: PyTorch CPU-only Version
 

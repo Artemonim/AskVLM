@@ -9,7 +9,7 @@ from core.pipelines import LocalPipeline
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Artemonim's Speech Kit - Local Processing CLI"
+        description="AskVLM - Local Processing CLI"
     )
     parser.add_argument(
         "-i",

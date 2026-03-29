@@ -19,7 +19,7 @@ param(
 )
 
 function Show-Help {
-    Write-Host "Artemonim's Speech Kit build/runner" -ForegroundColor Cyan
+    Write-Host "AskVLM build/runner" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage:"
     Write-Host "  .\\build.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-- <build.py args>]"

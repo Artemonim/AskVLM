@@ -1,4 +1,4 @@
-# Artemonim's Speech Kit
+# AskVLM
 
 AI-powered speech transcription and editing toolkit with comprehensive code quality assurance.
 
@@ -43,7 +43,7 @@ pip install -e .[ml]
 ```bash
 # Clone the repository
 git clone <repository-url>
-cd "Artemonim's Speech Kit"
+cd AskVLM
 
 # Install development dependencies and setup environment
 make setup-dev

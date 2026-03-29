@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -14,62 +14,29 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from core.video_qa_context import normalize_video_qa_context
+from core.video_qa_policy import (
+    default_video_qa_url_import_policy,
+)
+from core.video_qa_sources import LocalFileProvider
 
-@dataclass(frozen=True, slots=True)
-class LocalFileSource:
-    """Resolved local media file for the Video QA shell."""
+if TYPE_CHECKING:
+    from collections.abc import Iterable
 
-    path: Path
-    size_bytes: int
-    suffix: str
-
-    @property
-    def summary(self) -> str:
-        """Return a concise human-readable description of the source."""
-        suffix = self.suffix or "no extension"
-        return f"{self.path} | {self.size_bytes:,} bytes | {suffix}"
-
-
-class LocalFileProvider:
-    """Resolve local files without URL import or remote fetching."""
-
-    name = "LocalFile"
-
-    def resolve(self, raw_path: str | Path) -> LocalFileSource:
-        """Resolve `raw_path` into a local source with metadata."""
-        text = str(raw_path).strip()
-        if not text:
-            msg = "Local file path is empty."
-            raise ValueError(msg)
-
-        path = Path(text).expanduser()
-        if not path.exists():
-            msg = f"Local file not found: {path}"
-            raise FileNotFoundError(msg)
-        if not path.is_file():
-            msg = f"Local file provider expects a file path: {path}"
-            raise IsADirectoryError(msg)
-
-        try:
-            stat = path.stat()
-        except OSError as exc:
-            msg = f"Unable to inspect local file: {path}"
-            raise OSError(msg) from exc
-
-        resolved = path.resolve()
-        return LocalFileSource(
-            path=resolved,
-            size_bytes=int(stat.st_size),
-            suffix=resolved.suffix.lower(),
-        )
+    from core.video_qa_context import VideoQAContextBundle
+    from core.video_qa_policy import (
+        VideoQAUrlImportPolicy,
+    )
+    from core.video_qa_sources import LocalFileSource
 
 
 class VideoQAPanel(QWidget):
-    """Wave 1 Video QA shell with a local-file source picker."""
+    """Thin Video QA shell adapter with a local-file source picker."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._provider = LocalFileProvider()
+        self._url_import_policy = default_video_qa_url_import_policy()
         self._source: LocalFileSource | None = None
 
         layout = QVBoxLayout(self)
@@ -79,8 +46,9 @@ class VideoQAPanel(QWidget):
         layout.addWidget(title)
 
         guardrails = QLabel(
-            "Wave 1 guardrails: local file only. URL import, attachments, chunk "
-            "planning, LLM orchestration, and budget policy land later."
+            "Local file is the active source. URL import, attachments, chunk "
+            "planning, LLM orchestration, and budget policy stay backend-only "
+            "for now."
         )
         guardrails.setWordWrap(True)
         layout.addWidget(guardrails)
@@ -175,6 +143,21 @@ class VideoQAPanel(QWidget):
     def source(self) -> LocalFileSource | None:
         """Return the resolved local source metadata, if available."""
         return self._source
+
+    def context_bundle(
+        self,
+        attachments: Iterable[str | Path] = (),
+    ) -> VideoQAContextBundle:
+        """Return a normalized prompt context bundle for the current shell."""
+        return normalize_video_qa_context(
+            source=self._source,
+            question=self.question_text(),
+            attachments=attachments,
+        )
+
+    def url_import_policy(self) -> VideoQAUrlImportPolicy:
+        """Return the backend-only URL import policy."""
+        return self._url_import_policy
 
     def _sync_source_from_edit(self) -> None:
         """Sync the source state from the editable path field."""

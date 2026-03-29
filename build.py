@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Artemonim's Speech Kit Local CI (build.py)
+AskVLM Local CI (build.py)
 
 - Auto-fixes formatting with ruff before analysis.
 - Uses configs from .linting/
@@ -798,7 +798,7 @@ class LocalCI:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Local CI runner for Artemonim's Speech Kit")
+    parser = argparse.ArgumentParser(description="Local CI runner for AskVLM")
     parser.add_argument("--tool", choices=list(TOOLS.keys()), help="Run only a specific tool")
     parser.add_argument("--path", nargs="+", help="Limit analysis to given paths")
     parser.add_argument("--verbose", "-v", action="store_true")

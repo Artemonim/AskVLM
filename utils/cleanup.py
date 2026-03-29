@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Cleanup utility for Artemonim's Speech Kit.
+"""Cleanup utility for AskVLM.
 
 This script cleans up Python cache files, build artifacts, and temporary files
 to free up disk space and ensure clean development environment.
