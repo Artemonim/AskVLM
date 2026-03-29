@@ -1,0 +1,29 @@
+# AGENTS.md
+
+## Доктрина
+- Не ломай текущий subtitle-first workflow: preview, export и burn-in считаются стабильной базой.
+- Новый функционал для `Text`, `Subtitles` и `Video QA` должен оставаться разведённым по режимам и результатам.
+- Перед заявлением о готовности всегда прогоняй локальную CI через `./run.ps1 -SkipLaunch`.
+
+## Куда смотреть
+- `README.md` — краткий старт для человека.
+- `TODO.md` — актуальный ближайший roadmap.
+- `TODO_legacy.md` — архив старого long-form плана.
+- `doc/Multimodal GUI Design.md` — текущая продуктовая рамка мультимодального GUI.
+- `run.ps1` и `build.ps1` — источник истины для локальной проверки и запуска.
+
+## Code Map
+- `gui/` — окно, маршрутизация режимов и worker orchestration.
+- `core/` — pipeline, FFmpeg, STT, diarization и settings.
+- `editing/` — text model и editing tools.
+- `utils/` — exporters, logging и общие helpers.
+- `tests/` — автоматические проверки и E2E сценарии.
+
+## Границы
+- Не добавляй секреты, токены и машинно-зависимые пути в код или документацию.
+- Если есть неочевидное исключение или новое правило, зафиксируй его здесь или в `.cursor/rules/`.
+
+## Контроль качества
+- Основная команда проверки: `. .venv/Scripts/Activate.ps1 && ./run.ps1 -SkipLaunch`.
+- Запускай терминал с таймаутом не менее 5 минут.
+
