@@ -58,3 +58,16 @@
 - Hugging Face: [Qwen/Qwen3.5-35B-A3B](https://huggingface.co/Qwen/Qwen3.5-35B-A3B)
 - README модели: [официальный README](https://huggingface.co/Qwen/Qwen3.5-35B-A3B/blob/main/README.md)
 - Обзор линейки: [Qwen 3.5 blog](https://qwen.ai/blog?id=qwen3.5)
+
+## 9. LM Studio — internal reference (verified from official docs)
+
+Краткая зафиксированная семантика для backend (`Video QA`), без замены живой проверки на железе.
+
+- **OpenAI-compatible HTTP**: в документации LM Studio описаны OpenAI-совместимые маршруты, включая `/v1/responses` и `/v1/chat/completions`. Конкретная форма JSON и наличие полей зависят от endpoint и версии; нельзя считать, что termination-метаданные всегда идентичны облачному OpenAI.
+- **Multimodal payload**: запросы с изображениями следуют OpenAI-совместимому формату (например, `content` как список частей с `image_url` / base64); детали и ограничения — в официальных разделах LM Studio про OpenAI compat и image input.
+- **Streaming**: при SSE/streaming-режиме итоговые `finish_reason` / `stopReason` могут появляться только на последнем chunk или в отдельной структуре; клиенту нужно дождаться завершения потока, прежде чем полагаться на нормализацию termination.
+- **`stopReason` (prediction stats)**: документированные значения включают `maxPredictedTokensReached`, `stopStringFound`, `toolCalls`, `contextLengthReached`. Код нормализации: `core/video_qa_lm_studio_termination.py`.
+- **`contextOverflowPolicy`**: поддерживаемые режимы — `stopAtLimit`, `truncateMiddle`, `rollingWindow`. Это server-side политика относительно контекста; приложение по-прежнему опирается на собственный preflight и fallback до отдельной верификации на целевой модели.
+- **Structured output**: совместимость с жёстким JSON/схемой зависит от модели и сборки; graceful fallback остаётся обязательным.
+
+Ограничение: end-to-end поведение при переполнении контекста (ошибка vs partial output vs тихая усечённость) на целевом железе и версии LM Studio остаётся **ручной** проверкой; этот раздел не отменяет пункт roadmap про live overflow verification.

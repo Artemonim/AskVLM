@@ -91,7 +91,7 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 - [ ] Зафиксировать целевой профиль локальной модели и её ограничения для `Video QA`.
 - [ ] Проверить связку `LM Studio + выбранная Qwen/VLM` на реальном мультимодальном запросе, а не только на тексте.
 - [ ] Проверить, насколько локальный сервер поддерживает structured output / JSON contract, и предусмотреть graceful fallback.
-- [ ] Добавить в репозиторий краткий internal reference по LM Studio: OpenAI-compatible API, multimodal payload, streaming, caveats structured output.
+- [x] Добавить в репозиторий краткий internal reference по LM Studio: OpenAI-compatible API, multimodal payload, streaming, caveats structured output.
 
 ## 8. Outputs and artifacts
 
