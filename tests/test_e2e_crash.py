@@ -2,18 +2,72 @@ import os
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtGui import QCloseEvent
+from PySide6.QtWidgets import QApplication, QTableWidgetItem
+from pytestqt.qtbot import QtBot
 
 from gui.main_window import MainWindow
 
 
-# Combinations:
-# 1. Quality: fast vs good
-# 2. Count: 1 vs 2 files
-# 3. Action: implicit_cancel (close window) vs explicit_cancel (click cancel then close)
+def _select_inputs(fixtures_dir: Path, num_videos: int) -> list[Path]:
+    sources = [
+        fixtures_dir / "test_video_first.mp4",
+        fixtures_dir / "test_video_second.mp4",
+    ]
+    available = [path for path in sources if path.exists()]
+    if not available:
+        pytest.skip("Fixtures not found")
+    return [available[index % len(available)] for index in range(num_videos)]
+
+
+def _create_window(
+    qtbot: QtBot,
+    out_dir: Path,
+    inputs: list[Path],
+    quality: str,
+) -> MainWindow:
+    window = MainWindow()
+    window.show()
+    qtbot.addWidget(window)
+
+    window.out_dir_edit.setText(str(out_dir))
+    window.chk_diar.setChecked(False)
+    window.chk_dialog.setChecked(False)
+    if quality == "fast":
+        qtbot.mouseClick(window.btn_quality, Qt.LeftButton)
+
+    for media_path in inputs:
+        window.last_input_dir = media_path.parent
+        row = window.input_list.rowCount()
+        window.input_list.insertRow(row)
+        window.input_list.setItem(row, 1, QTableWidgetItem(str(media_path)))
+
+    return window
+
+
+def _make_dummy_thread(*, should_stop: bool) -> SimpleNamespace:
+    thread = SimpleNamespace(quitted=False)
+
+    def _is_running() -> bool:
+        return True
+
+    def _quit() -> None:
+        thread.quitted = True
+
+    def _wait(_timeout_ms: int) -> bool:
+        return should_stop
+
+    thread.isRunning = _is_running
+    thread.quit = _quit
+    thread.wait = _wait
+    return thread
+
+
+# * E2E crash detection covers a small matrix of runtime scenarios.
 @pytest.mark.skipif(
     not os.getenv("SK_RUN_E2E_CRASH"),
     reason="Manual E2E test for crash detection (set SK_RUN_E2E_CRASH=1 to run)",
@@ -22,117 +76,48 @@ from gui.main_window import MainWindow
 @pytest.mark.parametrize("num_videos", [1, 2])
 @pytest.mark.parametrize("strategy", ["implicit_cancel", "explicit_cancel"])
 def test_e2e_crash_scenarios(
-    qapp, qtbot, tmp_path, monkeypatch, quality, num_videos, strategy
+    qapp: QApplication,
+    qtbot: QtBot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    quality: str,
+    num_videos: int,
+    strategy: str,
 ) -> None:
-    """Parametric E2E test for crash/hang detection on exit.
-    Covers Fast/Good modes, Single/Multi-file inputs, and Implicit/Explicit cancellation.
+    """Parametric E2E test for crash and hang detection on exit.
+
+    Covers Fast and Good modes, single and multi-file inputs, and implicit and
+    explicit cancellation.
     """
-    # * Isolate QSettings to prevent overwriting user config
-    # Define a mock QSettings that ignores arguments and uses a temp INI file
     temp_settings_path = tmp_path / "test_settings.ini"
 
     class MockSettings(QSettings):
-        def __init__(self, *args, **kwargs) -> None:
-            # Redirect all QSettings instantiations to our temp file
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
             super().__init__(str(temp_settings_path), QSettings.Format.IniFormat)
 
-    # Patch the QSettings class imported in gui.main_window
     monkeypatch.setattr("gui.main_window.QSettings", MockSettings)
 
-    # Setup inputs
     fixtures_dir = Path(__file__).parent / "fixtures"
-    # Use existing fixtures; duplicate if needed to reach count
-    sources = [
-        fixtures_dir / "test_video_first.mp4",
-        fixtures_dir / "test_video_second.mp4",
-    ]
-    if not sources[0].exists():
-        pytest.skip("Fixtures not found")
-
-    # Select inputs based on num_videos
-    inputs = [sources[i % len(sources)] for i in range(num_videos)]
+    inputs = _select_inputs(fixtures_dir, num_videos)
 
     out_dir = tmp_path / f"e2e_out_{quality}_{num_videos}_{strategy}"
     out_dir.mkdir()
 
-    # Initialize Window
-    window = MainWindow()
-    window.show()
-    qtbot.addWidget(window)
+    window = _create_window(qtbot, out_dir, inputs, quality)
 
-    # Setup UI state
-    window.out_dir_edit.setText(str(out_dir))
-    window.chk_diar.setChecked(False)
-    window.chk_dialog.setChecked(False)
-
-    # Set quality
-    # We need to toggle if default isn't what we want, or set internal state directly
-    # and trigger update. The UI button toggles, but we can set state and call applier.
-    window._quality_mode = quality
-    window._apply_quality_to_pipeline()
-
-    # Add files
-    for p in inputs:
-        window.last_input_dir = p.parent
-        row = window.input_list.rowCount()
-        window.input_list.insertRow(row)
-        from PySide6.QtWidgets import QTableWidgetItem
-
-        window.input_list.setItem(row, 1, QTableWidgetItem(str(p)))
-        window._update_item_icon_row(row)
-
-    window._scan_output_statuses()
-
-    # Start processing
     qtbot.mouseClick(window.btn_start, Qt.LeftButton)
-
-    # Wait until Whisper transcription phase begins to ensure GPU work is active.
-    # Status bar messages are updated via LocalPipeline.report().
     qtbot.waitUntil(
         lambda: "Transcribing" in window.status.currentMessage(),
         timeout=60000,
     )
-    # Let it run briefly so that Whisper has time to start emitting segments.
     time.sleep(2.0)
 
     if strategy == "explicit_cancel":
-        # * Explicit user-style cancel while Whisper is actively transcribing.
         qtbot.mouseClick(window.btn_cancel, Qt.LeftButton)
-        # Do NOT wait for cancellation acknowledgment here: we want to model
-        # the user closing the window almost immediately after pressing Cancel.
         time.sleep(0.5)
-        window.close()
-    else:
-        # Implicit cancel via Close (user closes window without pressing Cancel).
-        window.close()
 
-    # Wait for threads shutdown
-    # Capture thread reference early to avoid PySide6 deletion issues
-    th = window._thread
-
-    # If explicit cancel + close, the window.close() triggered closeEvent,
-    # which triggers await_worker_shutdown, which QUITS and WAITS on the thread.
-    # So by the time we get here, the thread might already be finished and deleted by Qt.
-
-    # Check if Python wrapper is still valid and running
-    if th is not None:
-        try:
-            if th.isRunning():
-                success = th.wait(30000)
-                if not success:
-                    pass
-        except RuntimeError:
-            # Object already deleted by C++ side (expected on successful close)
-            pass
-
-    # Also check burn thread just in case (should be None here)
-    bth = window._burn_thread
-    if bth is not None:
-        try:
-            if bth.isRunning():
-                bth.wait(2000)
-        except RuntimeError:
-            pass
+    window.close()
+    assert window.await_worker_shutdown(timeout_ms=30000)
 
 
 @pytest.mark.parametrize(
@@ -140,11 +125,16 @@ def test_e2e_crash_scenarios(
     [(False, False), (True, True)],
 )
 def test_close_event_respects_shutdown_result(
-    qapp, qtbot, monkeypatch, shutdown_result, expected_accept
+    qapp: QApplication,
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    shutdown_result: bool,
+    expected_accept: bool,
 ) -> None:
     """CloseEvent keeps the window open until shutdown completes."""
-    monkeypatch.setattr(MainWindow, "_load_settings", lambda self: None)
-    monkeypatch.setattr(MainWindow, "_save_settings", lambda self: None)
+    monkeypatch.setattr(MainWindow, "_load_settings", lambda _self: None)
+    monkeypatch.setattr(MainWindow, "_save_settings", lambda _self: None)
 
     window = MainWindow()
     qtbot.addWidget(window)
@@ -157,14 +147,12 @@ def test_close_event_respects_shutdown_result(
             self.closing = True
 
     dummy_worker = DummyWorker()
-    window._worker = dummy_worker
+    dummy_thread = _make_dummy_thread(should_stop=shutdown_result)
+    monkeypatch.setattr(window, "_worker", dummy_worker)
+    monkeypatch.setattr(window, "_thread", dummy_thread)
+    monkeypatch.setattr(window, "_burn_thread", None)
     cancel_calls: list[bool] = []
     monkeypatch.setattr(window, "request_cancel", lambda: cancel_calls.append(True))
-    monkeypatch.setattr(
-        window,
-        "await_worker_shutdown",
-        lambda timeout_ms=30000: shutdown_result,
-    )
 
     event = QCloseEvent()
     window.closeEvent(event)

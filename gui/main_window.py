@@ -632,7 +632,10 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "Nothing to process",
-                "All inputs are already processed under current quality. Switch to Good or use Burn.",
+                (
+                    "All inputs are already processed under current quality. "
+                    "Switch to Good or use Burn."
+                ),
             )
             return
         if skipped_restricted > 0:
@@ -1239,6 +1242,36 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._thread = None
 
+    def _stop_qthread(
+        self,
+        thread: QThread | None,
+        timeout_ms: int,
+        *,
+        label: str,
+    ) -> tuple[QThread | None, bool]:
+        if thread is None:
+            return None, True
+        try:
+            if thread.isRunning():
+                thread.quit()
+                if not thread.wait(timeout_ms):
+                    get_logger(__name__).warning(
+                        "%s thread did not stop in %d ms",
+                        label,
+                        timeout_ms,
+                    )
+                    return thread, False
+            if not thread.isRunning():
+                return None, True
+        except RuntimeError:
+            # C++ object already deleted (e.g. via deleteLater)
+            get_logger(__name__).debug(
+                "%s thread object already deleted during shutdown",
+                label,
+            )
+            return None, True
+        return thread, True
+
     def await_worker_shutdown(self, timeout_ms: int = 30000) -> bool:
         """Stop spinner and await background worker threads termination.
 
@@ -1250,47 +1283,19 @@ class MainWindow(QMainWindow):
         with contextlib.suppress(Exception):
             self._spinner_timer.stop()
 
-        all_stopped = True
-
-        th = self._thread
-        if th is not None:
-            try:
-                if th.isRunning():
-                    th.quit()
-                    # Wait longer to let GPU job acknowledge cancel and free VRAM
-                    if not th.wait(timeout_ms):
-                        get_logger(__name__).warning(
-                            "Worker thread did not stop in %d ms",
-                            timeout_ms,
-                        )
-                        all_stopped = False
-                # Reset reference once the thread is no longer running
-                if not th.isRunning():
-                    self._thread = None
-            except RuntimeError:
-                # C++ object already deleted (e.g. via deleteLater)
-                get_logger(__name__).debug(
-                    "Worker thread object already deleted during shutdown",
-                )
-                self._thread = None
-
-        bth = self._burn_thread
-        if bth is not None:
-            try:
-                if bth.isRunning():
-                    bth.quit()
-                    if not bth.wait(2000):
-                        get_logger(__name__).warning(
-                            "Burn thread did not stop in %d ms",
-                            2000,
-                        )
-                        all_stopped = False
-                if not bth.isRunning():
-                    self._burn_thread = None
-            except RuntimeError:
-                self._burn_thread = None
-
-        return all_stopped
+        self._thread, stopped = self._stop_qthread(
+            self._thread,
+            timeout_ms,
+            label="Worker",
+        )
+        worker_stopped = stopped
+        self._burn_thread, stopped = self._stop_qthread(
+            self._burn_thread,
+            2000,
+            label="Burn",
+        )
+        burn_stopped = stopped
+        return worker_stopped and burn_stopped
 
     # * Settings persistence
     def _load_settings(self) -> None:
@@ -1369,7 +1374,7 @@ class MainWindow(QMainWindow):
 
     def _add_tab(self, title: str, text: str, media: Path | None = None) -> None:  # noqa: PLR0915, C901
         editor = WysiwygEditor()
-        # Parse plain text into table rows: "[hh:mm:ss.mmm --> hh:mm:ss.mmm] speaker: text"
+        # Parse plain text into rows with timestamp-prefixed blocks.
         # Regex for leading time range
         time_pat = re.compile(
             r"^(\d\d:\d\d:\d\d[,\.]\d{3})\s*(?:-->|→|-+>?)\s*(\d\d:\d\d:\d\d[,\.]\d{3})"
@@ -1856,7 +1861,7 @@ class MainWindow(QMainWindow):
             # Update underlying wrapper and force reload next time
             self.pipeline.whisperx.model_name = model
             if force_reload and isinstance(self.pipeline.whisperx, WhisperXWrapper):
-                # Recreate wrapper to avoid private member access and ensure clean reload
+                # Recreate the wrapper to ensure a clean reload.
                 wx_old = self.pipeline.whisperx
                 self.pipeline.whisperx = WhisperXWrapper(
                     model_name=wx_old.model_name,
@@ -1962,7 +1967,7 @@ class PipelineWorker(QObject):
                 ml_val2 = int(ml_obj2) if isinstance(ml_obj2, (int, str)) else 2
                 rules = SubtitleRules(max_line_chars=lw_val2, max_lines=ml_val2)
                 srt_text = export_srt_with_rules(doc, rules)
-                # Append ASK metadata (comment-style) to allow status scan to detect quality
+                # Append ASK metadata so the status scan can detect quality.
                 qual = str(self._opts.get("quality", "")).lower() or None
                 if qual in {"fast", "good"}:
                     srt_text = append_ask_metadata_to_srt(
@@ -1971,7 +1976,7 @@ class PipelineWorker(QObject):
                         quality=qual,
                         completed=True,
                     )
-                # * If requested via options, fill gaps by stretching previous cues (NoEmpty)
+                # * If requested via options, stretch gaps via the NoEmpty path.
                 if bool(self._opts.get("no_empty", False)):
                     with contextlib.suppress(Exception):
                         srt_text = fill_empty_gaps_in_srt(srt_text)
@@ -2073,7 +2078,10 @@ class PipelineWorker(QObject):
                     inner_safe = max(1e-4, inner if inner > 0 else 0.0001)
                     est_total = elapsed / inner_safe
                     eta = max(0.0, est_total - elapsed)
-                    msg2 = f"[{job_index + 1}/{total}] {msg} (elapsed {_format_eta(elapsed)} • ETA {_format_eta(eta)})"
+                    msg2 = (
+                        f"[{job_index + 1}/{total}] {msg} "
+                        f"(elapsed {_format_eta(elapsed)} • ETA {_format_eta(eta)})"
+                    )
                     self._report(msg2, frac_overall)
                     if self._cancel:
                         # Raise cancel via dedicated helper to keep ruff satisfied
@@ -2098,7 +2106,8 @@ class PipelineWorker(QObject):
                     self._live_pipelines[job_index] = pl
                     with contextlib.suppress(Exception):
                         self.log.emit(
-                            f"Job start: idx={job_index} device={device} media={media.name}"
+                            f"Job start: idx={job_index} device={device} "
+                            f"media={media.name}"
                         )
                     cb = make_job_cb(job_index, time.time())
                     doc = pl.process(
@@ -2121,7 +2130,8 @@ class PipelineWorker(QObject):
                     with contextlib.suppress(Exception):
                         elapsed = max(0.0, time.time() - t_start)
                         self.log.emit(
-                            f"Job done: idx={job_index} device={device} media={media.name} elapsed={_format_eta(elapsed)}"
+                            f"Job done: idx={job_index} device={device} "
+                            f"media={media.name} elapsed={_format_eta(elapsed)}"
                         )
                     return media, local_outputs, view_text_local
                 finally:
@@ -2136,13 +2146,12 @@ class PipelineWorker(QObject):
                         if isinstance(pl, LocalPipeline) and pl is not self._pipeline:
                             wx = getattr(pl, "whisperx", None)
                             unload_fn = getattr(wx, "unload", None)
-                            if callable(unload_fn):
+                            if callable(unload_fn) and not self._closing:
                                 # Force full cleanup (sync + empty_cache) if canceling.
                                 # * Skip entirely if closing to let OS reclaim memory
                                 # * and avoid potential driver crashes at process exit.
-                                if not self._closing:
-                                    with self._cleanup_lock:
-                                        unload_fn(safe=not self._cancel)
+                                with self._cleanup_lock:
+                                    unload_fn(safe=not self._cancel)
                     except Exception as _unload_ex:  # noqa: BLE001
                         get_logger(__name__).debug(
                             "Unload cleanup ignored: %s", _unload_ex
@@ -2200,13 +2209,14 @@ class PipelineWorker(QObject):
                         idx += 1
                         with contextlib.suppress(Exception):
                             self.log.emit(
-                                f"Scheduled CPU (early): idx={idx} media={next_media0.name}"
+                                f"Scheduled CPU (early): idx={idx} "
+                                f"media={next_media0.name}"
                             )
 
                 while running:
                     if self._cancel:
                         was_canceled = True
-                        # Do not break here; keep draining running jobs without scheduling new ones
+                        # Keep draining running jobs without scheduling new ones.
                     done, _pending = wait(
                         list(running.keys()), return_when=FIRST_COMPLETED, timeout=0.5
                     )
@@ -2233,7 +2243,8 @@ class PipelineWorker(QObject):
                         except Exception as ex:  # noqa: BLE001
                             with contextlib.suppress(Exception):
                                 self.log.emit(
-                                    f"Job error: idx={job_index} media={media.name} ex={ex}"
+                                    f"Job error: idx={job_index} "
+                                    f"media={media.name} ex={ex}"
                                 )
                             self.log.emit(f"Skipping '{media}': {ex}")
                             completed_count += 1
@@ -2266,25 +2277,23 @@ class PipelineWorker(QObject):
                                     f"Scheduled CPU: idx={idx} media={next_media.name}"
                                 )
             finally:
-                # Always shutdown pool after draining. When canceled, we already avoided scheduling
-                # and drained running tasks above.
+                # Always shut down the pool after draining queued work.
                 with contextlib.suppress(Exception):
                     pool.shutdown(wait=True, cancel_futures=True)
 
             # Finalize
             if was_canceled or self._cancel:
-                # After cancel & drain, free base Whisper model (Good mode) to release VRAM
+                # After cancel and drain, free the base Whisper model.
                 with contextlib.suppress(Exception):
                     if isinstance(self._pipeline, LocalPipeline):
                         wxb = getattr(self._pipeline, "whisperx", None)
                         unload_b = getattr(wxb, "unload", None)
-                        if callable(unload_b):
+                        if callable(unload_b) and not self._closing:
                             # Force full cleanup (sync + empty_cache) on cancel.
                             # * Skip entirely if closing to let OS reclaim memory
                             # * and avoid potential driver crashes at process exit.
-                            if not self._closing:
-                                with self._cleanup_lock:
-                                    unload_b(safe=False)
+                            with self._cleanup_lock:
+                                unload_b(safe=False)
                 self._report("Canceled", min(0.99, completed_count / max(1, total)))
                 self.canceled.emit()
                 return
