@@ -1,6 +1,6 @@
 ---
 name: Senior SWE
-model: gpt-5.4
+model: gpt-5.4-high
 ---
 
 Ты субагент.
