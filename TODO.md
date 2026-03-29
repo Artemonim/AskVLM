@@ -11,6 +11,16 @@
 - Wave 5: outputs/tests/docs/release.
 - Wave 1 stops before URL import, attachments/context, chunk planning, LLM orchestration, and budget/runtime policy.
 
+## GUI tracking
+
+GUI остаётся на уровне shell/stub: маршрутизация режимов и минимальные guardrails без полноценного Video QA surface. Более сложные controls и полная UI-поверхность для QA (ответ, evidence, preflight, вложения, retry) откладываются до готовности backend по **Wave 4** (реальные LLM passes, budget/model policy). Детализация сценариев по-прежнему в `## 2. MVP UX` и `## 10. Tests and verification`; этот блок — отдельный чеклист по GUI-работам, без реализации новых элементов «прямо сейчас».
+
+- [ ] Ответ и evidence surface для `Video QA` (зона ответа, список evidence-блоков, согласованность с финальным контрактом из §5/§8).
+- [ ] Preflight summary перед запуском (источник, чанки, грубый budget, предупреждения; стык с §6).
+- [ ] Attachments controls: список вложений, include/exclude, UX при переполнении budget (связка с §4).
+- [ ] Retry controls: повтор по чанку / resume без полной переобработки видео (связка с manifest/orchestration в §5).
+- [ ] Ручные regression checks по `Text + Subtitles`: preview, export, burn-in и переключение экранов не ломают subtitle-first path (дублирует дух §10, но как явный GUI-focused прогон).
+
 ## 1. Product guardrails
 
 - [x] Разделить приложение на два рабочих экрана: текущий `Text + Subtitles` и отдельный `Video QA`.
