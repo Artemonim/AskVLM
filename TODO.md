@@ -73,7 +73,7 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 - [ ] Строить budget control на своём preflight и fallback, а server-side overflow policy использовать только после отдельной верификации.
 - [x] Ввести versioned JSON-manifest чанков: `schema_version`, `chunk_id`, `t_start`, `t_end`, кадры, артефакты, `status`, `attempts`, `error`.
 - [ ] Поддержать повторный запуск одного чанка и idempotent resume по manifest.
-- [ ] Зафиксировать контракт финального ответа: `answer`, `evidence[]`, таймкоды, цитаты транскрипта, ссылки на кадры, признак неопределённости.
+- [x] Зафиксировать контракт финального ответа: `answer`, `evidence[]`, таймкоды, цитаты транскрипта, ссылки на кадры, признак неопределённости.
 
 ## 6. Budgeting and runtime scheduling
 
@@ -96,9 +96,9 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 ## 8. Outputs and artifacts
 
 - [ ] Оставить текущие `TXT`/`SRT`/`VTT`/`JSON` экспортёры как базовый путь.
-- [ ] Для `Video QA` добавить machine-readable export ответа и evidence-списка.
-- [ ] Сохранять итоговый answer bundle рядом с manifest, чтобы можно было разбирать run post factum.
-- [ ] Для ответа по видео дать формат с цитатами, таймкодами и ссылками на кадры.
+- [x] Для `Video QA` добавить machine-readable export ответа и evidence-списка.
+- [x] Сохранять итоговый answer bundle рядом с manifest, чтобы можно было разбирать run post factum.
+- [x] Для ответа по видео дать формат с цитатами, таймкодами и ссылками на кадры.
 
 ## 9. Naming, legal and release prep
 
