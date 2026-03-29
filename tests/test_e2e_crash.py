@@ -142,7 +142,7 @@ def test_e2e_crash_scenarios(
 def test_close_event_respects_shutdown_result(
     qapp, qtbot, monkeypatch, shutdown_result, expected_accept
 ) -> None:
-    """closeEvent keeps the window open until shutdown completes."""
+    """CloseEvent keeps the window open until shutdown completes."""
     monkeypatch.setattr(MainWindow, "_load_settings", lambda self: None)
     monkeypatch.setattr(MainWindow, "_save_settings", lambda self: None)
 
@@ -172,7 +172,6 @@ def test_close_event_respects_shutdown_result(
     assert event.isAccepted() is expected_accept
     assert dummy_worker.closing is True
     assert cancel_calls == [True]
-
 
 
 if __name__ == "__main__":

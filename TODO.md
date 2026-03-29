@@ -93,6 +93,7 @@
 ## Phase 1.7: Simple GUI MVP (Quick Transcribe)
 
 -   [x] Runner flags for launch control (SkipLaunch, FastLaunch)
+    -   [x] `run.ps1` resolves the project root from its own location.
 -   [x] Minimal end-to-end GUI flow
     -   [x] `gui/main_window.py`: Quick Transcribe panel
         -   [x] Pick file OR folder; pick output dir (default: `transcriptions/`)

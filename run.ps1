@@ -37,6 +37,19 @@ function Show-Help {
 
 if ($Help) { Show-Help; exit 0 }
 
+# * Resolve the project root from the script location so the wrapper works
+# * even when it is launched from another working directory.
+$scriptRoot = if ($PSScriptRoot) {
+    $PSScriptRoot
+} else {
+    Split-Path -LiteralPath $MyInvocation.MyCommand.Path -Parent
+}
+$buildScript = Join-Path -Path $scriptRoot -ChildPath "build.ps1"
+if (-not (Test-Path -LiteralPath $buildScript)) {
+    Write-Error "Unable to locate build.ps1 next to run.ps1."
+    exit 1
+}
+
 # Forward known arguments to build.ps1
 $buildParams = @{}
 if ($Tool) { $buildParams['Tool'] = $Tool }
@@ -51,9 +64,18 @@ if ($FastLaunch) { $buildParams['FastLaunch'] = $true }
 $dashdashIndex = $args.IndexOf("--")
 if ($dashdashIndex -ge 0) {
     $forward = $args[($dashdashIndex + 1)..($args.Length - 1)]
-    # Pass explicit '--' so build.ps1 detects them correctly
-    & ./build.ps1 @buildParams -- $forward
-} else {
-    & ./build.ps1 @buildParams
 }
+
+Push-Location -LiteralPath $scriptRoot
+try {
+    if ($dashdashIndex -ge 0) {
+        # Pass explicit '--' so build.ps1 detects forwarded arguments correctly.
+        & $buildScript @buildParams -- $forward
+    } else {
+        & $buildScript @buildParams
+    }
+} finally {
+    Pop-Location
+}
+
 exit $LASTEXITCODE
