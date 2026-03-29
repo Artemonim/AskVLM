@@ -5,6 +5,7 @@ import os
 import re
 import signal
 import sys
+import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
@@ -709,20 +710,32 @@ class MainWindow(QMainWindow):
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.canceled.connect(self._thread.quit)
         self._worker.canceled.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._on_worker_thread_finished)
         self._thread.finished.connect(self._thread.deleteLater)
 
         self._thread.start()
 
     def request_cancel(self) -> None:
         """Request cancellation from the worker (best effort)."""
-        if self._worker is not None:
-            self._worker.request_cancel()
-            with contextlib.suppress(Exception):
-                get_logger(__name__).info("Cancel signal forwarded to worker")
-            self.status.showMessage("Cancel requested…")
-            self.btn_cancel.setEnabled(_UI_UNCHECKED)
+        worker = self._worker
+        if worker is not None:
+            try:
+                worker.request_cancel()
+            except RuntimeError:
+                # * Under some shutdown sequences the underlying C++ object
+                # * is already deleted by Qt; treat this as "already canceled".
+                get_logger(__name__).debug(
+                    "Worker object already deleted when requesting cancel",
+                )
+                self._worker = None
+            else:
+                with contextlib.suppress(Exception):
+                    get_logger(__name__).info("Cancel signal forwarded to worker")
+                self.status.showMessage("Cancel requested…")
+                self.btn_cancel.setEnabled(_UI_UNCHECKED)
         if isinstance(self._burn_worker, _InlineBurnWorker):
-            self._burn_worker.request_cancel()
+            with contextlib.suppress(RuntimeError):
+                self._burn_worker.request_cancel()
 
     def on_progress(self, frac: float, msg: str) -> None:
         """Update progress bar and status message."""
@@ -1195,27 +1208,89 @@ class MainWindow(QMainWindow):
         """Ensure we cancel background tasks and persist settings on close."""
         with contextlib.suppress(Exception):
             self._save_settings()
-        # Trigger global cancel
-        with contextlib.suppress(Exception):
+
+        should_close = True
+        # Trigger global cancel and wait for background work to finish
+        try:
+            if self._worker:
+                self._worker.set_closing()
             self.request_cancel()
             with contextlib.suppress(Exception):
                 get_logger(__name__).info("Application exit requested")
             # Stop spinner and wait for worker threads
-            self.await_worker_shutdown()
+            should_close = self.await_worker_shutdown(timeout_ms=30000)
+        except Exception:  # noqa: BLE001
+            # * Best-effort shutdown: if something unexpected happens, prefer exit
+            should_close = True
+
+        if not should_close:
+            # * Keep window open to avoid destroying running QThreads,
+            # * which would cause Qt to abort the process.
+            self.status.showMessage(
+                "Background tasks are still stopping; please wait…",
+            )
+            event.ignore()
+            return
+
         event.accept()
 
-    def await_worker_shutdown(self, timeout_ms: int = 10000) -> None:
-        """Stop spinner and await background worker threads termination."""
+    def _on_worker_thread_finished(self) -> None:
+        """Reset worker/thread references after background worker termination."""
+        self._worker = None
+        self._thread = None
+
+    def await_worker_shutdown(self, timeout_ms: int = 30000) -> bool:
+        """Stop spinner and await background worker threads termination.
+
+        Returns:
+            True if all known worker threads have stopped within the timeout,
+            False if any worker is still running.
+
+        """
         with contextlib.suppress(Exception):
             self._spinner_timer.stop()
-        # Give threads time to stop
-        if self._thread is not None and self._thread.isRunning():
-            self._thread.quit()
-            # Wait longer to let GPU job acknowledge cancel and free VRAM
-            self._thread.wait(timeout_ms)
-        if self._burn_thread is not None and self._burn_thread.isRunning():
-            self._burn_thread.quit()
-            self._burn_thread.wait(2000)
+
+        all_stopped = True
+
+        th = self._thread
+        if th is not None:
+            try:
+                if th.isRunning():
+                    th.quit()
+                    # Wait longer to let GPU job acknowledge cancel and free VRAM
+                    if not th.wait(timeout_ms):
+                        get_logger(__name__).warning(
+                            "Worker thread did not stop in %d ms",
+                            timeout_ms,
+                        )
+                        all_stopped = False
+                # Reset reference once the thread is no longer running
+                if not th.isRunning():
+                    self._thread = None
+            except RuntimeError:
+                # C++ object already deleted (e.g. via deleteLater)
+                get_logger(__name__).debug(
+                    "Worker thread object already deleted during shutdown",
+                )
+                self._thread = None
+
+        bth = self._burn_thread
+        if bth is not None:
+            try:
+                if bth.isRunning():
+                    bth.quit()
+                    if not bth.wait(2000):
+                        get_logger(__name__).warning(
+                            "Burn thread did not stop in %d ms",
+                            2000,
+                        )
+                        all_stopped = False
+                if not bth.isRunning():
+                    self._burn_thread = None
+            except RuntimeError:
+                self._burn_thread = None
+
+        return all_stopped
 
     # * Settings persistence
     def _load_settings(self) -> None:
@@ -1823,9 +1898,16 @@ class PipelineWorker(QObject):
         self._out_dir = out_dir
         self._opts = options
         self._cancel = False
+        self._closing = False
         # Track live LocalPipeline instances per job index to allow best-effort
         # resource release on user cancellation.
         self._live_pipelines: dict[int, object] = {}
+        # Serializer for heavy CUDA cleanup operations to prevent race conditions
+        self._cleanup_lock = threading.Lock()
+
+    def set_closing(self) -> None:
+        """Mark the worker as closing to skip aggressive resource cleanup."""
+        self._closing = True
 
     def request_cancel(self) -> None:
         """Request cancellation of processing."""
@@ -2055,7 +2137,12 @@ class PipelineWorker(QObject):
                             wx = getattr(pl, "whisperx", None)
                             unload_fn = getattr(wx, "unload", None)
                             if callable(unload_fn):
-                                unload_fn()
+                                # Force full cleanup (sync + empty_cache) if canceling.
+                                # * Skip entirely if closing to let OS reclaim memory
+                                # * and avoid potential driver crashes at process exit.
+                                if not self._closing:
+                                    with self._cleanup_lock:
+                                        unload_fn(safe=not self._cancel)
                     except Exception as _unload_ex:  # noqa: BLE001
                         get_logger(__name__).debug(
                             "Unload cleanup ignored: %s", _unload_ex
@@ -2192,7 +2279,12 @@ class PipelineWorker(QObject):
                         wxb = getattr(self._pipeline, "whisperx", None)
                         unload_b = getattr(wxb, "unload", None)
                         if callable(unload_b):
-                            unload_b()
+                            # Force full cleanup (sync + empty_cache) on cancel.
+                            # * Skip entirely if closing to let OS reclaim memory
+                            # * and avoid potential driver crashes at process exit.
+                            if not self._closing:
+                                with self._cleanup_lock:
+                                    unload_b(safe=False)
                 self._report("Canceled", min(0.99, completed_count / max(1, total)))
                 self.canceled.emit()
                 return
