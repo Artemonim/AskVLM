@@ -61,7 +61,7 @@
 - [ ] Явно описать overflow policy: сначала уменьшать число кадров, потом разрешение, потом дробить текст/чанк.
 - [ ] Проверить фактическое поведение LM Studio при переполнении контекста: ошибка, partial output, `stopReason` или silent truncation.
 - [ ] Строить budget control на своём preflight и fallback, а server-side overflow policy использовать только после отдельной верификации.
-- [ ] Ввести versioned JSON-manifest чанков: `schema_version`, `chunk_id`, `t_start`, `t_end`, кадры, артефакты, `status`, `attempts`, `error`.
+- [x] Ввести versioned JSON-manifest чанков: `schema_version`, `chunk_id`, `t_start`, `t_end`, кадры, артефакты, `status`, `attempts`, `error`.
 - [ ] Поддержать повторный запуск одного чанка и idempotent resume по manifest.
 - [ ] Зафиксировать контракт финального ответа: `answer`, `evidence[]`, таймкоды, цитаты транскрипта, ссылки на кадры, признак неопределённости.
 
@@ -92,9 +92,9 @@
 
 ## 9. Naming, legal and release prep
 
-- [ ] Зафиксировать `AskVLM` как canonical product name в GUI, CLI, build/help-текстах, metadata и документации.
-- [ ] Найти и обновить legacy-упоминания `Artemonim's Speech Kit` и старые абсолютные пути в коде и документации.
-- [ ] Продумать миграцию `QSettings`, session keys и exporter metadata со старых идентификаторов на `AskVLM`, не ломая прошлые сессии пользователей.
+- [x] Зафиксировать `AskVLM` как canonical product name в GUI, CLI, build/help-текстах, metadata и документации.
+- [x] Найти и обновить legacy-упоминания старого бренда приложения и старые абсолютные пути в коде и документации.
+- [x] Перевести `QSettings`, session keys и exporter metadata на `AskVLM` без legacy compatibility branches и fallback-парсинга.
 - [ ] Подготовить MIT readiness checklist: лицензии зависимостей, бинарей, model weights и вспомогательных инструментов.
 - [ ] До внедрения URL import проверить не только лицензии, но и ToS/redistributability для конкретных source adapters.
 - [ ] Решить, какие external tools поставляются вместе с приложением, а какие пользователь устанавливает отдельно.

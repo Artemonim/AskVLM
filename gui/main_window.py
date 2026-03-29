@@ -69,12 +69,12 @@ from gui.video_qa import VideoQAPanel
 from gui.wysiwyg_editor import TableRow, WysiwygEditor
 from utils.exporters import (
     SubtitleRules,
-    append_ask_metadata_to_srt,
+    append_askvlm_metadata_to_srt,
     export_document,
     export_srt_with_rules,
-    extract_ask_metadata_from_srt,
+    extract_askvlm_metadata_from_srt,
     fill_empty_gaps_in_srt,
-    strip_ask_meta_from_srt,
+    strip_askvlm_metadata_from_srt,
 )
 from utils.logging import get_logger, setup_logging
 
@@ -880,8 +880,8 @@ class MainWindow(QMainWindow):
             except OSError as exc:
                 get_logger(__name__).debug("Failed to read SRT '%s': %s", p, exc)
                 content = ""
-            # Strip ASK metadata lines/cues from viewer text
-            content2 = strip_ask_meta_from_srt(content)
+            # * Strip AskVLM metadata lines from viewer text.
+            content2 = strip_askvlm_metadata_from_srt(content)
             self._add_tab(p.stem, content2, self._find_input_media_by_stem(p.stem))
             return
         if view_text:
@@ -900,8 +900,8 @@ class MainWindow(QMainWindow):
             except OSError as exc:
                 get_logger(__name__).debug("Failed to read output '%s': %s", p, exc)
                 content = ""
-            # Strip ASK metadata lines/cues from viewer text
-            content2 = strip_ask_meta_from_srt(content)
+            # * Strip AskVLM metadata lines from viewer text.
+            content2 = strip_askvlm_metadata_from_srt(content)
             self._add_tab(p.stem, content2, self._find_input_media_by_stem(p.stem))
 
     def _remove_placeholder_document_tab_if_present(self) -> None:
@@ -946,9 +946,9 @@ class MainWindow(QMainWindow):
                 max_lines=int(self.spin_max_lines.value()),
             )
             srt_text = export_srt_with_rules(doc, rules)
-            srt_text = append_ask_metadata_to_srt(
+            srt_text = append_askvlm_metadata_to_srt(
                 srt_text,
-                tool_name="Artemonim's Speech Kit",
+                tool_name="AskVLM",
                 quality=str(self._quality_mode),
                 completed=True,
             )
@@ -1101,11 +1101,7 @@ class MainWindow(QMainWindow):
                 content = srt.read_text(encoding="utf-8")
             except OSError:
                 return
-            content2 = "\n".join(
-                line
-                for line in content.splitlines()
-                if not line.startswith("# ASK_META:")
-            )
+            content2 = strip_askvlm_metadata_from_srt(content)
             self._add_tab(srt.stem, content2, self._find_input_media_by_stem(p.stem))
 
     def _close_orphan_tabs(self) -> None:
@@ -1303,7 +1299,7 @@ class MainWindow(QMainWindow):
 
     # * Settings persistence
     def _load_settings(self) -> None:
-        s = QSettings("Artemonim", "SpeechKit")
+        s = QSettings("AskVLM", "AskVLM")
         # Window geometry/state
         geo = s.value("ui/window_geometry", None)
         if isinstance(geo, QByteArray):
@@ -1355,7 +1351,7 @@ class MainWindow(QMainWindow):
         self.spin_max_lines.setValue(max(1, min(3, mlines)))
 
     def _save_settings(self) -> None:
-        s = QSettings("Artemonim", "SpeechKit")
+        s = QSettings("AskVLM", "AskVLM")
         # Window geometry/state
         s.setValue("ui/window_geometry", self.saveGeometry())
         s.setValue("ui/window_state", self.saveState())
@@ -1460,7 +1456,7 @@ class MainWindow(QMainWindow):
             self.sidebar.record_usage(title, sp)
         # Restore column widths if saved
         with contextlib.suppress(Exception):
-            s = QSettings("Artemonim", "SpeechKit")
+            s = QSettings("AskVLM", "AskVLM")
             w0_val: object = s.value("ui/table_time_width", 0, type=int)
             w1_val: object = s.value("ui/table_speaker_width", 0, type=int)
             w2_val: object = s.value("ui/table_text_width", 0, type=int)
@@ -1507,7 +1503,7 @@ class MainWindow(QMainWindow):
     def _save_table_widths(self, editor: WysiwygEditor) -> None:
         """Persist current table column widths to QSettings."""
         with contextlib.suppress(Exception):
-            s = QSettings("Artemonim", "SpeechKit")
+            s = QSettings("AskVLM", "AskVLM")
             s.setValue("ui/table_time_width", int(editor.columnWidth(0)))
             s.setValue("ui/table_speaker_width", int(editor.columnWidth(1)))
             s.setValue("ui/table_text_width", int(editor.columnWidth(2)))
@@ -1739,9 +1735,9 @@ class MainWindow(QMainWindow):
                 txt = srt.read_text(encoding="utf-8")
             except OSError:
                 continue
-            meta = extract_ask_metadata_from_srt(txt) or {}
+            meta = extract_askvlm_metadata_from_srt(txt) or {}
             if isinstance(meta, dict):
-                if str(meta.get("tool", "")) != "Artemonim's Speech Kit" or not bool(
+                if str(meta.get("tool", "")) != "AskVLM" or not bool(
                     meta.get("completed", False)
                 ):
                     pass
@@ -1995,12 +1991,12 @@ class PipelineWorker(QObject):
                 ml_val2 = int(ml_obj2) if isinstance(ml_obj2, (int, str)) else 2
                 rules = SubtitleRules(max_line_chars=lw_val2, max_lines=ml_val2)
                 srt_text = export_srt_with_rules(doc, rules)
-                # Append ASK metadata so the status scan can detect quality.
+                # * Append AskVLM metadata so the status scan can detect quality.
                 qual = str(self._opts.get("quality", "")).lower() or None
                 if qual in {"fast", "good"}:
-                    srt_text = append_ask_metadata_to_srt(
+                    srt_text = append_askvlm_metadata_to_srt(
                         srt_text,
-                        tool_name="Artemonim's Speech Kit",
+                        tool_name="AskVLM",
                         quality=qual,
                         completed=True,
                     )

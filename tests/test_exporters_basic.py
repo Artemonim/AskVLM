@@ -106,16 +106,17 @@ def test_fill_empty_gaps_in_srt_adjusts_end_times() -> None:
 
 
 def test_metadata_append_extract_and_strip() -> None:
-    """ASK metadata helpers append, extract and strip correctly."""
+    """AskVLM metadata helpers append, extract and strip correctly."""
     base = "1\n00:00:00,000 --> 00:00:01,000\nHello\n\n"
-    with_meta = ex.append_ask_metadata_to_srt(
-        base, tool_name="ASK", quality="fast", completed=True
+    with_meta = ex.append_askvlm_metadata_to_srt(
+        base, tool_name="AskVLM", quality="fast", completed=True
     )
-    meta = ex.extract_ask_metadata_from_srt(with_meta)
+    assert ex.ASKVLM_META_PREFIX in with_meta
+    meta = ex.extract_askvlm_metadata_from_srt(with_meta)
     assert meta
-    assert meta.get("tool") == "ASK"
+    assert meta.get("tool") == "AskVLM"
     assert meta.get("completed") is True
-    stripped = ex.strip_ask_meta_from_srt(with_meta)
+    stripped = ex.strip_askvlm_metadata_from_srt(with_meta)
     assert stripped.strip().endswith("Hello")
 
 

@@ -183,7 +183,7 @@ class FileOutcome:
 
 def _make_worker(model_name: str, device: str, compute_type: str) -> WhisperXWrapper:
     # * Test hook: allow fake lightweight worker via env var to avoid heavy model loads
-    if os.getenv("SPEECHKIT_BENCH_FAKE", "0") == "1":
+    if os.getenv("ASKVLM_BENCH_FAKE", "0") == "1":
         class _Fake:
             def transcribe(self, wav_path: Path) -> dict:
                 # * Return deterministic short text
@@ -202,7 +202,7 @@ def _transcribe_one(
 ) -> FileOutcome:
     t0 = time.perf_counter()
     # * If running in fake mode, skip actual audio prep
-    if os.getenv("SPEECHKIT_BENCH_FAKE", "0") == "1":
+    if os.getenv("ASKVLM_BENCH_FAKE", "0") == "1":
         res = worker.transcribe(media)
     else:
         wav = prepare_audio(media, work_dir)

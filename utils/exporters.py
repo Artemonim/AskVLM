@@ -320,25 +320,25 @@ def export_document(doc: Document, fmt: str, out_path: Path) -> Path:
     return out_path
 
 
-# * Metadata helpers for SRT sidecar inside file
-ASK_META_PREFIX = "# ASK_META: "
+# * Metadata helpers for AskVLM SRT sidecar inside file
+ASKVLM_META_PREFIX = "# ASKVLM_META: "
 
 
-def append_ask_metadata_to_srt(
+def append_askvlm_metadata_to_srt(
     srt_text: str,
     *,
     tool_name: str,
     quality: str | None = None,
     completed: bool | None = None,
 ) -> str:
-    """Append ASK metadata lines to the end of an SRT string.
+    """Append AskVLM metadata lines to the end of an SRT string.
 
     The metadata is appended after a trailing blank line using a single line
     starting with a stable prefix so other tools ignore it safely.
 
     Args:
         srt_text: Existing SRT contents.
-        tool_name: Name of the producing tool (e.g., "Artemonim's Speech Kit").
+        tool_name: Name of the producing tool (for example, "AskVLM").
         quality: Optional quality marker: "fast" | "good".
         completed: Optional completion flag.
 
@@ -351,14 +351,14 @@ def append_ask_metadata_to_srt(
         payload["quality"] = str(quality)
     if completed is not None:
         payload["completed"] = bool(completed)
-    meta_line = ASK_META_PREFIX + json.dumps(payload, ensure_ascii=False)
+    meta_line = ASKVLM_META_PREFIX + json.dumps(payload, ensure_ascii=False)
     if not srt_text.endswith("\n"):
         srt_text += "\n"
     return srt_text + meta_line + "\n"
 
 
-def extract_ask_metadata_from_srt(srt_text: str) -> dict[str, Any] | None:
-    """Extract ASK metadata payload from an SRT string if present.
+def extract_askvlm_metadata_from_srt(srt_text: str) -> dict[str, Any] | None:
+    """Extract AskVLM metadata payload from an SRT string if present.
 
     The function searches for the last line starting with the fixed
     prefix and parses the JSON that follows.
@@ -371,40 +371,24 @@ def extract_ask_metadata_from_srt(srt_text: str) -> dict[str, Any] | None:
 
     """
     try:
-        # 1) Prefer explicit comment prefix (# ASK_META: {...})
         for line in reversed(srt_text.splitlines()):
-            if line.startswith(ASK_META_PREFIX):
-                raw = line[len(ASK_META_PREFIX) :].strip()
+            if line.startswith(ASKVLM_META_PREFIX):
+                raw = line[len(ASKVLM_META_PREFIX) :].strip()
                 data = json.loads(raw)
                 if isinstance(data, dict):
                     return data
                 return None
-        # 2) Fallback: look for a JSON payload on the last non-empty line (subtitle cue)
-        for line in reversed(srt_text.splitlines()):
-            s = line.strip()
-            if not s:
-                continue
-            if s.startswith("{") and s.endswith("}"):
-                try:
-                    data = json.loads(s)
-                    if isinstance(data, dict) and "tool" in data:
-                        return data
-                except json.JSONDecodeError:
-                    pass
-            # stop after encountering a non-empty non-json line
-            break
     except (ValueError, OSError):
         return None
     return None
 
 
-def strip_ask_meta_from_srt(srt_text: str) -> str:
-    """Return SRT text with ASK metadata lines/cues removed.
+def strip_askvlm_metadata_from_srt(srt_text: str) -> str:
+    """Return SRT text with AskVLM metadata lines removed.
 
-    Removes both comment-style metadata lines starting with the stable
-    prefix ("# ASK_META:") and any standalone JSON object lines that
-    parse to a dict containing a "tool" key. This is safe for displaying
-    inside the editor/viewer and avoids treating metadata as subtitle text.
+    Removes comment-style metadata lines starting with the stable
+    prefix ("# ASKVLM_META:"). This is safe for displaying inside the
+    editor/viewer and avoids treating metadata as subtitle text.
     """
     out_lines: list[str] = []
     for line in srt_text.splitlines():
@@ -412,16 +396,7 @@ def strip_ask_meta_from_srt(srt_text: str) -> str:
         if not s:
             out_lines.append(line)
             continue
-        if s.startswith(ASK_META_PREFIX):
-            # skip comment metadata
+        if s.startswith(ASKVLM_META_PREFIX):
             continue
-        if s.startswith("{") and s.endswith("}"):
-            try:
-                data = json.loads(s)
-                if isinstance(data, dict) and "tool" in data:
-                    # skip standalone JSON meta cue
-                    continue
-            except json.JSONDecodeError:
-                pass
         out_lines.append(line)
     return "\n".join(out_lines) + ("\n" if srt_text.endswith("\n") else "")

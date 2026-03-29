@@ -7,11 +7,12 @@ from PySide6.QtWidgets import QApplication, QTableWidgetItem
 from editing.text_model import Document, TextSegment
 from gui.main_window import MainWindow, PipelineWorker
 from utils.exporters import (
+    ASKVLM_META_PREFIX,
     SubtitleRules,
-    append_ask_metadata_to_srt,
+    append_askvlm_metadata_to_srt,
     export_srt_with_rules,
-    extract_ask_metadata_from_srt,
-    strip_ask_meta_from_srt,
+    extract_askvlm_metadata_from_srt,
+    strip_askvlm_metadata_from_srt,
 )
 
 if TYPE_CHECKING:
@@ -19,22 +20,23 @@ if TYPE_CHECKING:
 
 
 def test_srt_metadata_round_trip() -> None:
-    """Append/extract ASK metadata round trip is consistent."""
+    """Append/extract AskVLM metadata round trip is consistent."""
     # Ensure Qt exists for potential GUI interactions later
     QApplication.instance() or QApplication([])
 
     doc = Document()
     doc.add_segment(TextSegment("speaker_1", 0.0, 1.0, "hello world"))
     srt = export_srt_with_rules(doc, SubtitleRules(max_line_chars=20, max_lines=2))
-    with_meta = append_ask_metadata_to_srt(
+    with_meta = append_askvlm_metadata_to_srt(
         srt,
-        tool_name="Artemonim's Speech Kit",
+        tool_name="AskVLM",
         quality="fast",
         completed=True,
     )
-    meta = extract_ask_metadata_from_srt(with_meta)
+    assert ASKVLM_META_PREFIX in with_meta
+    meta = extract_askvlm_metadata_from_srt(with_meta)
     assert isinstance(meta, dict)
-    assert meta.get("tool") == "Artemonim's Speech Kit"
+    assert meta.get("tool") == "AskVLM"
     assert meta.get("quality") == "fast"
     assert meta.get("completed") is True
 
@@ -68,8 +70,8 @@ def test_input_status_scan_sets_icons(tmp_path: Path) -> None:
         d = Document()
         d.add_segment(TextSegment("speaker_1", 0.0, 1.0, f"{stem}"))
         txt = export_srt_with_rules(d, SubtitleRules())
-        txt = append_ask_metadata_to_srt(
-            txt, tool_name="Artemonim's Speech Kit", quality=quality, completed=True
+        txt = append_askvlm_metadata_to_srt(
+            txt, tool_name="AskVLM", quality=quality, completed=True
         )
         (tmp_path / f"{stem}.srt").write_text(txt, encoding="utf-8")
 
@@ -88,7 +90,7 @@ def test_input_status_scan_sets_icons(tmp_path: Path) -> None:
 
 
 def test_pipeline_appends_ask_metadata_and_scan(tmp_path: Path) -> None:
-    """Pipeline exports SRT with ASK meta and scanner detects quality."""
+    """Pipeline exports SRT with AskVLM metadata and scanner detects quality."""
     # Ensure Qt exists
     QApplication.instance() or QApplication([])
 
@@ -122,9 +124,9 @@ def test_pipeline_appends_ask_metadata_and_scan(tmp_path: Path) -> None:
 
     srt_path = tmp_path / "pipe_input.srt"
     assert srt_path.exists()
-    meta = extract_ask_metadata_from_srt(srt_path.read_text(encoding="utf-8"))
+    meta = extract_askvlm_metadata_from_srt(srt_path.read_text(encoding="utf-8"))
     assert isinstance(meta, dict)
-    assert meta.get("tool") == "Artemonim's Speech Kit"
+    assert meta.get("tool") == "AskVLM"
     assert meta.get("quality") == "fast"
     assert meta.get("completed") is True
 
@@ -138,8 +140,8 @@ def test_pipeline_appends_ask_metadata_and_scan(tmp_path: Path) -> None:
     assert w._get_input_status(media) == "fast"  # noqa: SLF001
 
 
-def test_viewer_strips_meta_cue_and_comment(tmp_path: Path) -> None:
-    """Viewer text strips JSON meta cue and comment meta lines safely."""
+def test_viewer_strips_askvlm_meta_comment(tmp_path: Path) -> None:
+    """Viewer text strips AskVLM metadata comment lines safely."""
     srt = """1
 00:00:00,000 --> 00:00:01,000
 Hello
@@ -148,12 +150,9 @@ Hello
 00:00:02,000 --> 00:00:03,000
 World
 
-{\"tool\": \"Artemonim's Speech Kit\", \"quality\": \"fast\", \"completed\": true}
-# ASK_META: {"tool": "Artemonim's Speech Kit", "quality": "fast", "completed": true}
+# ASKVLM_META: {"tool": "AskVLM", "quality": "fast", "completed": true}
 """
-    stripped = strip_ask_meta_from_srt(srt)
-    # Should not contain JSON metadata nor comment meta line
-    assert "Artemonim's Speech Kit" not in stripped
-    # Should preserve the original cues
+    stripped = strip_askvlm_metadata_from_srt(srt)
+    assert ASKVLM_META_PREFIX not in stripped
     assert "Hello" in stripped
     assert "World" in stripped
