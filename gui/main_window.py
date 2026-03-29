@@ -23,7 +23,6 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtGui import (
-    QAction,
     QDesktopServices,
     QFont,
     QFontDatabase,
@@ -66,6 +65,7 @@ from core.whisperx_wrapper import WhisperXWrapper
 from editing.text_model import Document, TextSegment
 from gui.speaker_sidebar import SpeakerSidebar
 from gui.subtitle_preview import SubtitlePreview
+from gui.video_qa import VideoQAPanel
 from gui.wysiwyg_editor import TableRow, WysiwygEditor
 from utils.exporters import (
     SubtitleRules,
@@ -253,12 +253,14 @@ class CancelledByUserError(Exception):
     """Raised internally to abort processing when user requests cancel."""
 
 
-# * Main window for Artemonim's Speech Kit GUI
+# * Main window for AskVLM GUI
 class MainWindow(QMainWindow):
     """Application main window with Quick Transcribe controls and text viewer."""
 
     # * Constants
     MAX_SPEAKER_LEN = 64
+    SHELL_SCREEN_TEXT = "text_subtitles"
+    SHELL_SCREEN_VIDEO_QA = "video_qa"
 
     def _can_show_modal(self) -> bool:
         """Return True if it is safe to show modal dialogs (not under pytest/CI)."""
@@ -273,27 +275,28 @@ class MainWindow(QMainWindow):
         with contextlib.suppress(Exception):
             setup_logging()
         get_logger(__name__).info("MainWindow initializing")
-        self.setWindowTitle("Artemonim's Speech Kit")
+        self.setWindowTitle("AskVLM")
         self.resize(800, 600)
-
-        # * Menu bar setup
-        menu_bar = self.menuBar()
-        file_menu = menu_bar.addMenu("File")
-
-        open_action = QAction("Open...", self)
-        open_action.triggered.connect(self.choose_file)
-        file_menu.addAction(open_action)
-
-        exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
+        # * Hide the native menu bar so mode tabs sit directly under the title bar.
+        self.menuBar().setVisible(False)
 
         # * Central widget and main vertical layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
+        shell_layout = QVBoxLayout(central_widget)
 
-        # (Removed legacy top input row; input management lives in the Input tab)
+        # * Top-level shell keeps Text + Subtitles separated from Video QA
+        self.shell_tabs = QTabWidget()
+        shell_layout.addWidget(self.shell_tabs, 1)
+
+        workspace_tab = QWidget()
+        workspace_layout = QVBoxLayout(workspace_tab)
+        self.shell_tabs.addTab(workspace_tab, "Text + Subtitles")
+
+        self.video_qa_panel = VideoQAPanel()
+        self.shell_tabs.addTab(self.video_qa_panel, "Video QA")
+
+        layout = workspace_layout
 
         # * Output directory row
         out_row = QHBoxLayout()
@@ -1130,8 +1133,14 @@ class MainWindow(QMainWindow):
 
     def start_burn(self) -> None:
         """Start burn-in process for selected inputs using burn settings."""
-        if not self.input_path or self.input_mode not in {"file", "folder"}:
-            QMessageBox.information(self, "No input", "Please choose a file or folder.")
+        burn_video_exts = {".mp4", ".mov", ".mkv", ".avi"}
+        gathered = self._gather_inputs()
+        if not gathered:
+            QMessageBox.information(
+                self,
+                "No input",
+                "Add at least one file or folder in the Input tab before burning subtitles.",
+            )
             return
         if not self._has_transcript:
             QMessageBox.information(self, "No transcript", "Please transcribe first.")
@@ -1139,20 +1148,15 @@ class MainWindow(QMainWindow):
         out_dir = Path(self.out_dir_edit.text()).resolve()
         normalize = self.chk_normalize.isChecked()
         font_name = self.font_combo.currentText().strip() or None
-        # Build inputs list (videos only)
-        if self.input_mode == "file":
-            inputs = (
-                [self.input_path]
-                if self.input_path.suffix.lower() in {".mp4", ".mov", ".mkv", ".avi"}
-                else []
-            )
-        else:
-            patterns = ["*.mp4", "*.mov", "*.mkv", "*.avi"]
-            inputs = []
-            for pat in patterns:
-                inputs.extend(Path(self.input_path).glob(pat))
+        inputs = [
+            p for p in gathered if p.is_file() and p.suffix.lower() in burn_video_exts
+        ]
         if not inputs:
-            QMessageBox.information(self, "No video", "No video files found to burn.")
+            QMessageBox.information(
+                self,
+                "No video",
+                "No video files (.mp4, .mov, .mkv, .avi) found among the Input tab entries.",
+            )
             return
         # Start burn worker thread
         if self._burn_thread is not None:
@@ -1315,6 +1319,11 @@ class MainWindow(QMainWindow):
             with contextlib.suppress(Exception):
                 self.splitter.restoreState(sp)
 
+        shell_screen = str(s.value("ui/shell_screen", self.SHELL_SCREEN_TEXT))
+        self._set_shell_screen(shell_screen)
+        self.video_qa_panel.set_source_path(str(s.value("videoqa/source_path", "")))
+        self.video_qa_panel.set_question_text(str(s.value("videoqa/question", "")))
+
         self.chk_diar.setChecked(bool(s.value("opts/diar", type=bool)))
         self.chk_dialog.setChecked(bool(s.value("opts/dialog", type=bool)))
         self.chk_save_srt.setChecked(bool(s.value("opts/save_srt", 1, type=bool)))
@@ -1362,9 +1371,28 @@ class MainWindow(QMainWindow):
         s.setValue("paths/last_input_dir", str(self.last_input_dir))
         s.setValue("burn/normalize", self.chk_normalize.isChecked())
         s.setValue("burn/font", self.font_combo.currentText())
+        s.setValue("ui/shell_screen", self._shell_screen_key())
+        source_path = self.video_qa_panel.source_path()
+        if source_path is None:
+            s.remove("videoqa/source_path")
+        else:
+            s.setValue("videoqa/source_path", str(source_path))
+        s.setValue("videoqa/question", self.video_qa_panel.question_text())
         # Phase 1.81
         s.setValue("subs/max_line_chars", int(self.spin_line_len.value()))
         s.setValue("subs/max_lines", int(self.spin_max_lines.value()))
+
+    def _shell_screen_key(self) -> str:
+        """Return the current top-level shell key."""
+        if self.shell_tabs.currentIndex() == 1:
+            return self.SHELL_SCREEN_VIDEO_QA
+        return self.SHELL_SCREEN_TEXT
+
+    def _set_shell_screen(self, screen: str) -> None:
+        """Select the top-level shell tab from a persisted key."""
+        idx = 1 if screen == self.SHELL_SCREEN_VIDEO_QA else 0
+        if 0 <= idx < self.shell_tabs.count():
+            self.shell_tabs.setCurrentIndex(idx)
 
     # * Tabs helpers
     def _clear_tabs(self) -> None:

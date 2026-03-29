@@ -2,20 +2,29 @@
 
 Статус: базовая транскрипция, субтитры, preview, export и burn-in уже есть и считаются стабильной базой. Следующий этап: превратить приложение в мультимодальный desktop-инструмент, где пользователь подаёт видео, формулирует задачу и получает grounded-ответ от LLM без поломки subtitle-first workflow.
 
+## Wave plan
+
+- Wave 1: GUI shell + guardrails + minimal `LocalFile` provider. Subtitle-first `preview/export/burn-in` remains the stable base and is not mixed with `Video QA`.
+- Wave 2: attachments/context + provider contract + URL import policy + early naming/legal slice.
+- Wave 3: graph/manifest/schema/preparation only.
+- Wave 4: real LLM passes + budget/model policy + LM Studio.
+- Wave 5: outputs/tests/docs/release.
+- Wave 1 stops before URL import, attachments/context, chunk planning, LLM orchestration, and budget/runtime policy.
+
 ## 1. Product guardrails
 
-- [ ] Разделить приложение на два рабочих экрана: текущий `Text + Subtitles` и отдельный `Video QA`.
-- [ ] Не ломать текущий subtitle preview / export / burn-in path при добавлении `Video QA`.
+- [x] Разделить приложение на два рабочих экрана: текущий `Text + Subtitles` и отдельный `Video QA`.
+- [x] Не ломать текущий subtitle preview / export / burn-in path при добавлении `Video QA`.
 - [ ] Держать один главный сценарий UX: `video source -> task -> optional attachments -> grounded answer`.
-- [ ] Считать локальный файл базовым источником входа; URL-источники должны быть надстройкой, а не новым ядром pipeline.
+- [x] Считать локальный файл базовым источником входа; URL-источники должны быть надстройкой, а не новым ядром pipeline.
 - [ ] Считать это двумя сервисами в одном приложении: общий shell, но разные экраны, результаты и сценарии запуска.
 
 ## 2. MVP UX
 
-- [ ] Оставить текущий экран как workspace для `Text + Subtitles`, не смешивая его с `Video QA`.
-- [ ] Сделать отдельный экран `Video QA` со своим layout и своей зоной результата.
+- [x] Оставить текущий экран как workspace для `Text + Subtitles`, не смешивая его с `Video QA`.
+- [x] Сделать отдельный экран `Video QA` со своим layout и своей зоной результата.
 - [ ] При старте приложения спрашивать, какой экран открыть, либо восстанавливать экран прошлой сессии.
-- [ ] Сохранять последний выбранный экран в settings и добавлять явный переключатель экрана внутри приложения.
+- [x] Сохранять последний выбранный экран в settings и добавлять явный переключатель экрана внутри приложения.
 - [ ] Для `Video QA` добавить поле задания, отдельную область ответа и список evidence-блоков.
 - [ ] Добавить секцию вложений к заданию: `txt`, `md`, кодовые файлы, `jpg`/`jpeg`, `png`, `webp`.
 - [ ] Показать preflight перед запуском: источник, число чанков, примерный бюджет контекста, предупреждения.
@@ -25,7 +34,7 @@
 ## 3. Input providers and source acquisition
 
 - [ ] Ввести контракт `input provider`: любой источник обязан резолвиться в локальный путь к медиа и метаданные.
-- [ ] Реализовать `LocalFile` как основной и самый надёжный provider для MVP.
+- [x] Реализовать `LocalFile` как основной и самый надёжный provider для MVP.
 - [ ] Добавить опциональный URL import stage как отдельный provider, не вшивая загрузчик в orchestrator.
 - [ ] Рассмотреть `yt-dlp`-класс инструментов как external optional dependency, а не как жёстко встроенную часть приложения.
 - [ ] Поддержать YouTube URL как первый experimental provider после `LocalFile`.
