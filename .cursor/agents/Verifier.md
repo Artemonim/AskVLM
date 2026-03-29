@@ -1,6 +1,6 @@
 ---
 name: Verifier
-model: composer-2
+model: composer-2-fast
 description: Можешь запустить в конце работы над задачей для верификации спецификации.
 readonly: true
 ---
