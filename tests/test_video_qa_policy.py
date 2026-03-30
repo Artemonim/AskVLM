@@ -78,5 +78,6 @@ def test_temp_file_policy_description_is_meaningful() -> None:
     text = VideoQAUrlImportPolicy().temp_file_policy_description()
     assert isinstance(text, str)
     assert len(text.strip()) > 0
-    assert "temporary" in text.lower()
-    assert "staged" in text.lower() or "ingestion" in text.lower()
+    assert "staged" in text.lower() or "staging" in text.lower()
+    assert "cleanup" in text.lower()
+    assert "explicit" in text.lower()

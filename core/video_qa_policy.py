@@ -54,8 +54,10 @@ class VideoQAUrlImportPolicy:
     def temp_file_policy_description(self) -> str:
         """Describe how temporary files are handled during URL import."""
         return (
-            "Remote media is staged in a temporary file outside the orchestrator "
-            "and removed after ingestion when the import completes."
+            "Remote media is staged explicitly in a dedicated directory outside the "
+            "orchestrator; callers remove that staging directory via an explicit cleanup "
+            "step when the file is no longer needed (nothing is deleted implicitly by the "
+            "import helper alone)."
         )
 
 

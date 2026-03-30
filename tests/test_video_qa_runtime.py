@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from core.video_qa_context import VideoQAAttachmentRequest, normalize_video_qa_context
 from core.video_qa_runtime import (
+    TextTokenCounterKind,
     VideoQABudgetPolicy,
     build_video_qa_budget_estimate,
+    build_video_qa_runtime_summary,
     default_video_qa_budget_policy,
     default_video_qa_runtime_policy,
+    default_video_qa_runtime_scheduler,
+    default_video_qa_target_model_profile,
 )
 from core.video_qa_sources import LocalFileProvider
 
@@ -22,7 +27,81 @@ def test_runtime_policy_defaults_to_single_active_model() -> None:
     assert policy.max_active_heavy_models == 1
     assert policy.allow_parallel_inference is False
     assert policy.serialize_model_heavy_steps is True
+    assert policy.offload_to_ram_before_unload is True
+    assert policy.execution_order == ("active", "offload_to_ram", "unload")
     assert "8 GB VRAM / 64 GB RAM" in policy.summary()
+
+
+def test_runtime_scheduler_single_heavy_model_and_lifecycle_order() -> None:
+    """Scheduler exposes one active heavy model and fixed RAM offload order."""
+    sched = default_video_qa_runtime_scheduler()
+
+    assert sched.max_concurrent_active_heavy_models == 1
+    assert sched.parallel_inference_enabled is False
+    assert sched.single_active_heavy_model_holds() is True
+    assert sched.heavy_model_lifecycle_order() == (
+        "active",
+        "offload_to_ram",
+        "unload",
+    )
+
+
+def test_default_model_profile_fields_and_summary() -> None:
+    """Target LM Studio profile is data-only with multimodal and best-effort JSON."""
+    profile = default_video_qa_target_model_profile()
+
+    assert profile.canonical_model_id == "Qwen/Qwen3.5-35B-A3B"
+    assert profile.provider == "LM Studio"
+    assert "text" in profile.modalities
+    assert "image" in profile.modalities
+    assert profile.structured_output_is_best_effort is True
+    assert profile.canonical_model_id in profile.summary()
+    assert "LM Studio" in profile.summary()
+    assert len(profile.model_dependent_limitations()) >= 1
+    assert len(profile.application_heuristic_notes()) >= 1
+
+
+def test_build_video_qa_runtime_summary_combines_layers() -> None:
+    """Runtime summary bundles profile, counter mode, and scheduler."""
+    s = build_video_qa_runtime_summary()
+    assert "Qwen" in s.model_profile.canonical_model_id
+    assert s.text_token_counter_mode is TextTokenCounterKind.HEURISTIC
+    assert s.scheduler.max_concurrent_active_heavy_models == 1
+    assert "text_tokens=heuristic" in s.summary()
+
+
+@dataclass(frozen=True, slots=True)
+class _FixedTokenCounter:
+    """Test double: fixed token count for any text."""
+
+    n: int
+
+    def count(self, _text: str) -> int:
+        return self.n
+
+
+def test_budget_estimate_uses_custom_text_token_counter(
+    tmp_path: Path,
+) -> None:
+    """Custom counter drives question token line in the budget estimate."""
+    source_media = tmp_path / "clip.mp4"
+    source_media.write_bytes(b"abc")
+    source = LocalFileProvider().resolve(source_media)
+
+    bundle = normalize_video_qa_context(
+        source=source,
+        question="ignored for token count",
+        attachments=(),
+    )
+    fixed = _FixedTokenCounter(n=99)
+    estimate = build_video_qa_budget_estimate(
+        bundle,
+        chunk_count=1,
+        text_token_counter=fixed,
+    )
+
+    assert estimate.question_tokens == 99
+    assert estimate.text_token_counter_mode is TextTokenCounterKind.CUSTOM
 
 
 def test_budget_policy_defaults_are_conservative() -> None:

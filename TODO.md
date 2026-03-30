@@ -46,12 +46,12 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 - [x] Ввести контракт `input provider`: любой источник обязан резолвиться в локальный путь к медиа и метаданные.
 - [x] Реализовать `LocalFile` как основной и самый надёжный provider для MVP.
 - [x] Unit tests для `core/video_qa_policy.py` (default off, схемы/host, `file://`, описание temp policy).
-- [ ] Добавить опциональный URL import stage как отдельный provider, не вшивая загрузчик в orchestrator.
-- [ ] Рассмотреть `yt-dlp`-класс инструментов как external optional dependency, а не как жёстко встроенную часть приложения.
-- [ ] Поддержать YouTube URL как первый experimental provider после `LocalFile`.
+- [x] Добавить опциональный URL import stage как отдельный provider, не вшивая загрузчик в orchestrator (`core/video_qa_url_import.py`: `VideoQAUrlImportProvider`).
+- [x] Рассмотреть `yt-dlp`-класс инструментов как external optional dependency, а не как жёстко встроенную часть приложения (`VideoUrlDownloader` + `YtDlpCliDownloader`, без обязательной зависимости).
+- [x] Поддержать YouTube URL как первый experimental provider после `LocalFile` (HTTP(S) хосты YouTube / `youtu.be`; остальные URL отклоняются на этом этапе).
 - [ ] Отложить `VK Video` и `Rutube` в отдельный later/experimental слой после стабилизации YouTube path.
 - [ ] Не планировать `Instagram`, `TikTok`, `X.com` в ближайший этап без устойчивого и юридически безопасного пути.
-- [ ] Зафиксировать политику временных файлов, кэша и очистки после URL import.
+- [x] Зафиксировать политику временных файлов, кэша и очистки после URL import (`VideoQAUrlImportPolicy.temp_file_policy_description`, `UrlImportStagingHandle` / `cleanup_staging`).
 
 ## 4. Prompt context and attachments
 
@@ -64,38 +64,38 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 
 ## 5. Video QA orchestration
 
-- [ ] Вынести orchestrator поверх текущего pipeline: `source resolve -> transcript reuse/build -> chunk plan -> representative frames -> LLM passes -> final aggregation`.
-- [ ] Сохранять subtitle-first базу: транскрипт и субтитры остаются самостоятельным результатом, а не побочным артефактом QA.
-- [ ] Делать chunking по сценам/контенту с fallback на равномерную сетку по времени.
-- [ ] Зафиксировать политику `representative frame`: по умолчанию средний кадр сцены; альтернативы оставить как расширение.
-- [ ] Явно описать overflow policy: сначала уменьшать число кадров, потом разрешение, потом дробить текст/чанк.
+- [x] Вынести orchestrator поверх текущего pipeline: `source resolve -> transcript reuse/build -> chunk plan -> representative frames -> LLM passes -> final aggregation` (`core/video_qa_executor.py`: `run_video_qa_executor`, инжектируемые transcript / frames / inference / aggregate).
+- [x] Сохранять subtitle-first базу: транскрипт и субтитры остаются самостоятельным результатом, а не побочным артефактом QA (в planning-слое: `transcript_prepare` в `VIDEO_QA_SUBTITLE_FIRST_GRAPH_KINDS`, без слияния с QA chunk-планом).
+- [x] Делать chunking по сценам/контенту с fallback на равномерную сетку по времени (`core/video_qa_orchestration.py`: `build_video_qa_chunk_plan`).
+- [x] Зафиксировать политику `representative frame`: по умолчанию средний кадр сцены; альтернативы оставить как расширение (`VideoQARepresentativeFramePolicy`).
+- [x] Явно описать overflow policy: сначала уменьшать число кадров, потом разрешение, потом дробить текст/чанк (`VideoQAOverflowPolicy`).
 - [ ] Проверить фактическое поведение LM Studio при переполнении контекста: ошибка, partial output, `stopReason` или silent truncation.
 - [ ] Строить budget control на своём preflight и fallback, а server-side overflow policy использовать только после отдельной верификации.
 - [x] Ввести versioned JSON-manifest чанков: `schema_version`, `chunk_id`, `t_start`, `t_end`, кадры, артефакты, `status`, `attempts`, `error`.
-- [ ] Поддержать повторный запуск одного чанка и idempotent resume по manifest.
+- [x] Поддержать повторный запуск одного чанка и idempotent resume по manifest (`merge_planned_chunks_into_manifest` по `chunk_id`; executor пропускает `completed` и обновляет manifest без повторного inference).
 - [x] Зафиксировать контракт финального ответа: `answer`, `evidence[]`, таймкоды, цитаты транскрипта, ссылки на кадры, признак неопределённости.
 
 ## 6. Budgeting and runtime scheduling
 
-- [ ] Для текста считать budget максимально точно через tokenizer/совместимый счётчик выбранной модели.
-- [ ] Для изображений использовать консервативную offline-эвристику с явным запасом.
-- [ ] Резервировать budget под финальный ответ и под служебные instructions, а не только под input.
-- [ ] Показать пользователю грубую оценку budget до старта и причину fallback/дробления при overflow.
-- [ ] Ввести runtime scheduler: одновременно активна только одна тяжёлая нейросеть.
-- [ ] Для конфигурации `8 GB VRAM / 64 GB RAM` зафиксировать политику `active -> offload to RAM -> unload`, чтобы `Whisper`, `Qwen` и другие модели не конкурировали бесконтрольно.
-- [ ] Сериализовать model-heavy этапы и не разрешать параллельный inference в GUI без явной очереди.
-- [ ] Отдельно задокументировать, какие лимиты зависят от модели, а какие являются общими эвристиками приложения.
+- [x] Для текста: абстракция счётчика токенов + консервативный fallback; точный tokenizer подключается при передаче счётчика в `build_video_qa_budget_estimate` (см. `TextTokenCounter`).
+- [x] Для изображений использовать консервативную offline-эвристику с явным запасом (`VideoQAAttachment.budget_tokens` и attachment budget в `VideoQAContextBundle`).
+- [x] Резервировать budget под финальный ответ и под служебные instructions, а не только под input (`VideoQABudgetPolicy` / `VideoQABudgetEstimate`).
+- [x] Показать пользователю грубую оценку budget до старта и причину fallback/дробления при overflow (backend: `build_video_qa_preflight_report` / `format_video_qa_preflight_report_text` в `core/video_qa_orchestration.py`; отображение в GUI — см. §2).
+- [x] Runtime scheduler (`VideoQARuntimeScheduler`): одновременно активна только одна тяжёлая нейросеть (политика по умолчанию).
+- [x] Для конфигурации `8 GB VRAM / 64 GB RAM` зафиксирована политика `active -> offload to RAM -> unload` в `VideoQARuntimePolicy` / scheduler.
+- [x] Сериализация model-heavy этапов и запрет параллельного inference по умолчанию (`allow_parallel_inference=False`, `serialize_model_heavy_steps=True`).
+- [x] В `VideoQAModelProfile` задокументировано разделение model-dependent ограничений и эвристик приложения.
 
 ## 7. Model and LM Studio integration
 
-- [ ] Зафиксировать целевой профиль локальной модели и её ограничения для `Video QA`.
+- [x] Зафиксирован data-only профиль `VideoQAModelProfile` (`Qwen/Qwen3.5-35B-A3B`, LM Studio, multimodal, structured output best-effort); подробности по-прежнему в `doc/Qwen3.5-35B-A3B.md`.
 - [ ] Проверить связку `LM Studio + выбранная Qwen/VLM` на реальном мультимодальном запросе, а не только на тексте.
 - [ ] Проверить, насколько локальный сервер поддерживает structured output / JSON contract, и предусмотреть graceful fallback.
 - [x] Добавить в репозиторий краткий internal reference по LM Studio: OpenAI-compatible API, multimodal payload, streaming, caveats structured output.
 
 ## 8. Outputs and artifacts
 
-- [ ] Оставить текущие `TXT`/`SRT`/`VTT`/`JSON` экспортёры как базовый путь.
+- [x] Оставить текущие `TXT`/`SRT`/`VTT`/`JSON` экспортёры как базовый путь.
 - [x] Для `Video QA` добавить machine-readable export ответа и evidence-списка.
 - [x] Сохранять итоговый answer bundle рядом с manifest, чтобы можно было разбирать run post factum.
 - [x] Для ответа по видео дать формат с цитатами, таймкодами и ссылками на кадры.
@@ -106,7 +106,7 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 - [x] Найти и обновить legacy-упоминания старого бренда приложения и старые абсолютные пути в коде и документации.
 - [x] Перевести `QSettings`, session keys и exporter metadata на `AskVLM` без legacy compatibility branches и fallback-парсинга.
 - [ ] Подготовить MIT readiness checklist: лицензии зависимостей, бинарей, model weights и вспомогательных инструментов.
-- [ ] До внедрения URL import проверить не только лицензии, но и ToS/redistributability для конкретных source adapters.
+- [ ] Для URL import (backend `core/video_qa_url_import.py` уже есть; по умолчанию выключен в policy) перед релизом / enable-by-default проверить не только лицензии, но и ToS/redistributability для конкретных source adapters.
 - [ ] Решить, какие external tools поставляются вместе с приложением, а какие пользователь устанавливает отдельно.
 - [ ] Добавить user-facing дисклеймер про ответственность за источник контента при URL import.
 
@@ -116,7 +116,7 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 - [ ] Проверить, что `Text` и `Subtitles` пути не деградируют после добавления `Video QA`.
 - [ ] Проверить `input providers`: локальный файл, ошибки URL resolve, временные файлы, cleanup.
 - [ ] Проверить сбор контекста из вложений и их budget trimming.
-- [ ] Проверить chunk planning, manifest persistence и resume по `chunk_id`.
+- [ ] Проверить chunk planning, manifest persistence и resume по `chunk_id` (частично: `tests/test_video_qa_executor.py` — executor, resume, run-level `failed` и сводка при ошибке чанка, смешанные исходы; полный E2E с GUI/диском — позже).
 - [ ] Проверить overflow fallback order, реакцию на server-side context limit и объяснимость ошибок пользователю.
 - [ ] Проверить scheduler и правило `one active model at a time`.
 - [ ] Проверить формат ответа с таймкодами, цитатами и привязкой к кадрам.
