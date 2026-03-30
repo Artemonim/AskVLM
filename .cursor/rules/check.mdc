@@ -1,7 +1,0 @@
----
-description: 
-globs: 
-alwaysApply: true
----
-- Use `.venv/Scripts/Activate.ps1 && ./run.ps1 -SkipLaunch` to check yourself.
-- Не забывай изменять и обращаться к [TODO.md](mdc:TODO.md) для самоконтроля.
