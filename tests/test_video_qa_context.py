@@ -61,3 +61,38 @@ def test_video_qa_context_normalizes_attachments_and_question(
     assert "Source:" in prompt_block
     assert "Question: What is in the clip?" in prompt_block
     assert "Attachments:" in prompt_block
+
+
+def test_video_qa_context_render_prompt_block_includes_chunk_sections(
+    tmp_path: Path,
+) -> None:
+    """Prompt blocks include chunk metadata, transcript summary, and frame refs."""
+    source_media = tmp_path / "clip.mp4"
+    source_media.write_bytes(b"abc")
+    source = LocalFileProvider().resolve(source_media)
+
+    attachment = tmp_path / "notes.txt"
+    attachment.write_text("hello", encoding="utf-8")
+
+    bundle = normalize_video_qa_context(
+        source=source,
+        question="What is shown?",
+        attachments=[attachment],
+    )
+
+    prompt_block = bundle.render_prompt_block(
+        chunk_id="chunk-01",
+        chunk_time_span=(12.5, 18.0),
+        transcript_summary="The speaker points at a diagram.\nThey highlight the left side.",
+        frame_refs=("frame-001.png", " frame-002.png "),
+    )
+
+    assert "Chunk:" in prompt_block
+    assert "- id: chunk-01" in prompt_block
+    assert "- span: 12.50s to 18.00s" in prompt_block
+    assert "Transcript summary:" in prompt_block
+    assert "- The speaker points at a diagram." in prompt_block
+    assert "- They highlight the left side." in prompt_block
+    assert "Representative frames:" in prompt_block
+    assert "- frame-001.png" in prompt_block
+    assert "- frame-002.png" in prompt_block

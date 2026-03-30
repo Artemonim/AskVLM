@@ -2,6 +2,23 @@
 
 Статус: базовая транскрипция, субтитры, preview, export и burn-in уже есть и считаются стабильной базой. Следующий этап: превратить приложение в мультимодальный desktop-инструмент, где пользователь подаёт видео, формулирует задачу и получает grounded-ответ от LLM без поломки subtitle-first workflow.
 
+## Pipeline readiness
+
+| Element | Status | Note |
+| --- | --- | --- |
+| GUI shell | ✅ ready | Mode routing and separate `Text + Subtitles` / `Video QA` surfaces exist. |
+| Load media: local file | ✅ ready | Local file remains the stable base input. |
+| Load media: network | 🟡 partial | YouTube URL import exists, but it is default-off and not the only missing release item. |
+| Text mode | ✅ ready | Stable base workflow. |
+| Subtitle mode | ✅ ready | Stable preview/export/burn-in workflow. |
+| Whisper/WhisperX | ✅ ready for subtitle-first base, 🟡 partial for Video QA wiring | The transcription base is stable, but a concrete Video QA transcript-provider hookup is still a follow-up. |
+| Chunking | ✅ ready at planning level | Chunk planning exists in backend orchestration. |
+| Representative frames | 🟡 partial | Policy/protocol exist; a concrete production materializer is still a follow-up. |
+| LM Studio / VLM | 🟡 partial | Client + chunk inferencer exist, but executor/GUI wiring and overflow verification remain. |
+| Transcript summary | 🟡 partial | Summary helper/contract exists; end-to-end runtime integration remains. |
+| Final answer | 🟡 partial | Answer bundle/export exists; production aggregation wiring remains. |
+| Tests | 🟡 partial | CI passes, but manual regression and live overflow checks remain open. |
+
 ## Wave plan
 
 - Wave 1: GUI shell + guardrails + minimal `LocalFile` provider. Subtitle-first `preview/export/burn-in` remains the stable base and is not mixed with `Video QA`.
@@ -61,7 +78,7 @@
 - [x] Для кодовых вложений сохранять язык/расширение, чтобы промпт мог корректно ссылаться на фрагменты.
 - [x] Для изображений считать budget по эвристике с запасом, а не делать вид, что offline token count точен.
 - [x] Добавить UI-флаги include/exclude для каждого вложения, если budget оказывается слишком большим (чекбоксы в таблице вложений; стратегия prompt — отдельно).
-- [ ] Подготовить стратегию, как вложения попадают в prompt рядом с чанками видео и вопросом пользователя.
+- [ ] Подготовить стратегию, как вложения попадают в prompt рядом с чанками видео и вопросом пользователя. Сейчас preflight при overflow просто блокирует запуск; отдельная future engineering task later — делить входной контекст на чанки и либо подавать чанки по очереди вместе с вопросом, либо суммаризировать чанки перед финальной агрегацией.
 
 ## 5. Video QA orchestration
 

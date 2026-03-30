@@ -146,8 +146,19 @@ class VideoQAContextBundle:
         """Return the combined token budget of enabled attachments."""
         return sum(item.budget_tokens for item in self.enabled_attachments)
 
-    def render_prompt_block(self) -> str:
-        """Render a compact prompt block for the current context bundle."""
+    def render_prompt_block(
+        self,
+        *,
+        chunk_id: str | None = None,
+        chunk_time_span: tuple[float, float] | None = None,
+        transcript_summary: str | None = None,
+        frame_refs: Iterable[str] = (),
+    ) -> str:
+        """Render a compact prompt block for the current context bundle.
+
+        The block keeps user-provided context first and appends chunk-specific data
+        when available, so a future chunk inferencer can reuse the same contract.
+        """
         lines: list[str] = []
         if self.source is not None:
             lines.append(f"Source: {self.source.path}")
@@ -167,6 +178,23 @@ class VideoQAContextBundle:
                     f"{attachment.size:,} bytes, suffix={suffix}"
                     f"{language}, budget≈{attachment.budget_tokens}"
                 )
+        if chunk_id is not None or chunk_time_span is not None:
+            lines.append("Chunk:")
+            if chunk_id is not None:
+                lines.append(f"- id: {chunk_id}")
+            if chunk_time_span is not None:
+                start, end = chunk_time_span
+                lines.append(f"- span: {start:.2f}s to {end:.2f}s")
+        normalized_summary = str(transcript_summary or "").strip()
+        if normalized_summary:
+            lines.append("Transcript summary:")
+            lines.extend(f"- {line}" for line in normalized_summary.splitlines())
+        normalized_frames = tuple(
+            str(ref).strip() for ref in frame_refs if str(ref).strip()
+        )
+        if normalized_frames:
+            lines.append("Representative frames:")
+            lines.extend(f"- {frame_ref}" for frame_ref in normalized_frames)
         return "\n".join(lines)
 
 
