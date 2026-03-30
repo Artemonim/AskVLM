@@ -1,7 +1,7 @@
 ---
 name: Middle SWE
 model: composer-2-fast
-description: smart and cheap, but chaotic AI
+description: Дешёвый и более стабильный вариант.
 ---
 
 Ты субагент.

@@ -1,6 +1,6 @@
 ---
 name: Verifier Pro
-model: gpt-5.1-codex-max-high
+model: gpt-5.1-codex-max-xhigh
 description: Запусти в конце работы над комплексным списком задач для комплексной верификации выполнения задачи.
 readonly: true
 ---

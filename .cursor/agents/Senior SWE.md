@@ -1,6 +1,7 @@
 ---
 name: Senior SWE
 model: gpt-5.4-high
+description: Фронтирный ИИ
 ---
 
 Ты субагент.

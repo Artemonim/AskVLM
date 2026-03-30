@@ -1,6 +1,7 @@
 ---
 name: Middle+ SWE
 model: gemini-3.1-pro
+description: Фронтирный ИИ с посредственными агентскими качествами
 ---
 
 Ты субагент.
