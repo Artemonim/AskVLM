@@ -183,7 +183,9 @@ class LocalCI:
 
     def _print(self, msg: str) -> None:
         if not self.json_output:
-            print(msg)
+            # * flush=True: when stdout is not a TTY (piped/IDE), block buffering delays
+            #   heartbeat and step lines until process exit unless explicitly flushed.
+            print(msg, flush=True)
 
     def _log(self, msg: str) -> None:
         """Write message to build.log"""
@@ -832,6 +834,14 @@ class LocalCI:
 
 
 def main() -> None:
+    # * When stdout is not a TTY, Python may use block buffering; line-buffer so progress
+    #   and heartbeat appear while long subprocesses run (see LocalCI._print flush).
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     parser = argparse.ArgumentParser(description="Local CI runner for AskVLM")
     parser.add_argument("--tool", choices=list(TOOLS.keys()), help="Run only a specific tool")
     parser.add_argument("--path", nargs="+", help="Limit analysis to given paths")
@@ -875,7 +885,7 @@ def main() -> None:
     ci = LocalCI(verbose=args.verbose, json_output=args.json, targets=targets)
     res = ci.run(only=args.tool, fix=(not args.no_fix))
     if args.json:
-        print(json.dumps(res, indent=2))
+        print(json.dumps(res, indent=2), flush=True)
 
     # * Launch GUI by default after successful checks (unless explicitly skipped)
     if not args.skip_launch and res["summary"]["overall_status"] == "PASS":
