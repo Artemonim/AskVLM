@@ -62,12 +62,21 @@ from core.ffmpeg import (
     start_burn_process,
 )
 from core.pipelines import CancelledError, LocalPipeline
+from core.video_qa_executor import VideoQAExecutorRunOutcome
+from core.video_qa_local_run import (
+    DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
+    VideoQAPreflightBlockedError,
+    ensure_local_video_qa_run_allowed,
+    preflight_local_video_qa,
+)
 from core.whisperx_wrapper import WhisperXWrapper
 from editing.text_model import Document, TextSegment
 from gui.speaker_sidebar import SpeakerSidebar
 from gui.subtitle_preview import SubtitlePreview
 from gui.video_qa import VideoQAPanel
+from gui.video_qa_worker import VideoQALocalRunWorker
 from gui.wysiwyg_editor import TableRow, WysiwygEditor
+from utils.askvlm_defaults import get_default_video_qa_canonical_model_id
 from utils.exporters import (
     SubtitleRules,
     append_askvlm_metadata_to_srt,
@@ -244,6 +253,8 @@ if TYPE_CHECKING:
     from subprocess import Popen
 
     from PySide6.QtGui import QCloseEvent
+
+    from core.video_qa_context import VideoQAContextBundle
 
 # * Constants for boolean UI states
 _UI_CHECKED = True
@@ -477,6 +488,8 @@ class MainWindow(QMainWindow):
         self._worker: PipelineWorker | None = None
         self._burn_thread: QThread | None = None
         self._burn_worker: object | None = None
+        self._video_qa_thread: QThread | None = None
+        self._video_qa_worker: VideoQALocalRunWorker | None = None
         self._has_transcript: bool = False
         # * Preview mapping and state
         self._last_inputs: list[Path] = []
@@ -550,6 +563,10 @@ class MainWindow(QMainWindow):
         # Initial status scan
         self._scan_output_statuses()
 
+        self.video_qa_panel.video_qa_run_requested.connect(
+            self._log_wrap(self._on_video_qa_run_requested, "Video QA run")
+        )
+
     def choose_file(self) -> None:
         """Choose a single media file for processing."""
         file_name, _ = QFileDialog.getOpenFileName(
@@ -608,9 +625,20 @@ class MainWindow(QMainWindow):
             self.btn_burn.setEnabled(enabled)
             self.chk_normalize.setEnabled(enabled)
             self.font_combo.setEnabled(enabled)
+        vq_idle = self._video_qa_thread is None or (
+            not self._video_qa_thread.isRunning()
+        )
+        self.video_qa_panel.btn_run_qa.setEnabled(bool(enabled) and vq_idle)
 
-    def start_processing(self) -> None:  # noqa: PLR0915
+    def start_processing(self) -> None:  # noqa: PLR0915, C901
         """Start pipeline processing in a background thread (QThread)."""
+        if self._video_qa_thread is not None and self._video_qa_thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Busy",
+                "Video QA is running. Wait for it to finish or cancel it.",
+            )
+            return
         # Validate input
         inputs = self._gather_inputs()
         if not inputs:
@@ -743,6 +771,10 @@ class MainWindow(QMainWindow):
         if isinstance(self._burn_worker, _InlineBurnWorker):
             with contextlib.suppress(RuntimeError):
                 self._burn_worker.request_cancel()
+        vq = self._video_qa_worker
+        if vq is not None:
+            with contextlib.suppress(RuntimeError):
+                vq.request_cancel()
 
     def on_progress(self, frac: float, msg: str) -> None:
         """Update progress bar and status message."""
@@ -794,6 +826,120 @@ class MainWindow(QMainWindow):
         # Stop spinner once cancellation is fully handled
         with contextlib.suppress(Exception):
             self._spinner_timer.stop()
+
+    def _re_enable_after_video_qa(self) -> None:
+        """Restore main controls after a Video QA worker ends (success, error, or cancel)."""
+        self.progress.setValue(0)
+        self.btn_start.setEnabled(True)
+        self.video_qa_panel.btn_run_qa.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+
+    def _on_video_qa_run_requested(self) -> None:
+        """Validate preflight and start the Video QA background worker."""
+        if self._thread is not None and self._thread.isRunning():
+            QMessageBox.information(
+                self,
+                "Busy",
+                "Subtitle processing is running. Wait for it to finish or cancel it.",
+            )
+            return
+        if self._video_qa_thread is not None and self._video_qa_thread.isRunning():
+            return
+        ctx = self.video_qa_panel.context_bundle()
+        if ctx.source is None:
+            QMessageBox.warning(self, "Video QA", "Select a local media file first.")
+            return
+        if not str(ctx.question or "").strip():
+            QMessageBox.warning(self, "Video QA", "Enter a question.")
+            return
+        out_dir = Path(self.out_dir_edit.text()).resolve()
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            QMessageBox.critical(self, "Output error", f"Cannot use output dir: {exc}")
+            return
+        try:
+            duration_s = float(get_media_duration_seconds(ctx.source.path))
+        except OSError:
+            duration_s = 0.0
+        report, chunk_plan = preflight_local_video_qa(
+            ctx,
+            duration_seconds=duration_s,
+            context_window_tokens=self.video_qa_panel.context_window_tokens(),
+        )
+        try:
+            ensure_local_video_qa_run_allowed(report, chunk_plan)
+        except VideoQAPreflightBlockedError as exc:
+            QMessageBox.warning(self, "Video QA", str(exc))
+            return
+        self._start_video_qa_worker(ctx, out_dir)
+
+    def _start_video_qa_worker(
+        self,
+        ctx: VideoQAContextBundle,
+        out_dir: Path,
+    ) -> None:
+        """Spin up :class:`VideoQALocalRunWorker` on a dedicated thread."""
+        self._apply_quality_to_pipeline(force_reload=False)
+        self._video_qa_thread = QThread(self)
+        self._video_qa_worker = VideoQALocalRunWorker(
+            context=ctx,
+            output_dir=out_dir,
+            context_window_tokens=self.video_qa_panel.context_window_tokens(),
+            whisper=self.pipeline.whisperx,
+            lm_base_url=DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
+            lm_model_id=get_default_video_qa_canonical_model_id(),
+        )
+        self._video_qa_worker.moveToThread(self._video_qa_thread)
+        self._video_qa_thread.started.connect(self._video_qa_worker.run)
+        self._video_qa_worker.progress.connect(self.on_progress)
+        self._video_qa_worker.finished.connect(self._on_video_qa_finished)
+        self._video_qa_worker.error.connect(self._on_video_qa_error)
+        self._video_qa_worker.canceled.connect(self._on_video_qa_canceled)
+        self._video_qa_worker.error.connect(self._video_qa_worker.deleteLater)
+        self._video_qa_worker.finished.connect(self._video_qa_thread.quit)
+        self._video_qa_worker.finished.connect(self._video_qa_worker.deleteLater)
+        self._video_qa_worker.canceled.connect(self._video_qa_thread.quit)
+        self._video_qa_worker.canceled.connect(self._video_qa_worker.deleteLater)
+        self._video_qa_thread.finished.connect(self._on_video_qa_worker_thread_finished)
+        self._video_qa_thread.finished.connect(self._video_qa_thread.deleteLater)
+        self.btn_start.setEnabled(False)
+        self.video_qa_panel.btn_run_qa.setEnabled(False)
+        self.btn_cancel.setEnabled(True)
+        self.progress.setValue(0)
+        self.status.showMessage("Video QA…")
+        self._video_qa_thread.start()
+
+    def _on_video_qa_finished(self, outcome: object) -> None:
+        """Populate answer/evidence from a successful Video QA run."""
+        if isinstance(outcome, VideoQAExecutorRunOutcome):
+            self.video_qa_panel.set_answer_text(outcome.answer_bundle.answer)
+            items = [
+                f"[{ev.t_start:.2f}s - {ev.t_end:.2f}s] {ev.transcript_quote}"
+                for ev in outcome.answer_bundle.evidence
+            ]
+            self.video_qa_panel.set_evidence_items(items)
+        self.status.showMessage("Video QA completed")
+
+    def _on_video_qa_error(self, message: str) -> None:
+        """Surface a Video QA failure and stop the worker thread."""
+        if self._can_show_modal():
+            QMessageBox.warning(self, "Video QA", message)
+        self.status.showMessage("Video QA error")
+        if self._video_qa_thread is not None:
+            self._video_qa_thread.quit()
+
+    def _on_video_qa_canceled(self) -> None:
+        """Reset UI after cooperative Video QA cancellation."""
+        self.status.showMessage("Video QA canceled")
+        if self._video_qa_thread is not None:
+            self._video_qa_thread.quit()
+
+    def _on_video_qa_worker_thread_finished(self) -> None:
+        """Clear Video QA thread references after the thread stops."""
+        self._re_enable_after_video_qa()
+        self._video_qa_thread = None
+        self._video_qa_worker = None
 
     # * Per-file UI updates
     def _on_file_started(self, media_path: str) -> None:
@@ -1296,7 +1442,12 @@ class MainWindow(QMainWindow):
             label="Burn",
         )
         burn_stopped = stopped
-        return worker_stopped and burn_stopped
+        self._video_qa_thread, vq_stopped = self._stop_qthread(
+            self._video_qa_thread,
+            timeout_ms,
+            label="VideoQA",
+        )
+        return worker_stopped and burn_stopped and vq_stopped
 
     def _apply_video_qa_settings(self, s: QSettings) -> None:
         """Restore Video QA panel fields from settings."""

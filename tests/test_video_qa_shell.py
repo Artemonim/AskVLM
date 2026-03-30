@@ -128,6 +128,61 @@ def test_context_bundle_respects_attachment_include(
     assert "b.txt" in disabled
 
 
+def test_video_qa_run_button_enabled_and_emits_request(qtbot: QtBot) -> None:
+    """Run Video QA is active and notifies the shell via ``video_qa_run_requested``."""
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    run_btn = panel.findChild(QPushButton, "video_qa_run")
+    assert run_btn is not None
+    assert run_btn.isEnabled()
+    assert "Run Video QA" in run_btn.text()
+    with qtbot.waitSignal(panel.video_qa_run_requested, timeout=2000):
+        qtbot.mouseClick(run_btn, Qt.MouseButton.LeftButton)
+
+
+def test_main_window_dispatches_video_qa_launch_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    """The shell forwards the run button click into the Video QA launch path."""
+    settings_path = tmp_path / "settings.ini"
+
+    class MockSettings(QSettings):
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            super().__init__(str(settings_path), QSettings.Format.IniFormat)
+
+    monkeypatch.setattr("gui.main_window.QSettings", MockSettings)
+    monkeypatch.setattr("gui.main_window.get_media_duration_seconds", lambda _p: 60.0)
+
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"abc")
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    window.out_dir_edit.setText(str(tmp_path / "out"))
+    window.video_qa_panel.set_source_path(media)
+    window.video_qa_panel.set_question_text("What is shown?")
+    run_btn = window.video_qa_panel.findChild(QPushButton, "video_qa_run")
+    assert run_btn is not None
+    assert run_btn.isEnabled()
+
+    launched: list[tuple[object, object]] = []
+
+    def fake_start(ctx: object, out_dir: object) -> None:
+        launched.append((ctx, out_dir))
+
+    monkeypatch.setattr(window, "_start_video_qa_worker", fake_start)
+
+    qtbot.mouseClick(run_btn, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: len(launched) == 1, timeout=2000)
+
+    ctx, out_dir = launched[0]
+    assert getattr(ctx, "question", "") == "What is shown?"
+    assert getattr(getattr(ctx, "source", None), "path", None) == media.resolve()
+    assert str(out_dir) == str((tmp_path / "out").resolve())
+
+
 def test_video_qa_retry_controls_present_and_disabled(qtbot: QtBot) -> None:
     """Retry controls are visible placeholders until backend wiring exists."""
     panel = VideoQAPanel()

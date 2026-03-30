@@ -11,12 +11,12 @@
 | Load media: network | 🟡 partial | YouTube URL import exists, but it is default-off and not the only missing release item. |
 | Text mode | ✅ ready | Stable base workflow. |
 | Subtitle mode | ✅ ready | Stable preview/export/burn-in workflow. |
-| Whisper/WhisperX | ✅ ready for subtitle-first base, 🟡 partial for Video QA wiring | The transcription base is stable, but a concrete Video QA transcript-provider hookup is still a follow-up. |
+| Whisper/WhisperX | ✅ ready for subtitle-first base, ✅ Video QA local run wired | Subtitle pipeline unchanged; Video QA uses ASR via `WhisperXWrapper` + `prepare_audio` without diarization/dialog formatting by default in the local run path. VRAM hand-off Whisper → LM phase not enforced yet (see §6). |
 | Chunking | ✅ ready at planning level | Chunk planning exists in backend orchestration. |
-| Representative frames | 🟡 partial | Policy/protocol exist; a concrete production materializer is still a follow-up. |
-| LM Studio / VLM | 🟡 partial | Client + chunk inferencer exist, but executor/GUI wiring and overflow verification remain. |
-| Transcript summary | 🟡 partial | Summary helper/contract exists; end-to-end runtime integration remains. |
-| Final answer | 🟡 partial | Answer bundle/export exists; production aggregation wiring remains. |
+| Representative frames | ✅ ready for local GUI run | `core/video_qa_local_run.VideoQAFFmpegFrameMaterializer` uses `extract_frame_to_file`. |
+| LM Studio / VLM | 🟡 partial | GUI launch path runs chunk inferencer + LM Studio client; overflow vs live server behaviour still needs verification. |
+| Transcript summary | ✅ ready for chunk prompts | `VideoQALMStudioChunkInferencer` builds per-chunk transcript excerpts; full QA path is wired from GUI. |
+| Final answer | ✅ deterministic aggregate in local run | `VideoQADeterministicAnswerAggregator` builds `VideoQAAnswerBundle` without a second LM call; manifest + answer JSON save next to output. |
 | Tests | 🟡 partial | CI passes, but manual regression and live overflow checks remain open. |
 
 ## Wave plan
@@ -30,7 +30,7 @@
 
 ## GUI tracking
 
-**Активный workstream:** базовый `Video QA` surface в GUI (источник, вопрос, вложения, preflight, read-only answer/evidence) развивается отдельно от стабильного `Text + Subtitles`. Полноценный запуск LLM, retry по чанкам и расширенный overflow-UX — следующие этапы (см. Wave 4+). Детализация сценариев по-прежнему в `## 2. MVP UX` и `## 10. Tests and verification`.
+**Активный workstream:** базовый `Video QA` surface в GUI (источник, вопрос, вложения, preflight, read-only answer/evidence) развивается отдельно от стабильного `Text + Subtitles`. Полноценный запуск LLM из GUI (`Run Video QA`, worker в `MainWindow`, glue `core/video_qa_local_run.py`) уже есть; retry по чанкам и расширенный overflow-UX — следующие этапы (см. Wave 4+). Детализация сценариев по-прежнему в `## 2. MVP UX` и `## 10. Tests and verification`.
 
 - [x] Ответ и evidence surface для `Video QA` (read-only зоны; методы для будущей подводки backend; контракт §5/§8 — по мере появления реального run).
 - [x] Split layout: `Video QA` разделён на левую панель подготовки и правую для процесса/результатов с редактируемым бюджетом токенов.
@@ -99,7 +99,8 @@
 - [x] Для изображений использовать консервативную offline-эвристику с явным запасом (`VideoQAAttachment.budget_tokens` и attachment budget в `VideoQAContextBundle`).
 - [x] Резервировать budget под финальный ответ и под служебные instructions, а не только под input (`VideoQABudgetPolicy` / `VideoQABudgetEstimate`).
 - [x] Показать пользователю грубую оценку budget до старта и причину fallback/дробления при overflow (backend: `build_video_qa_preflight_report` / `format_video_qa_preflight_report_text` в `core/video_qa_orchestration.py`; отображение в GUI — см. §2).
-- [x] Runtime scheduler (`VideoQARuntimeScheduler`): одновременно активна только одна тяжёлая нейросеть (политика по умолчанию).
+- [x] Runtime scheduler (`VideoQARuntimeScheduler`): описана политика «одновременно не более одной тяжёлой нейросети» в `core/video_qa_runtime.py` (data-only: сводки для preflight/доков, **без** принудительной выгрузки моделей в executor).
+- [ ] **Enforce: одна нейросеть в VRAM (процесс AskVLM) в каждый момент времени:** между `transcript_prepare` и `llm_pass` явно освобождать VRAM от локального Whisper (`WhisperXWrapper.unload`); сейчас Video QA / GUI path **не** вызывает `unload()` — модель остаётся загруженной на время HTTP к LM Studio. Учесть внешний VLM в LM Studio (уже в VRAM до старта сценария; приложение это не контролирует) — документация и при необходимости preflight-предупреждение или UX-hint.
 - [x] Для конфигурации `8 GB VRAM / 64 GB RAM` зафиксирована политика `active -> offload to RAM -> unload` в `VideoQARuntimePolicy` / scheduler.
 - [x] Сериализация model-heavy этапов и запрет параллельного inference по умолчанию (`allow_parallel_inference=False`, `serialize_model_heavy_steps=True`).
 - [x] В `VideoQAModelProfile` задокументировано разделение model-dependent ограничений и эвристик приложения.
@@ -117,6 +118,7 @@
 - [x] Для `Video QA` добавить machine-readable export ответа и evidence-списка.
 - [x] Сохранять итоговый answer bundle рядом с manifest, чтобы можно было разбирать run post factum.
 - [x] Для ответа по видео дать формат с цитатами, таймкодами и ссылками на кадры.
+- [ ] **Журнал / полный артефакт прогона:** сейчас `Video QA` пишет на диск `{run_id}.manifest.json` и answer bundle; транскрипт ASR целиком в manifest не хранится, сырой ответ LM почти не логируется (кроме best-effort `logging` при сбое парсинга). Нет единого файла «run log» (стадии, тайминги, ошибки, опционально redacted payloads). Решить: что сохранять рядом с output dir (transcript.json / `.log`), уровень детализации и опциональный verbose-режим.
 
 ## 9. Naming, legal and release prep
 

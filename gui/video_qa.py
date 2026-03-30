@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtCore import QByteArray, Qt, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -109,6 +109,8 @@ _VIDEO_QA_PANEL_STYLE = (
 class VideoQAPanel(QWidget):
     """Video QA workspace: source, question, attachments, preflight, answer/evidence, and retry scaffold."""
 
+    video_qa_run_requested = Signal()
+
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._provider = LocalFileProvider()
@@ -172,7 +174,8 @@ class VideoQAPanel(QWidget):
         root.addWidget(title)
         hint = QLabel(
             "Local file source, optional text/code/image attachments, and preflight "
-            "planning. LLM execution is not wired from the GUI yet."
+            "planning. Run Video QA uses the configured output folder, local ASR, "
+            "ffmpeg frames, and LM Studio."
         )
         hint.setWordWrap(True)
         root.addWidget(hint)
@@ -309,7 +312,7 @@ class VideoQAPanel(QWidget):
         self.answer_edit = QPlainTextEdit()
         self.answer_edit.setReadOnly(True)
         self.answer_edit.setPlaceholderText(
-            "Final answer will appear here after a Video QA run is implemented."
+            "Final answer appears here after a successful Video QA run."
         )
         self.answer_edit.setMinimumHeight(100)
         self.answer_edit.setStyleSheet(_ANSWER_STYLE)
@@ -356,12 +359,19 @@ class VideoQAPanel(QWidget):
         root.addWidget(retry_box)
 
     def _build_run_placeholder(self, root: QVBoxLayout) -> None:
-        self.btn_run_qa = QPushButton("Run Video QA (not wired yet)")
-        self.btn_run_qa.setEnabled(False)
+        self.btn_run_qa = QPushButton("Run Video QA")
+        self.btn_run_qa.setObjectName("video_qa_run")
+        self.btn_run_qa.setEnabled(True)
         self.btn_run_qa.setToolTip(
-            "Backend LM Studio execution is not connected from the GUI in this build."
+            "Run ASR, extract frames per chunk, call LM Studio per chunk, "
+            "and aggregate the answer (uses the main output directory)."
         )
+        self.btn_run_qa.clicked.connect(self._emit_run_requested)
         root.addWidget(self.btn_run_qa)
+
+    def _emit_run_requested(self) -> None:
+        """Notify the main window that the user wants to start a Video QA run."""
+        self.video_qa_run_requested.emit()
 
     def browse_for_source(self) -> None:
         """Open a file dialog and attach the selected local source."""
