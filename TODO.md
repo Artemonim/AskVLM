@@ -9,16 +9,16 @@
 - Wave 3: graph/manifest/schema/preparation only.
 - Wave 4: real LLM passes + budget/model policy + LM Studio.
 - Wave 5: outputs/tests/docs/release.
-- Wave 1 stops before URL import, attachments/context, chunk planning, LLM orchestration, and budget/runtime policy.
+- Wave 1 stops before URL import, attachments/context, chunk planning, LLM orchestration, and budget/runtime policy in the backend; GUI surfacing of already-implemented backend capabilities is tracked separately in `## GUI tracking`.
 
 ## GUI tracking
 
-GUI остаётся на уровне shell/stub: маршрутизация режимов и минимальные guardrails без полноценного Video QA surface. Более сложные controls и полная UI-поверхность для QA (ответ, evidence, preflight, вложения, retry) откладываются до готовности backend по **Wave 4** (реальные LLM passes, budget/model policy). Детализация сценариев по-прежнему в `## 2. MVP UX` и `## 10. Tests and verification`; этот блок — отдельный чеклист по GUI-работам, без реализации новых элементов «прямо сейчас».
+**Активный workstream:** базовый `Video QA` surface в GUI (источник, вопрос, вложения, preflight, read-only answer/evidence) развивается отдельно от стабильного `Text + Subtitles`. Полноценный запуск LLM, retry по чанкам и расширенный overflow-UX — следующие этапы (см. Wave 4+). Детализация сценариев по-прежнему в `## 2. MVP UX` и `## 10. Tests and verification`.
 
-- [ ] Ответ и evidence surface для `Video QA` (зона ответа, список evidence-блоков, согласованность с финальным контрактом из §5/§8).
-- [ ] Preflight summary перед запуском (источник, чанки, грубый budget, предупреждения; стык с §6).
-- [ ] Attachments controls: список вложений, include/exclude, UX при переполнении budget (связка с §4).
-- [ ] Retry controls: повтор по чанку / resume без полной переобработки видео (связка с manifest/orchestration в §5).
+- [x] Ответ и evidence surface для `Video QA` (read-only зоны; методы для будущей подводки backend; контракт §5/§8 — по мере появления реального run).
+- [x] Preflight summary перед запуском (кнопка Refresh + текст из `format_video_qa_preflight_report_text`; стык с §6).
+- [x] Attachments controls: список вложений, include/exclude; переполнение budget отображается в тексте preflight (дальнейший dedicated overflow UI — позже).
+- [x] Retry controls: повтор по чанку / resume без полной переобработки видео — **UX scaffold** (секция `Retry controls`, disabled кнопки + пояснение); реальная связка с manifest/orchestration/backend run из GUI — следующий этап (§5).
 - [ ] Ручные regression checks по `Text + Subtitles`: preview, export, burn-in и переключение экранов не ломают subtitle-first path (дублирует дух §10, но как явный GUI-focused прогон).
 
 ## 1. Product guardrails
@@ -33,13 +33,13 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 
 - [x] Оставить текущий экран как workspace для `Text + Subtitles`, не смешивая его с `Video QA`.
 - [x] Сделать отдельный экран `Video QA` со своим layout и своей зоной результата.
-- [ ] При старте приложения спрашивать, какой экран открыть, либо восстанавливать экран прошлой сессии.
+- [x] При старте приложения спрашивать, какой экран открыть, либо восстанавливать экран прошлой сессии.
 - [x] Сохранять последний выбранный экран в settings и добавлять явный переключатель экрана внутри приложения.
-- [ ] Для `Video QA` добавить поле задания, отдельную область ответа и список evidence-блоков.
-- [ ] Добавить секцию вложений к заданию: `txt`, `md`, кодовые файлы, `jpg`/`jpeg`, `png`, `webp`.
-- [ ] Показать preflight перед запуском: источник, число чанков, примерный бюджет контекста, предупреждения.
-- [ ] Не смешивать subtitle editor и chat-like output; у каждого экрана должна быть своя зона результата.
-- [ ] Подготовить UX для повторного запуска по ошибочному чанку без повторной обработки всего видео.
+- [x] Для `Video QA` добавить поле задания, отдельную область ответа и список evidence-блоков (MVP: read-only зоны + API для будущей подводки).
+- [x] Добавить секцию вложений к заданию: `txt`, `md`, кодовые файлы, `jpg`/`jpeg`, `png`, `webp` (через общий фильтр и нормализацию в `core/video_qa_context`).
+- [x] Показать preflight перед запуском: источник, число чанков, примерный бюджет контекста, предупреждения (кнопка Refresh preflight).
+- [x] Не смешивать subtitle editor и chat-like output; у каждого экрана должна быть своя зона результата.
+- [x] Подготовить UX для повторного запуска по ошибочному чанку без повторной обработки всего видео (scaffold: disabled `Retry selected chunk` / `Resume last run`; backend — позже).
 
 ## 3. Input providers and source acquisition
 
@@ -59,7 +59,7 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 - [x] Нормализовать текстовые вложения в единый внутренний формат с типом, именем файла и размером.
 - [x] Для кодовых вложений сохранять язык/расширение, чтобы промпт мог корректно ссылаться на фрагменты.
 - [x] Для изображений считать budget по эвристике с запасом, а не делать вид, что offline token count точен.
-- [ ] Добавить UI-флаги include/exclude для каждого вложения, если budget оказывается слишком большим.
+- [x] Добавить UI-флаги include/exclude для каждого вложения, если budget оказывается слишком большим (чекбоксы в таблице вложений; стратегия prompt — отдельно).
 - [ ] Подготовить стратегию, как вложения попадают в prompt рядом с чанками видео и вопросом пользователя.
 
 ## 5. Video QA orchestration
@@ -89,8 +89,8 @@ GUI остаётся на уровне shell/stub: маршрутизация р
 ## 7. Model and LM Studio integration
 
 - [x] Зафиксирован data-only профиль `VideoQAModelProfile` (`Qwen/Qwen3.5-35B-A3B`, LM Studio, multimodal, structured output best-effort); подробности по-прежнему в `doc/Qwen3.5-35B-A3B.md`.
-- [ ] Проверить связку `LM Studio + выбранная Qwen/VLM` на реальном мультимодальном запросе, а не только на тексте.
-- [ ] Проверить, насколько локальный сервер поддерживает structured output / JSON contract, и предусмотреть graceful fallback.
+- [x] Проверить связку `LM Studio + выбранная Qwen/VLM` на реальном мультимодальном запросе, а не только на тексте (локальный opt-in probe на `localhost:1234`).
+- [x] Проверить, насколько локальный сервер поддерживает structured output / JSON contract, и предусмотреть graceful fallback (verified with the same local probe).
 - [x] Добавить в репозиторий краткий internal reference по LM Studio: OpenAI-compatible API, multimodal payload, streaming, caveats structured output.
 
 ## 8. Outputs and artifacts

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import signal
@@ -1297,6 +1298,19 @@ class MainWindow(QMainWindow):
         burn_stopped = stopped
         return worker_stopped and burn_stopped
 
+    def _apply_video_qa_settings(self, s: QSettings) -> None:
+        """Restore Video QA panel fields from settings."""
+        self.video_qa_panel.set_source_path(str(s.value("videoqa/source_path", "")))
+        self.video_qa_panel.set_question_text(str(s.value("videoqa/question", "")))
+        raw_attach = s.value("videoqa/attachments_json", "")
+        if isinstance(raw_attach, str) and raw_attach.strip():
+            try:
+                data = json.loads(raw_attach)
+            except json.JSONDecodeError:
+                data = None
+            if isinstance(data, list):
+                self.video_qa_panel.restore_attachments_state(list(data))
+
     # * Settings persistence
     def _load_settings(self) -> None:
         s = QSettings("AskVLM", "AskVLM")
@@ -1317,8 +1331,7 @@ class MainWindow(QMainWindow):
 
         shell_screen = str(s.value("ui/shell_screen", self.SHELL_SCREEN_TEXT))
         self._set_shell_screen(shell_screen)
-        self.video_qa_panel.set_source_path(str(s.value("videoqa/source_path", "")))
-        self.video_qa_panel.set_question_text(str(s.value("videoqa/question", "")))
+        self._apply_video_qa_settings(s)
 
         self.chk_diar.setChecked(bool(s.value("opts/diar", type=bool)))
         self.chk_dialog.setChecked(bool(s.value("opts/dialog", type=bool)))
@@ -1374,6 +1387,10 @@ class MainWindow(QMainWindow):
         else:
             s.setValue("videoqa/source_path", str(source_path))
         s.setValue("videoqa/question", self.video_qa_panel.question_text())
+        s.setValue(
+            "videoqa/attachments_json",
+            json.dumps(self.video_qa_panel.attachments_for_persistence()),
+        )
         # Phase 1.81
         s.setValue("subs/max_line_chars", int(self.spin_line_len.value()))
         s.setValue("subs/max_lines", int(self.spin_max_lines.value()))

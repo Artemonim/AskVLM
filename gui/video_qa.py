@@ -1,27 +1,44 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
+    QAbstractItemView,
+    QCheckBox,
     QFileDialog,
+    QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
+    QPlainTextEdit,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
-from core.video_qa_context import normalize_video_qa_context
+from core.ffmpeg import get_media_duration_seconds
+from core.video_qa_context import (
+    VideoQAAttachmentRequest,
+    normalize_video_qa_context,
+)
+from core.video_qa_orchestration import (
+    build_video_qa_preflight_report,
+    build_video_qa_preflight_summary,
+    format_video_qa_preflight_report_text,
+)
 from core.video_qa_policy import (
     default_video_qa_url_import_policy,
 )
 from core.video_qa_sources import LocalFileProvider
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Iterator
 
     from core.video_qa_context import VideoQAContextBundle
     from core.video_qa_policy import (
@@ -29,69 +46,204 @@ if TYPE_CHECKING:
     )
     from core.video_qa_sources import LocalFileSource
 
+# * Supported attachment extensions aligned with core/video_qa_context classification.
+_ATTACHMENT_NAME_FILTER = (
+    "Attachments (*.txt *.md *.rst *.json *.csv *.xml *.yaml *.yml *.ini *.log *.html "
+    "*.htm *.cfg *.env *.tsv "
+    "*.py *.pyi *.js *.jsx *.ts *.tsx *.rs *.go *.c *.h *.cpp *.hpp *.cs *.java *.kt "
+    "*.lua *.php *.rb *.scala *.swift *.sql *.m *.ps1 *.sh "
+    "*.png *.jpg *.jpeg *.gif *.webp *.bmp *.tif *.tiff);;"
+    "All files (*.*)"
+)
+
+_READ_ONLY_STYLE = (
+    "QPlainTextEdit { background-color: #f2f4f8; color: #1a1a1a; "
+    "font-family: Consolas, 'Segoe UI', monospace; font-size: 11px; }"
+)
+_ANSWER_STYLE = (
+    "QPlainTextEdit { background-color: #f8f6f2; color: #1a1a1a; "
+    "font-family: 'Segoe UI', system-ui, sans-serif; font-size: 12px; }"
+)
+_EVIDENCE_STYLE = (
+    "QPlainTextEdit { background-color: #f0f6f4; color: #1a1a1a; "
+    "font-family: Consolas, 'Segoe UI', monospace; font-size: 11px; }"
+)
+_RETRY_GROUP_STYLE = (
+    "QGroupBox { border: 1px solid #b8bdd4; border-radius: 4px; margin-top: 10px; "
+    "padding-top: 10px; background-color: #eceef5; }"
+    "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; "
+    "color: #2a2f4a; }"
+)
+
 
 class VideoQAPanel(QWidget):
-    """Thin Video QA shell adapter with a local-file source picker."""
+    """Video QA workspace: source, question, attachments, preflight, answer/evidence, and retry scaffold."""
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._provider = LocalFileProvider()
         self._url_import_policy = default_video_qa_url_import_policy()
         self._source: LocalFileSource | None = None
+        self._last_attachment_dir = Path.cwd()
+        self._build_form(QVBoxLayout(self))
 
-        layout = QVBoxLayout(self)
+    def _build_form(self, root: QVBoxLayout) -> None:
+        self._build_header(root)
+        self._build_source_and_question(root)
+        self._build_attachments_group(root)
+        self._build_preflight_group(root)
+        self._build_answer_evidence_group(root)
+        self._build_retry_controls_group(root)
+        self._build_run_placeholder(root)
 
+    def _build_header(self, root: QVBoxLayout) -> None:
         title = QLabel("Video QA")
         title.setStyleSheet("font-size: 16px; font-weight: 600;")
-        layout.addWidget(title)
-
-        guardrails = QLabel(
-            "Local file is the active source. URL import, attachments, chunk "
-            "planning, LLM orchestration, and budget policy stay backend-only "
-            "for now."
+        root.addWidget(title)
+        hint = QLabel(
+            "Local file source, optional text/code/image attachments, and preflight "
+            "planning. LLM execution is not wired from the GUI yet."
         )
-        guardrails.setWordWrap(True)
-        layout.addWidget(guardrails)
+        hint.setWordWrap(True)
+        root.addWidget(hint)
 
+    def _build_source_and_question(self, root: QVBoxLayout) -> None:
         source_row = QHBoxLayout()
-        source_label = QLabel("Local file:")
+        source_row.addWidget(QLabel("Local file:"))
         self.source_edit = QLineEdit()
         self.source_edit.setPlaceholderText("Select a local media file")
         self.source_edit.setClearButtonEnabled(True)
         self.source_edit.editingFinished.connect(self._sync_source_from_edit)
         self.browse_button = QPushButton("Browse...")
         self.browse_button.clicked.connect(self.browse_for_source)
-        source_row.addWidget(source_label)
         source_row.addWidget(self.source_edit, 1)
         source_row.addWidget(self.browse_button)
-        layout.addLayout(source_row)
-
+        root.addLayout(source_row)
         self.source_details = QLabel("No local file selected.")
         self.source_details.setWordWrap(True)
         self.source_details.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        layout.addWidget(self.source_details)
-
-        question_label = QLabel("Question:")
-        layout.addWidget(question_label)
+        root.addWidget(self.source_details)
+        root.addWidget(QLabel("Question:"))
         self.question_edit = QLineEdit()
         self.question_edit.setPlaceholderText(
             "Ask a question about the selected local file"
         )
-        layout.addWidget(self.question_edit)
+        root.addWidget(self.question_edit)
 
-        self.answer_placeholder = QLabel(
-            "Wave 1 does not execute Video QA yet. This area is reserved for the "
-            "final answer surface."
+    def _build_attachments_group(self, root: QVBoxLayout) -> None:
+        att_box = QGroupBox("Attachments")
+        att_layout = QVBoxLayout(att_box)
+        self._attachment_table = QTableWidget(0, 2)
+        self._attachment_table.setHorizontalHeaderLabels(["Include", "Path"])
+        self._attachment_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Fixed
         )
-        self.answer_placeholder.setWordWrap(True)
-        self.answer_placeholder.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
+        self._attachment_table.setColumnWidth(0, 72)
+        self._attachment_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
         )
-        layout.addWidget(self.answer_placeholder)
+        self._attachment_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self._attachment_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self._attachment_table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        att_layout.addWidget(self._attachment_table, 1)
+        att_btns = QHBoxLayout()
+        self.btn_add_attachments = QPushButton("Add files…")
+        self.btn_add_attachments.clicked.connect(self._add_attachment_files)
+        self.btn_remove_attachments = QPushButton("Remove selected")
+        self.btn_remove_attachments.clicked.connect(self._remove_selected_attachments)
+        att_btns.addWidget(self.btn_add_attachments)
+        att_btns.addWidget(self.btn_remove_attachments)
+        att_btns.addStretch(1)
+        att_layout.addLayout(att_btns)
+        root.addWidget(att_box, 1)
 
-        layout.addStretch(1)
+    def _build_preflight_group(self, root: QVBoxLayout) -> None:
+        pre_box = QGroupBox("Preflight")
+        pre_layout = QVBoxLayout(pre_box)
+        pre_btn_row = QHBoxLayout()
+        self.btn_refresh_preflight = QPushButton("Refresh preflight")
+        self.btn_refresh_preflight.clicked.connect(self.refresh_preflight)
+        pre_btn_row.addWidget(self.btn_refresh_preflight)
+        pre_btn_row.addStretch(1)
+        pre_layout.addLayout(pre_btn_row)
+        self.preflight_edit = QPlainTextEdit()
+        self.preflight_edit.setReadOnly(True)
+        self.preflight_edit.setPlaceholderText(
+            "Click “Refresh preflight” to estimate chunks and context budget."
+        )
+        self.preflight_edit.setMinimumHeight(140)
+        self.preflight_edit.setStyleSheet(_READ_ONLY_STYLE)
+        pre_layout.addWidget(self.preflight_edit)
+        root.addWidget(pre_box)
+
+    def _build_answer_evidence_group(self, root: QVBoxLayout) -> None:
+        out_box = QGroupBox("Answer and evidence")
+        out_layout = QVBoxLayout(out_box)
+        out_layout.addWidget(QLabel("Answer (read-only until backend run):"))
+        self.answer_edit = QPlainTextEdit()
+        self.answer_edit.setReadOnly(True)
+        self.answer_edit.setPlaceholderText(
+            "Final answer will appear here after a Video QA run is implemented."
+        )
+        self.answer_edit.setMinimumHeight(100)
+        self.answer_edit.setStyleSheet(_ANSWER_STYLE)
+        out_layout.addWidget(self.answer_edit)
+        out_layout.addWidget(QLabel("Evidence (read-only until backend run):"))
+        self.evidence_edit = QPlainTextEdit()
+        self.evidence_edit.setReadOnly(True)
+        self.evidence_edit.setPlaceholderText(
+            "Evidence items (quotes, timecodes, frame refs) will appear here."
+        )
+        self.evidence_edit.setMinimumHeight(100)
+        self.evidence_edit.setStyleSheet(_EVIDENCE_STYLE)
+        out_layout.addWidget(self.evidence_edit)
+        root.addWidget(out_box)
+
+    def _build_retry_controls_group(self, root: QVBoxLayout) -> None:
+        # * Scaffold only: chunk retry/resume wiring is not connected from the GUI yet.
+        retry_box = QGroupBox("Retry controls")
+        retry_box.setStyleSheet(_RETRY_GROUP_STYLE)
+        retry_layout = QVBoxLayout(retry_box)
+        retry_note = QLabel(
+            "Retry actions stay disabled until backend chunk execution and manifest "
+            "resume are wired to this panel."
+        )
+        retry_note.setWordWrap(True)
+        retry_layout.addWidget(retry_note)
+        retry_row = QHBoxLayout()
+        self.btn_retry_selected_chunk = QPushButton("Retry selected chunk")
+        self.btn_retry_selected_chunk.setObjectName("video_qa_retry_selected_chunk")
+        self.btn_retry_selected_chunk.setEnabled(False)
+        self.btn_retry_selected_chunk.setToolTip(
+            "Re-run a single chunk without reprocessing the whole video (not wired yet)."
+        )
+        self.btn_resume_last_run = QPushButton("Resume last run")
+        self.btn_resume_last_run.setObjectName("video_qa_resume_last_run")
+        self.btn_resume_last_run.setEnabled(False)
+        self.btn_resume_last_run.setToolTip(
+            "Resume from the last manifest-backed run without full re-ingest (not wired yet)."
+        )
+        retry_row.addWidget(self.btn_retry_selected_chunk)
+        retry_row.addWidget(self.btn_resume_last_run)
+        retry_row.addStretch(1)
+        retry_layout.addLayout(retry_row)
+        root.addWidget(retry_box)
+
+    def _build_run_placeholder(self, root: QVBoxLayout) -> None:
+        self.btn_run_qa = QPushButton("Run Video QA (not wired yet)")
+        self.btn_run_qa.setEnabled(False)
+        self.btn_run_qa.setToolTip(
+            "Backend LM Studio execution is not connected from the GUI in this build."
+        )
+        root.addWidget(self.btn_run_qa)
 
     def browse_for_source(self) -> None:
         """Open a file dialog and attach the selected local source."""
@@ -144,21 +296,176 @@ class VideoQAPanel(QWidget):
         """Return the resolved local source metadata, if available."""
         return self._source
 
+    def attachment_requests(self) -> list[VideoQAAttachmentRequest]:
+        """Return attachment requests for rows whose paths resolve to existing files."""
+        return list(self._iter_attachment_requests())
+
+    def set_answer_text(self, text: str) -> None:
+        """Set the read-only answer surface (for future backend wiring)."""
+        self.answer_edit.setPlainText(text)
+
+    def answer_text(self) -> str:
+        """Return the current answer text."""
+        return self.answer_edit.toPlainText()
+
+    def set_evidence_items(self, items: list[str]) -> None:
+        """Set evidence lines (for future backend wiring)."""
+        self.evidence_edit.setPlainText("\n".join(items))
+
+    def evidence_items(self) -> list[str]:
+        """Return non-empty evidence lines."""
+        return [
+            ln.strip()
+            for ln in self.evidence_edit.toPlainText().splitlines()
+            if ln.strip()
+        ]
+
+    def refresh_preflight(self) -> None:
+        """Build and display a preflight report from the current shell state."""
+        context = self.context_bundle()
+        extra_warnings: list[str] = []
+        duration_s = 0.0
+        src = self.source_path()
+        if src is None:
+            extra_warnings.append("No local media source selected.")
+        elif not src.exists():
+            extra_warnings.append("Media source path is missing on disk.")
+        else:
+            duration_s = float(get_media_duration_seconds(src))
+            if duration_s <= 0.0:
+                extra_warnings.append(
+                    "Media duration could not be read or is zero; preflight uses 0s."
+                )
+
+        preflight = build_video_qa_preflight_summary(
+            context,
+            duration_seconds=duration_s,
+        )
+        if extra_warnings:
+            merged = tuple(dict.fromkeys((*preflight.warnings, *extra_warnings)))
+            preflight = replace(preflight, warnings=merged)
+
+        report = build_video_qa_preflight_report(context, preflight)
+        self.preflight_edit.setPlainText(format_video_qa_preflight_report_text(report))
+
     def context_bundle(
         self,
-        attachments: Iterable[str | Path] = (),
+        attachments: Iterable[str | Path | VideoQAAttachmentRequest] | None = None,
     ) -> VideoQAContextBundle:
-        """Return a normalized prompt context bundle for the current shell."""
+        """Return a normalized prompt context bundle for the current shell.
+
+        Args:
+            attachments: Optional override iterable. When omitted, the panel's
+                attachment table drives normalization.
+
+        """
+        if attachments is not None:
+            return normalize_video_qa_context(
+                source=self._source,
+                question=self.question_text(),
+                attachments=attachments,
+            )
         return normalize_video_qa_context(
             source=self._source,
             question=self.question_text(),
-            attachments=attachments,
+            attachments=self._iter_attachment_requests(),
         )
 
     def url_import_policy(self) -> VideoQAUrlImportPolicy:
         """Return the backend-only URL import policy."""
         return self._url_import_policy
 
+    def attachments_for_persistence(self) -> list[dict[str, Any]]:
+        """Serialize attachment rows for QSettings."""
+        rows: list[dict[str, Any]] = []
+        for r in range(self._attachment_table.rowCount()):
+            item = self._attachment_table.item(r, 1)
+            if item is None:
+                continue
+            path_str = item.text().strip()
+            if not path_str:
+                continue
+            w = self._attachment_table.cellWidget(r, 0)
+            enabled = True
+            if isinstance(w, QCheckBox):
+                enabled = w.isChecked()
+            rows.append({"path": path_str, "enabled": enabled})
+        return rows
+
+    def restore_attachments_state(self, entries: list[Any] | None) -> None:
+        """Restore attachment rows from persisted data."""
+        self._attachment_table.setRowCount(0)
+        if not entries:
+            return
+        seen: set[str] = set()
+        for raw in entries:
+            if not isinstance(raw, dict):
+                continue
+            path_str = str(raw.get("path", "")).strip()
+            if not path_str or path_str in seen:
+                continue
+            seen.add(path_str)
+            enabled = bool(raw.get("enabled", True))
+            self._add_attachment_row(path_str, enabled=enabled)
+
     def _sync_source_from_edit(self) -> None:
         """Sync the source state from the editable path field."""
         self.set_source_path(self.source_edit.text())
+
+    def _iter_attachment_requests(self) -> Iterator[VideoQAAttachmentRequest]:
+        for row in range(self._attachment_table.rowCount()):
+            item = self._attachment_table.item(row, 1)
+            if item is None:
+                continue
+            path_str = item.text().strip()
+            if not path_str:
+                continue
+            p = Path(path_str)
+            w = self._attachment_table.cellWidget(row, 0)
+            enabled = True
+            if isinstance(w, QCheckBox):
+                enabled = w.isChecked()
+            if not p.is_file():
+                continue
+            yield VideoQAAttachmentRequest(path=p, enabled=enabled)
+
+    def _add_attachment_row(self, path: str, *, enabled: bool) -> None:
+        row = self._attachment_table.rowCount()
+        self._attachment_table.insertRow(row)
+        cb = QCheckBox()
+        cb.setChecked(enabled)
+        self._attachment_table.setCellWidget(row, 0, cb)
+        cell = QTableWidgetItem(path)
+        cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        self._attachment_table.setItem(row, 1, cell)
+
+    def _add_attachment_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Add attachment files",
+            str(self._last_attachment_dir),
+            _ATTACHMENT_NAME_FILTER,
+        )
+        existing: set[str] = set()
+        for r in range(self._attachment_table.rowCount()):
+            it = self._attachment_table.item(r, 1)
+            if it is not None:
+                existing.add(it.text())
+        for fn in files:
+            p = Path(fn)
+            if not p.is_file():
+                continue
+            self._last_attachment_dir = p.parent
+            key = str(p.resolve())
+            if key in existing:
+                continue
+            existing.add(key)
+            self._add_attachment_row(key, enabled=True)
+
+    def _remove_selected_attachments(self) -> None:
+        rows = sorted(
+            {i.row() for i in self._attachment_table.selectedIndexes()},
+            reverse=True,
+        )
+        for r in rows:
+            self._attachment_table.removeRow(r)
