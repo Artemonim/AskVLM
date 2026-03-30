@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QFileDialog,
+    QFormLayout,
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
@@ -16,6 +18,8 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
+    QSplitter,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -35,6 +39,7 @@ from core.video_qa_orchestration import (
 from core.video_qa_policy import (
     default_video_qa_url_import_policy,
 )
+from core.video_qa_runtime import default_video_qa_budget_policy
 from core.video_qa_sources import LocalFileProvider
 
 if TYPE_CHECKING:
@@ -57,22 +62,47 @@ _ATTACHMENT_NAME_FILTER = (
 )
 
 _READ_ONLY_STYLE = (
-    "QPlainTextEdit { background-color: #f2f4f8; color: #1a1a1a; "
-    "font-family: Consolas, 'Segoe UI', monospace; font-size: 11px; }"
+    "QPlainTextEdit { background-color: #1e1e1e; color: #d4d4d4; "
+    "font-family: Consolas, 'Segoe UI', monospace; font-size: 11px; "
+    "border: 1px solid #3f3f46; }"
 )
 _ANSWER_STYLE = (
-    "QPlainTextEdit { background-color: #f8f6f2; color: #1a1a1a; "
-    "font-family: 'Segoe UI', system-ui, sans-serif; font-size: 12px; }"
+    "QPlainTextEdit { background-color: #252526; color: #d4d4d4; "
+    "font-family: 'Segoe UI', system-ui, sans-serif; font-size: 12px; "
+    "border: 1px solid #3f3f46; }"
 )
 _EVIDENCE_STYLE = (
-    "QPlainTextEdit { background-color: #f0f6f4; color: #1a1a1a; "
-    "font-family: Consolas, 'Segoe UI', monospace; font-size: 11px; }"
+    "QPlainTextEdit { background-color: #1e1e1e; color: #d4d4d4; "
+    "font-family: Consolas, 'Segoe UI', monospace; font-size: 11px; "
+    "border: 1px solid #3f3f46; }"
 )
 _RETRY_GROUP_STYLE = (
-    "QGroupBox { border: 1px solid #b8bdd4; border-radius: 4px; margin-top: 10px; "
-    "padding-top: 10px; background-color: #eceef5; }"
+    "QGroupBox { border: 1px solid #3f3f46; border-radius: 4px; margin-top: 10px; "
+    "padding-top: 10px; background-color: #2d2d30; }"
     "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; "
-    "color: #2a2f4a; }"
+    "color: #d4d4d4; }"
+)
+_PREFLIGHT_SUMMARY_STYLE = (
+    "QLabel { color: #d4d4d4; font-size: 12px; }"
+    'QLabel[isWarning="true"] { color: #f48771; font-weight: bold; }'
+)
+_VIDEO_QA_PANEL_STYLE = (
+    "QGroupBox { border: 1px solid #3f3f46; border-radius: 4px; margin-top: 10px; "
+    "padding-top: 10px; background-color: #2b2b2f; }"
+    "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; "
+    "color: #d4d4d4; }"
+    "QTableWidget { background-color: #1e1e1e; color: #d4d4d4; gridline-color: #3f3f46; "
+    "border: 1px solid #3f3f46; }"
+    "QHeaderView::section { background-color: #2d2d30; color: #d4d4d4; "
+    "border: 1px solid #3f3f46; padding: 4px 8px; }"
+    "QLineEdit, QSpinBox, QComboBox { background-color: #1e1e1e; color: #d4d4d4; "
+    "border: 1px solid #3f3f46; }"
+    "QPushButton { background-color: #2d2d30; color: #d4d4d4; "
+    "border: 1px solid #3f3f46; padding: 6px 10px; }"
+    "QPushButton:disabled { color: #7a7a7a; background-color: #252526; }"
+    "QCheckBox { color: #d4d4d4; }"
+    "QSplitter::handle { background-color: #3f3f46; }"
+    "QLabel { color: #d4d4d4; }"
 )
 
 
@@ -86,15 +116,55 @@ class VideoQAPanel(QWidget):
         self._source: LocalFileSource | None = None
         self._last_attachment_dir = Path.cwd()
         self._build_form(QVBoxLayout(self))
+        self.setStyleSheet(_VIDEO_QA_PANEL_STYLE)
 
     def _build_form(self, root: QVBoxLayout) -> None:
         self._build_header(root)
-        self._build_source_and_question(root)
-        self._build_attachments_group(root)
-        self._build_preflight_group(root)
-        self._build_answer_evidence_group(root)
-        self._build_retry_controls_group(root)
-        self._build_run_placeholder(root)
+
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter.setChildrenCollapsible(False)
+
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        self._build_source_and_question(left_layout)
+
+        self._left_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._left_splitter.setChildrenCollapsible(False)
+
+        att_widget = QWidget()
+        att_layout = QVBoxLayout(att_widget)
+        att_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_attachments_group(att_layout)
+
+        pre_widget = QWidget()
+        pre_layout = QVBoxLayout(pre_widget)
+        pre_layout.setContentsMargins(0, 0, 0, 0)
+        self._build_preflight_group(pre_layout)
+
+        self._left_splitter.addWidget(att_widget)
+        self._left_splitter.addWidget(pre_widget)
+        self._left_splitter.setStretchFactor(0, 1)
+        self._left_splitter.setStretchFactor(1, 2)
+        self._left_splitter.setSizes([240, 360])
+        left_layout.addWidget(self._left_splitter, 1)
+
+        self._build_answer_evidence_group(right_layout)
+        self._build_retry_controls_group(right_layout)
+        self._build_run_placeholder(right_layout)
+
+        self._main_splitter.addWidget(left_widget)
+        self._main_splitter.addWidget(right_widget)
+        self._main_splitter.setStretchFactor(0, 1)
+        self._main_splitter.setStretchFactor(1, 1)
+        self._main_splitter.setSizes([540, 460])
+
+        root.addWidget(self._main_splitter, 1)
 
     def _build_header(self, root: QVBoxLayout) -> None:
         title = QLabel("Video QA")
@@ -134,9 +204,12 @@ class VideoQAPanel(QWidget):
 
     def _build_attachments_group(self, root: QVBoxLayout) -> None:
         att_box = QGroupBox("Attachments")
+        att_box.setStyleSheet(_VIDEO_QA_PANEL_STYLE)
         att_layout = QVBoxLayout(att_box)
         self._attachment_table = QTableWidget(0, 2)
         self._attachment_table.setHorizontalHeaderLabels(["Include", "Path"])
+        self._attachment_table.setAlternatingRowColors(True)
+        self._attachment_table.setMinimumHeight(220)
         self._attachment_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Fixed
         )
@@ -167,25 +240,70 @@ class VideoQAPanel(QWidget):
 
     def _build_preflight_group(self, root: QVBoxLayout) -> None:
         pre_box = QGroupBox("Preflight")
+        pre_box.setStyleSheet(_VIDEO_QA_PANEL_STYLE)
         pre_layout = QVBoxLayout(pre_box)
         pre_btn_row = QHBoxLayout()
         self.btn_refresh_preflight = QPushButton("Refresh preflight")
         self.btn_refresh_preflight.clicked.connect(self.refresh_preflight)
         pre_btn_row.addWidget(self.btn_refresh_preflight)
+
+        pre_btn_row.addSpacing(16)
+        pre_btn_row.addWidget(QLabel("Context window tokens:"))
+        self.budget_spin = QSpinBox()
+        self.budget_spin.setRange(1024, 262144)
+        self.budget_spin.setSingleStep(1024)
+        self.budget_spin.setValue(100000)
+        pre_btn_row.addWidget(self.budget_spin)
+
         pre_btn_row.addStretch(1)
         pre_layout.addLayout(pre_btn_row)
+
+        self.preflight_summary_form = QFormLayout()
+        self.lbl_preflight_source = QLabel("-")
+        self.lbl_preflight_question = QLabel("-")
+        self.lbl_preflight_duration = QLabel("-")
+        self.lbl_preflight_chunks = QLabel("-")
+        self.lbl_preflight_budget = QLabel("-")
+        self.lbl_preflight_warnings = QLabel("-")
+        self.lbl_preflight_warnings.setWordWrap(True)
+        self.lbl_preflight_warnings.setProperty("isWarning", "true")
+        self.lbl_preflight_overflow = QLabel("-")
+        self.lbl_preflight_overflow.setWordWrap(True)
+
+        self.preflight_summary_form.addRow(QLabel("Source:"), self.lbl_preflight_source)
+        self.preflight_summary_form.addRow(
+            QLabel("Question:"), self.lbl_preflight_question
+        )
+        self.preflight_summary_form.addRow(
+            QLabel("Duration:"), self.lbl_preflight_duration
+        )
+        self.preflight_summary_form.addRow(QLabel("Chunks:"), self.lbl_preflight_chunks)
+        self.preflight_summary_form.addRow(QLabel("Budget:"), self.lbl_preflight_budget)
+        self.preflight_summary_form.addRow(
+            QLabel("Warnings:"), self.lbl_preflight_warnings
+        )
+        self.preflight_summary_form.addRow(
+            QLabel("Overflow:"), self.lbl_preflight_overflow
+        )
+
+        summary_widget = QWidget()
+        summary_widget.setLayout(self.preflight_summary_form)
+        summary_widget.setStyleSheet(_PREFLIGHT_SUMMARY_STYLE)
+        pre_layout.addWidget(summary_widget)
+
         self.preflight_edit = QPlainTextEdit()
         self.preflight_edit.setReadOnly(True)
         self.preflight_edit.setPlaceholderText(
             "Click “Refresh preflight” to estimate chunks and context budget."
         )
-        self.preflight_edit.setMinimumHeight(140)
+        self.preflight_edit.setMinimumHeight(120)
         self.preflight_edit.setStyleSheet(_READ_ONLY_STYLE)
         pre_layout.addWidget(self.preflight_edit)
         root.addWidget(pre_box)
 
     def _build_answer_evidence_group(self, root: QVBoxLayout) -> None:
         out_box = QGroupBox("Answer and evidence")
+        out_box.setStyleSheet(_VIDEO_QA_PANEL_STYLE)
         out_layout = QVBoxLayout(out_box)
         out_layout.addWidget(QLabel("Answer (read-only until backend run):"))
         self.answer_edit = QPlainTextEdit()
@@ -320,6 +438,35 @@ class VideoQAPanel(QWidget):
             if ln.strip()
         ]
 
+    def context_window_tokens(self) -> int:
+        """Return the current GUI budget limit in tokens."""
+        return self.budget_spin.value()
+
+    def set_context_window_tokens(self, tokens: int) -> None:
+        """Set the current GUI budget limit."""
+        self.budget_spin.setValue(tokens)
+
+    def main_splitter_state(self) -> QByteArray:
+        """Return the saved state for the main left/right splitter."""
+        return self._main_splitter.saveState()
+
+    def left_splitter_state(self) -> QByteArray:
+        """Return the saved state for the attachments/preflight splitter."""
+        return self._left_splitter.saveState()
+
+    def restore_splitter_states(
+        self,
+        main_state: object | None,
+        left_state: object | None,
+    ) -> None:
+        """Restore the panel splitter state from persisted settings."""
+        if isinstance(main_state, QByteArray):
+            with contextlib.suppress(Exception):
+                self._main_splitter.restoreState(main_state)
+        if isinstance(left_state, QByteArray):
+            with contextlib.suppress(Exception):
+                self._left_splitter.restoreState(left_state)
+
     def refresh_preflight(self) -> None:
         """Build and display a preflight report from the current shell state."""
         context = self.context_bundle()
@@ -337,15 +484,32 @@ class VideoQAPanel(QWidget):
                     "Media duration could not be read or is zero; preflight uses 0s."
                 )
 
+        budget_policy = default_video_qa_budget_policy()
+        budget_policy = replace(
+            budget_policy, context_window_tokens=self.budget_spin.value()
+        )
+
         preflight = build_video_qa_preflight_summary(
             context,
             duration_seconds=duration_s,
+            budget_policy=budget_policy,
         )
         if extra_warnings:
             merged = tuple(dict.fromkeys((*preflight.warnings, *extra_warnings)))
             preflight = replace(preflight, warnings=merged)
 
         report = build_video_qa_preflight_report(context, preflight)
+
+        self.lbl_preflight_source.setText(report.source_summary or "(not selected)")
+        self.lbl_preflight_question.setText(report.question.strip() or "(empty)")
+        self.lbl_preflight_duration.setText(f"{duration_s:.2f}s")
+        self.lbl_preflight_chunks.setText(str(report.chunk_count))
+        self.lbl_preflight_budget.setText(report.budget_status_line)
+        self.lbl_preflight_warnings.setText(
+            "\n".join(report.warnings) if report.warnings else "none"
+        )
+        self.lbl_preflight_overflow.setText(report.overflow_fallback_explanation)
+
         self.preflight_edit.setPlainText(format_video_qa_preflight_report_text(report))
 
     def context_bundle(

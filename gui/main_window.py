@@ -1302,6 +1302,9 @@ class MainWindow(QMainWindow):
         """Restore Video QA panel fields from settings."""
         self.video_qa_panel.set_source_path(str(s.value("videoqa/source_path", "")))
         self.video_qa_panel.set_question_text(str(s.value("videoqa/question", "")))
+        budget_str = str(s.value("videoqa/context_window_tokens", ""))
+        if budget_str.isdigit():
+            self.video_qa_panel.set_context_window_tokens(int(budget_str))
         raw_attach = s.value("videoqa/attachments_json", "")
         if isinstance(raw_attach, str) and raw_attach.strip():
             try:
@@ -1310,6 +1313,12 @@ class MainWindow(QMainWindow):
                 data = None
             if isinstance(data, list):
                 self.video_qa_panel.restore_attachments_state(list(data))
+        main_splitter_state = s.value("videoqa/main_splitter_state", None)
+        left_splitter_state = s.value("videoqa/left_splitter_state", None)
+        self.video_qa_panel.restore_splitter_states(
+            main_splitter_state,
+            left_splitter_state,
+        )
 
     # * Settings persistence
     def _load_settings(self) -> None:
@@ -1388,8 +1397,19 @@ class MainWindow(QMainWindow):
             s.setValue("videoqa/source_path", str(source_path))
         s.setValue("videoqa/question", self.video_qa_panel.question_text())
         s.setValue(
+            "videoqa/context_window_tokens", self.video_qa_panel.context_window_tokens()
+        )
+        s.setValue(
             "videoqa/attachments_json",
             json.dumps(self.video_qa_panel.attachments_for_persistence()),
+        )
+        s.setValue(
+            "videoqa/main_splitter_state",
+            self.video_qa_panel.main_splitter_state(),
+        )
+        s.setValue(
+            "videoqa/left_splitter_state",
+            self.video_qa_panel.left_splitter_state(),
         )
         # Phase 1.81
         s.setValue("subs/max_line_chars", int(self.spin_line_len.value()))

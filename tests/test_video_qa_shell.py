@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QSettings
-from PySide6.QtWidgets import QPushButton
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtWidgets import QPushButton, QSplitter, QTableWidget
 
 from gui.main_window import MainWindow
 from gui.video_qa import VideoQAPanel
@@ -39,6 +39,9 @@ def test_video_qa_shell_restores_screen_and_source(
 
     window.video_qa_panel.set_source_path(media)
     window.video_qa_panel.set_question_text("What is shown?")
+    window.video_qa_panel.set_context_window_tokens(123456)
+    main_splitter_state = window.video_qa_panel.main_splitter_state()
+    left_splitter_state = window.video_qa_panel.left_splitter_state()
     window.shell_tabs.setCurrentIndex(1)
     window._save_settings()  # noqa: SLF001
 
@@ -48,6 +51,9 @@ def test_video_qa_shell_restores_screen_and_source(
     assert restored.shell_tabs.currentIndex() == 1
     assert restored.video_qa_panel.source_path() == media.resolve()
     assert restored.video_qa_panel.question_text() == "What is shown?"
+    assert restored.video_qa_panel.context_window_tokens() == 123456
+    assert restored.video_qa_panel.main_splitter_state() == main_splitter_state
+    assert restored.video_qa_panel.left_splitter_state() == left_splitter_state
 
 
 def test_video_qa_restores_attachments(
@@ -145,11 +151,34 @@ def test_preflight_refresh_renders_report(tmp_path: Path, qtbot: QtBot) -> None:
     qtbot.addWidget(panel)
     panel.set_source_path(media)
     panel.set_question_text("Describe the scene.")
+    panel.set_context_window_tokens(100000)
     panel.refresh_preflight()
+
     text = panel.preflight_edit.toPlainText()
     assert "Budget:" in text
     assert "Question:" in text
     assert "Describe the scene." in text
+
+    assert panel.lbl_preflight_budget.text() != "-"
+    assert "100000" in panel.lbl_preflight_budget.text()
+
+
+def test_video_qa_layout_has_splitters(qtbot: QtBot) -> None:
+    """Video QA layout is split into two resizable areas."""
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    splitters = panel.findChildren(QSplitter)
+    assert len(splitters) >= 2, "Expected horizontal and vertical splitters."
+    assert any(
+        splitter.orientation() == Qt.Orientation.Horizontal for splitter in splitters
+    )
+    assert any(
+        splitter.orientation() == Qt.Orientation.Vertical for splitter in splitters
+    )
+    attachments_table = panel.findChild(QTableWidget)
+    assert attachments_table is not None
+    assert attachments_table.minimumHeight() >= 220
+    assert panel.preflight_edit.minimumHeight() >= 120
 
 
 def test_text_subtitles_shell_layout_unchanged(qtbot: QtBot) -> None:

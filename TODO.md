@@ -16,8 +16,9 @@
 **Активный workstream:** базовый `Video QA` surface в GUI (источник, вопрос, вложения, preflight, read-only answer/evidence) развивается отдельно от стабильного `Text + Subtitles`. Полноценный запуск LLM, retry по чанкам и расширенный overflow-UX — следующие этапы (см. Wave 4+). Детализация сценариев по-прежнему в `## 2. MVP UX` и `## 10. Tests and verification`.
 
 - [x] Ответ и evidence surface для `Video QA` (read-only зоны; методы для будущей подводки backend; контракт §5/§8 — по мере появления реального run).
-- [x] Preflight summary перед запуском (кнопка Refresh + текст из `format_video_qa_preflight_report_text`; стык с §6).
-- [x] Attachments controls: список вложений, include/exclude; переполнение budget отображается в тексте preflight (дальнейший dedicated overflow UI — позже).
+- [x] Split layout: `Video QA` разделён на левую панель подготовки и правую для процесса/результатов с редактируемым бюджетом токенов.
+- [x] Preflight summary перед запуском (структурированные поля и формы вместо текстового blob'а; стык с §6).
+- [x] Attachments controls: список вложений расширяется по вертикали (resizable), include/exclude; переполнение budget отображается в тексте preflight.
 - [x] Retry controls: повтор по чанку / resume без полной переобработки видео — **UX scaffold** (секция `Retry controls`, disabled кнопки + пояснение); реальная связка с manifest/orchestration/backend run из GUI — следующий этап (§5).
 - [ ] Ручные regression checks по `Text + Subtitles`: preview, export, burn-in и переключение экранов не ломают subtitle-first path (дублирует дух §10, но как явный GUI-focused прогон).
 
