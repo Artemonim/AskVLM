@@ -7,14 +7,15 @@ param(
     [switch]$Json,
     [switch]$NoFix,
     [switch]$SkipLaunch,
-    [switch]$FastLaunch
+    [switch]$FastLaunch,
+    [switch]$Fast
 )
 
 function Show-Help {
     Write-Host "AskVLM runner" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage:"
-    Write-Host "  .\run.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-- <build.py args>]"
+    Write-Host "  .\run.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-Fast] [-- <build.py args>]"
     Write-Host ""
     Write-Host "Flags:"
     Write-Host "  -Tool <name>      Run only one tool: ruff-format, ruff, compile, mypy, pyright, pytest, bandit, pip-audit"
@@ -24,6 +25,7 @@ function Show-Help {
     Write-Host "  -NoFix            Disable auto-fix phase"
     Write-Host "  -SkipLaunch       Run checks/tests only; do not launch the app"
     Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
+    Write-Host "  -Fast             Skip slow and heavy ML tests (pytest)"
     Write-Host "  -Help             Show this help"
     Write-Host ""
     Write-Host "Coverage gates: FAIL <65%, WARN <75% (applied post-pytest)" -ForegroundColor Yellow
@@ -59,6 +61,7 @@ if ($Json) { $buildParams['Json'] = $true }
 if ($NoFix) { $buildParams['NoFix'] = $true }
 if ($SkipLaunch) { $buildParams['SkipLaunch'] = $true }
 if ($FastLaunch) { $buildParams['FastLaunch'] = $true }
+if ($Fast) { $buildParams['Fast'] = $true }
 
 # Handle remaining arguments (forwarded via --)
 $dashdashIndex = $args.IndexOf("--")

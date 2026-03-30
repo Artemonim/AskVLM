@@ -186,8 +186,6 @@ addopts = [
     "--cov=utils",
     "--cov-report=term-missing",
     "--cov-report=xml",
-    "-m",
-    "not slow",
     "-n",
     "auto",
     "--dist=loadgroup",
@@ -195,8 +193,10 @@ addopts = [
 testpaths = ["tests"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "heavy_ml: real Whisper, real LM Studio, or other heavy ML integration",
     "integration: marks tests as integration tests",
     "gpu: marks tests that require GPU",
+    "lm_studio_ping: optional localhost LM Studio HTTP probe (no inference)",
 ]
 filterwarnings = [
     "error",

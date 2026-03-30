@@ -9,14 +9,20 @@ import threading
 import time
 from dataclasses import dataclass
 import contextlib
+import sys
 from pathlib import Path
 from typing import Callable, Iterable, Literal
-import sys
 import os
 import subprocess as _subprocess
 import json as _json
 
 import typer
+
+# * Make direct script execution work without a preconfigured PYTHONPATH.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 from core.audio_io import prepare_audio, cleanup_intermediate_audio
 from core.ffmpeg import get_media_duration_seconds
 from core.whisperx_wrapper import WhisperXWrapper

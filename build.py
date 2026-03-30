@@ -30,6 +30,7 @@ import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TextIO
 import xml.etree.ElementTree as ET
+from ci_cache import CACHEABLE_TOOLS, cache_hit, clear_all_cache, compute_stage_hash, write_stage_cache
 from utils.downloader import check_missing_models, download_model, ensure_models_dir, load_models_config
 
 
@@ -165,10 +166,20 @@ def ensure_ml_models() -> None:
 
 
 class LocalCI:
-    def __init__(self, verbose: bool, json_output: bool, targets: Optional[List[str]]):
+    def __init__(
+        self,
+        verbose: bool,
+        json_output: bool,
+        targets: Optional[List[str]],
+        *,
+        fast: bool = False,
+        no_cache: bool = False,
+    ) -> None:
         self.verbose = verbose
         self.json_output = json_output
         self.targets = targets or DEFAULT_TARGETS
+        self.fast = fast
+        self.no_cache = no_cache
         self.results: Dict[str, Any] = {}
         self.start_time = time.time()
         # Initialize log file
@@ -192,7 +203,7 @@ class LocalCI:
         self.log_file.write(msg + "\n")
         self.log_file.flush()
 
-    def __del__(self):
+    def __del__(self) -> None:
         """Close log file when object is destroyed"""
         if hasattr(self, 'log_file') and self.log_file:
             self._log(f"Build finished at {time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -320,11 +331,36 @@ class LocalCI:
                 add = [p for p in self.targets if p != "tests"]
                 if add and add != DEFAULT_TARGETS:
                     cmd += add
+        if tool == "pytest" and self.fast:
+            cmd += ["-m", "not slow and not heavy_ml"]
         return cmd
 
     def run_tool(self, name: str, fix: bool) -> Dict[str, Any]:
         if not self._available(name):
             return {"tool": name, "available": False, "exit_code": 127, "error": f"{name} not available", "exec_time": 0.0}
+        if (
+            name in CACHEABLE_TOOLS
+            and (not fix)
+            and (not self.no_cache)
+        ):
+            digest = compute_stage_hash(name, self.targets)
+            if cache_hit(name, digest):
+                if not self.json_output:
+                    self._print(f"⏭️  {name} skipped (cache hit)")
+                self._log(f"\n--- {name.upper()} ---")
+                self._log("Skipped: cache hit (inputs unchanged since last success)")
+                return {
+                    "tool": name,
+                    "available": True,
+                    "exit_code": 0,
+                    "stdout": "",
+                    "stderr": "",
+                    "critical": TOOLS[name]["critical"],
+                    "fixed": False,
+                    "exec_time": 0.0,
+                    "skipped": True,
+                    "cache_hit": True,
+                }
         cmd = self._build_command(name, fix)
         start_time = time.time()
         code, out, err = self._run(cmd, heartbeat_label=name)
@@ -339,6 +375,13 @@ class LocalCI:
             "fixed": fix and TOOLS[name].get("can_fix", False),
             "exec_time": exec_time,
         }
+        if (
+            name in CACHEABLE_TOOLS
+            and (not fix)
+            and code == 0
+        ):
+            digest_ok = compute_stage_hash(name, self.targets)
+            write_stage_cache(name, digest_ok)
         # Normalize pytest: treat "no tests ran" as success
         if name == "pytest":
             text = (out or "") + "\n" + (err or "")
@@ -850,6 +893,21 @@ def main() -> None:
     parser.add_argument("--no-fix", action="store_true", help="Disable auto-fix phase")
     parser.add_argument("--skip-launch", action="store_true", help="Run checks/tests only; do not launch app")
     parser.add_argument("--fast-launch", action="store_true", help="Launch the app only; skip checks/tests")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Skip slow and heavy ML tests (pytest -m \"not slow and not heavy_ml\")",
+    )
+    parser.add_argument(
+        "--no-cache",
+        action="store_true",
+        help="Ignore CI stage cache reads (still records trust stamps on success)",
+    )
+    parser.add_argument(
+        "--clean-cache",
+        action="store_true",
+        help="Delete .ci_cache before running checks",
+    )
     args = parser.parse_args()
 
     # * FastLaunch: only launch the application (GUI), skip any checks
@@ -882,7 +940,18 @@ def main() -> None:
 
     ensure_ml_models()
 
-    ci = LocalCI(verbose=args.verbose, json_output=args.json, targets=targets)
+    if args.clean_cache:
+        clear_all_cache()
+        if not args.json:
+            print("Removed .ci_cache", flush=True)
+
+    ci = LocalCI(
+        verbose=args.verbose,
+        json_output=args.json,
+        targets=targets,
+        fast=args.fast,
+        no_cache=args.no_cache,
+    )
     res = ci.run(only=args.tool, fix=(not args.no_fix))
     if args.json:
         print(json.dumps(res, indent=2), flush=True)

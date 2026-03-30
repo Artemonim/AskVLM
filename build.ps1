@@ -13,6 +13,7 @@ param(
     [switch]$NoFix,
     [switch]$SkipLaunch,
     [switch]$FastLaunch,
+    [switch]$Fast,
     [switch]$RecreateVenv,
     [switch]$EnsureML,
     [switch]$EnsureCUDA
@@ -22,7 +23,7 @@ function Show-Help {
     Write-Host "AskVLM build/runner" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage:"
-    Write-Host "  .\\build.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-- <build.py args>]"
+    Write-Host "  .\\build.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-Fast] [-- <build.py args>]"
     Write-Host ""
     Write-Host "Flags:"
     Write-Host "  -Tool <name>      Run only one tool: ruff-format, ruff, compile, mypy, pyright, pytest, bandit, pip-audit"
@@ -32,6 +33,7 @@ function Show-Help {
     Write-Host "  -NoFix            Disable auto-fix phase"
     Write-Host "  -SkipLaunch       Run checks/tests only; do not launch the app"
     Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
+    Write-Host "  -Fast             Skip slow and heavy ML tests (pytest)"
     Write-Host "  -Help             Show this help"
     Write-Host ""
     Write-Host "Coverage gates: FAIL <65%, WARN <75% (applied post-pytest)" -ForegroundColor Yellow
@@ -173,6 +175,7 @@ if ($Json) { $pyArgs += "--json" }
 if ($NoFix) { $pyArgs += "--no-fix" }
 if ($SkipLaunch) { $pyArgs += "--skip-launch" }
 if ($FastLaunch) { $pyArgs += "--fast-launch" }
+if ($Fast) { $pyArgs += "--fast" }
 if ($forward.Count -gt 0) { $pyArgs += $forward }
 
 Write-Host "DEBUG: Running python with args: $($pyArgs -join ' ')" -ForegroundColor DarkGray

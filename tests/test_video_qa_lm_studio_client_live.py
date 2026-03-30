@@ -12,12 +12,14 @@ from core.video_qa_lm_studio_client import (
     LMStudioClientError,
     request_chat_completion,
 )
+from utils.askvlm_defaults import get_default_video_qa_canonical_model_id
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
 @pytest.mark.integration
+@pytest.mark.heavy_ml
 @pytest.mark.skipif(
     not os.getenv("ASKVLM_RUN_LIVE_LM_STUDIO"),
     reason="Live LM Studio test (set ASKVLM_RUN_LIVE_LM_STUDIO=1 to run)",
@@ -51,7 +53,7 @@ def test_live_lm_studio_multimodal_request(tmp_path: Path) -> None:
             prompt=prompt,
             image_paths=[image_path],
             json_schema=schema,
-            model="Qwen/Qwen3.5-35B-A3B",
+            model=get_default_video_qa_canonical_model_id(),
             temperature=0.0,
             timeout=120.0,
         )

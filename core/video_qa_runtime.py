@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
+from utils.askvlm_defaults import get_default_video_qa_canonical_model_id
+
 if TYPE_CHECKING:
     from .video_qa_context import VideoQAContextBundle
 
@@ -120,7 +122,9 @@ class VideoQAModelProfile:
     This profile never performs live model calls.
     """
 
-    canonical_model_id: str = "Qwen/Qwen3.5-35B-A3B"
+    canonical_model_id: str = field(
+        default_factory=get_default_video_qa_canonical_model_id
+    )
     provider: str = "LM Studio"
     modalities: tuple[str, ...] = ("text", "image")
     structured_output_is_best_effort: bool = True

@@ -15,6 +15,7 @@ from core.video_qa_runtime import (
     default_video_qa_target_model_profile,
 )
 from core.video_qa_sources import LocalFileProvider
+from utils.askvlm_defaults import get_default_video_qa_canonical_model_id
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -50,7 +51,7 @@ def test_default_model_profile_fields_and_summary() -> None:
     """Target LM Studio profile is data-only with multimodal and best-effort JSON."""
     profile = default_video_qa_target_model_profile()
 
-    assert profile.canonical_model_id == "Qwen/Qwen3.5-35B-A3B"
+    assert profile.canonical_model_id == get_default_video_qa_canonical_model_id()
     assert profile.provider == "LM Studio"
     assert "text" in profile.modalities
     assert "image" in profile.modalities
