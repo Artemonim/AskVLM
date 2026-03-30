@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import time
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, TextIO
 import xml.etree.ElementTree as ET
@@ -195,8 +196,37 @@ class LocalCI:
             self._log(f"Build finished at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             self.log_file.close()
 
-    def _run(self, cmd: List[str]) -> Tuple[int, str, str]:
+    def _run(self, cmd: List[str], heartbeat_label: Optional[str] = None) -> Tuple[int, str, str]:
+        # * Heartbeat prints keep the console "alive" during long quiet commands
+        #   (e.g. pytest -q), while still capturing stdout/stderr for build.log.
+        stop_event = threading.Event()
+        hb_thread: Optional[threading.Thread] = None
+        start_time = time.time()
+        heartbeat_tools = {"pytest", "mypy", "pyright"}
+        heartbeat_interval_s = 60
+
         try:
+            if (
+                heartbeat_label
+                and heartbeat_label in heartbeat_tools
+                and (not self.verbose)
+                and (not self.json_output)
+            ):
+                def _heartbeat() -> None:
+                    while not stop_event.is_set():
+                        time.sleep(heartbeat_interval_s)
+                        if stop_event.is_set():
+                            break
+                        elapsed_s = int(time.time() - start_time)
+                        hh = elapsed_s // 3600
+                        mm = (elapsed_s % 3600) // 60
+                        ss = elapsed_s % 60
+                        t = f"{hh:02d}:{mm:02d}:{ss:02d}"
+                        self._print(f"[heartbeat] {heartbeat_label} alive t+{t} (output captured to build.log)")
+
+                hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+                hb_thread.start()
+
             if self.verbose and not self.json_output:
                 self._print(f"* Running: {' '.join(cmd)}")
             shell = os.name == "nt" and cmd[0] in {"npx", "npm"}
@@ -208,6 +238,10 @@ class LocalCI:
             return 127, "", f"Command not found: {cmd[0]}"
         except Exception as e:
             return 1, "", str(e)
+        finally:
+            if hb_thread is not None:
+                stop_event.set()
+                hb_thread.join(timeout=1)
 
     def _available(self, tool: str) -> bool:
         base = TOOLS[tool]["command"]
@@ -291,7 +325,7 @@ class LocalCI:
             return {"tool": name, "available": False, "exit_code": 127, "error": f"{name} not available", "exec_time": 0.0}
         cmd = self._build_command(name, fix)
         start_time = time.time()
-        code, out, err = self._run(cmd)
+        code, out, err = self._run(cmd, heartbeat_label=name)
         exec_time = round(time.time() - start_time, 2)
         res: Dict[str, Any] = {
             "tool": name,
