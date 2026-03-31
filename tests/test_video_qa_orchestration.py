@@ -269,6 +269,10 @@ def test_preflight_overflow_policy_in_summary(tmp_path: Path) -> None:
     )
     assert summary.overflow_policy == custom
     assert len(summary.chunk_plan) == 2
+    assert summary.budget.sampled_frame_count == 120
+    assert summary.budget.frame_tokens_estimate == (
+        120 * policy.frame_tokens_per_sample
+    )
     assert summary.budget.chunk_overhead_tokens == (
         2 * policy.reserved_chunk_overhead_tokens
     )
@@ -317,7 +321,9 @@ def test_preflight_report_includes_budget_chunks_warnings_overflow_text(
     assert report.chunk_count == 2
     assert report.budget_fits is False
     assert "over by" in report.budget_status_line
+    assert "frames" in report.budget_status_line
     assert "total=" in report.budget_estimate_summary
+    assert "frames=" in report.budget_estimate_summary
     assert preflight.warnings
     assert report.warnings == preflight.warnings
     assert "1. reduce frame count" in report.overflow_mitigation_order_text
@@ -330,6 +336,7 @@ def test_preflight_report_includes_budget_chunks_warnings_overflow_text(
     assert "Chunks: 2" in text
     assert "Chunk plan:" in text
     assert report.chunk_plan[0].chunk_id in text
+    assert "frames=" in text
     assert "Overflow mitigation order:" in text
     assert "Warnings:" in text
 
@@ -340,16 +347,28 @@ def test_preflight_report_fits_shows_non_overflow_explanation(tmp_path: Path) ->
     clip.write_bytes(b"abc")
     source = LocalFileProvider().resolve(clip)
     bundle = normalize_video_qa_context(source=source, question="Hi", attachments=())
+    budget_policy = VideoQABudgetPolicy(
+        context_window_tokens=50000,
+        reserved_output_tokens=512,
+        reserved_instruction_tokens=256,
+        reserved_chunk_overhead_tokens=64,
+        frame_tokens_per_sample=128,
+        source_bytes_per_token=2048,
+        min_source_tokens=256,
+        max_source_tokens=1024,
+    )
     preflight = build_video_qa_preflight_summary(
         bundle,
         duration_seconds=30.0,
         uniform_segment_seconds=30.0,
+        budget_policy=budget_policy,
     )
     report = build_video_qa_preflight_report(bundle, preflight)
     assert len(report.chunk_plan) == 1
     assert report.chunk_plan[0].t_end == 30.0
     assert report.budget_fits is True
     assert "fits" in report.budget_status_line
+    assert "frames" in report.budget_status_line
     assert "Offline estimate fits" in report.overflow_fallback_explanation
     assert "exceeds" not in report.overflow_fallback_explanation
 

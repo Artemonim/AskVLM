@@ -6,7 +6,10 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from core.video_qa_answer_bundle import ANSWER_BUNDLE_SCHEMA_VERSION
+from core.video_qa_answer_bundle import (
+    ANSWER_BUNDLE_SCHEMA_VERSION,
+    VideoQAAnswerBundle,
+)
 from core.video_qa_context import normalize_video_qa_context
 from core.video_qa_executor import (
     VideoQAChunkExecutionResult,
@@ -16,8 +19,11 @@ from core.video_qa_executor import (
     VideoQATranscriptArtifacts,
     VideoQATranscriptProvider,
 )
+from core.video_qa_lm_studio_client import LMStudioResponse
 from core.video_qa_local_run import (
-    VideoQADeterministicAnswerAggregator,
+    FINAL_SYNTHESIS_JSON_SCHEMA,
+    VideoQAFFmpegFrameMaterializer,
+    VideoQALMStudioAnswerSynthesizer,
     VideoQALocalRunParams,
     VideoQAPreflightBlockedError,
     ensure_local_video_qa_run_allowed,
@@ -55,10 +61,10 @@ def test_ensure_local_run_blocked_when_budget_does_not_fit() -> None:
         ensure_local_video_qa_run_allowed(report, report.chunk_plan)
 
 
-def test_deterministic_aggregator_reads_chunk_json_artifacts(
+def test_final_synthesizer_uses_chunk_artifacts_and_returns_single_answer(
     tmp_path: Path,
 ) -> None:
-    """Aggregator builds an answer bundle from chunk artifact JSON strings."""
+    """Final synthesis pass produces one answer from chunk artifact inputs."""
     payload = {
         "chunk_summary": "Person opens the door.",
         "observations": ["Motion visible"],
@@ -94,18 +100,123 @@ def test_deterministic_aggregator_reads_chunk_json_artifacts(
             frames=(str(frame_path),),
         ),
     )
-    agg = VideoQADeterministicAnswerAggregator()
+
+    captured: dict[str, object] = {}
+
+    def fake_request(
+        base_url: str,
+        prompt: str,
+        json_schema: object = None,
+        **kwargs: object,
+    ) -> LMStudioResponse:
+        captured["base_url"] = base_url
+        captured["prompt"] = prompt
+        captured["json_schema"] = json_schema
+        captured["kwargs"] = kwargs
+        final_payload = {
+            "answer": "A person opens the door and moves into view.",
+            "evidence": [
+                {
+                    "transcript_quote": "door opens",
+                    "t_start": 1.0,
+                    "t_end": 3.0,
+                    "frame_refs": [str(frame_path)],
+                }
+            ],
+            "is_uncertain": False,
+            "uncertainty_note": None,
+        }
+        return LMStudioResponse(
+            content=json.dumps(final_payload),
+            parsed_json=final_payload,
+            used_fallback=False,
+            finish_reason="stop",
+            raw_response={},
+        )
+
+    agg = VideoQALMStudioAnswerSynthesizer(
+        base_url="http://127.0.0.1:1234/v1",
+        model="fake-model",
+        request_chat_fn=fake_request,
+    )
     bundle = agg.aggregate(
         context=ctx,
         manifest=manifest,
         transcript=transcript,
         chunk_results=chunk_results,
     )
-    assert "Person opens the door." in bundle.answer
+    assert bundle.answer == "A person opens the door and moves into view."
     assert bundle.is_uncertain is True
     assert bundle.schema_version == ANSWER_BUNDLE_SCHEMA_VERSION
     assert len(bundle.evidence) == 1
     assert bundle.evidence[0].t_start == 1.0
+    assert bundle.evidence[0].frame_refs == (str(frame_path),)
+    assert captured["base_url"] == "http://127.0.0.1:1234/v1"
+    assert captured["json_schema"] == FINAL_SYNTHESIS_JSON_SCHEMA
+    assert "Person opens the door." in str(captured["prompt"])
+    assert "chunk-1" not in bundle.answer
+
+
+def test_ffmpeg_frame_materializer_falls_back_to_single_frame(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Frame materializer falls back when multi-frame extraction yields nothing."""
+    video = tmp_path / "clip.mp4"
+    video.write_bytes(b"x")
+    frames_dir = tmp_path / "frames"
+    materializer = VideoQAFFmpegFrameMaterializer(
+        video_path=video,
+        frames_dir=frames_dir,
+        sample_fps=2.0,
+    )
+    fallback_output = frames_dir / "chunk-1.png"
+
+    def no_frames(
+        _video_file: object,
+        _start_s: float,
+        _end_s: float,
+        _output_pattern: Path,
+        *,
+        fps: float,
+    ) -> tuple[Path, ...]:
+        _ = (_video_file, _start_s, _end_s, _output_pattern, fps)
+        return ()
+
+    monkeypatch.setattr("core.video_qa_local_run.extract_frames_for_span", no_frames)
+
+    def fake_extract_frame(
+        _video_file: object,
+        _timestamp_s: float,
+        output_file: Path,
+    ) -> Path:
+        output_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+        return output_file
+
+    monkeypatch.setattr(
+        "core.video_qa_local_run.extract_frame_to_file", fake_extract_frame
+    )
+
+    manifest = VideoQARunManifest(
+        schema_version=1,
+        run_id="run-a",
+        created_at="2026-03-30T12:00:00Z",
+        source=None,
+        question="Q",
+        attachments=(),
+        graph=(),
+        chunks=(),
+        status="pending",
+    )
+    frames = materializer.materialize_frames(
+        chunk=VideoQAChunkRecord(chunk_id="chunk-1", t_start=0.0, t_end=1.0),
+        representative_timestamp=0.5,
+        manifest=manifest,
+        transcript=VideoQATranscriptArtifacts("hello"),
+    )
+
+    assert frames == (str(fallback_output.resolve()),)
+    assert fallback_output.exists()
 
 
 def test_run_local_video_qa_with_injected_stack(
@@ -167,6 +278,28 @@ def test_run_local_video_qa_with_injected_stack(
                 artifacts=(json.dumps(pl, sort_keys=True),),
             )
 
+    class _FixedAggregator:
+        def aggregate(
+            self,
+            *,
+            context: object,
+            manifest: VideoQARunManifest,
+            transcript: VideoQATranscriptArtifacts,
+            chunk_results: object,
+        ) -> VideoQAAnswerBundle:
+            _ = (context, transcript, chunk_results)
+            return VideoQAAnswerBundle(
+                schema_version=ANSWER_BUNDLE_SCHEMA_VERSION,
+                run_id=f"{manifest.run_id}-answer",
+                created_at=manifest.created_at,
+                question="Test?",
+                answer="seen",
+                evidence=(),
+                is_uncertain=False,
+                manifest_run_id=manifest.run_id,
+                uncertainty_note=None,
+            )
+
     whisper = MagicMock()
     params = VideoQALocalRunParams(
         context=ctx,
@@ -181,6 +314,7 @@ def test_run_local_video_qa_with_injected_stack(
         transcript_override=_FixedTranscript(),
         frame_override=_FixedFrames(),
         chunk_inferencer_override=_FixedInferencer(),
+        aggregator_override=_FixedAggregator(),
     )
     assert outcome.manifest.status == "completed"
     manifest_path = tmp_path / f"{outcome.manifest.run_id}.manifest.json"

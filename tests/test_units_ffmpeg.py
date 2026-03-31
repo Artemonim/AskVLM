@@ -47,6 +47,23 @@ def test_burn_subtitles_generates_file(
     assert output_video.stat().st_size > 0
 
 
+def test_extract_frames_for_span_returns_multiple_files(
+    short_audio_fixture: Path, tmp_path: Path
+) -> None:
+    """extract_frames_for_span writes multiple sampled frames for a chunk."""
+    outputs = ffm.extract_frames_for_span(
+        short_audio_fixture,
+        1.0,
+        3.0,
+        tmp_path / "chunk-%03d.png",
+        fps=2.0,
+    )
+
+    assert len(outputs) >= 3
+    assert all(path.exists() for path in outputs)
+    assert all(path.suffix == ".png" for path in outputs)
+
+
 def test_get_media_duration_real(short_audio_fixture: Path) -> None:
     """get_media_duration_seconds returns approx 10s for the fixture."""
     dur = ffm.get_media_duration_seconds(short_audio_fixture)

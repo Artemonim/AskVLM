@@ -5,7 +5,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QByteArray, Qt, Signal
+from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -76,12 +76,6 @@ _EVIDENCE_STYLE = (
     "font-family: Consolas, 'Segoe UI', monospace; font-size: 11px; "
     "border: 1px solid #3f3f46; }"
 )
-_RETRY_GROUP_STYLE = (
-    "QGroupBox { border: 1px solid #3f3f46; border-radius: 4px; margin-top: 10px; "
-    "padding-top: 10px; background-color: #2d2d30; }"
-    "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; "
-    "color: #d4d4d4; }"
-)
 _PREFLIGHT_SUMMARY_STYLE = (
     "QLabel { color: #d4d4d4; font-size: 12px; }"
     'QLabel[isWarning="true"] { color: #f48771; font-weight: bold; }'
@@ -107,16 +101,25 @@ _VIDEO_QA_PANEL_STYLE = (
 
 
 class VideoQAPanel(QWidget):
-    """Video QA workspace: source, question, attachments, preflight, answer/evidence, and retry scaffold."""
+    """Video QA workspace: source, question, attachments, preflight, answer, and evidence."""
 
     video_qa_run_requested = Signal()
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        preflight_debounce_ms: int = 2000,
+    ) -> None:
         super().__init__(parent)
         self._provider = LocalFileProvider()
         self._url_import_policy = default_video_qa_url_import_policy()
         self._source: LocalFileSource | None = None
         self._last_attachment_dir = Path.cwd()
+        self._preflight_refresh_timer = QTimer(self)
+        self._preflight_refresh_timer.setSingleShot(True)
+        self._preflight_refresh_timer.setInterval(max(0, int(preflight_debounce_ms)))
+        self._preflight_refresh_timer.timeout.connect(self.refresh_preflight)
         self._build_form(QVBoxLayout(self))
         self.setStyleSheet(_VIDEO_QA_PANEL_STYLE)
 
@@ -157,7 +160,6 @@ class VideoQAPanel(QWidget):
         left_layout.addWidget(self._left_splitter, 1)
 
         self._build_answer_evidence_group(right_layout)
-        self._build_retry_controls_group(right_layout)
         self._build_run_placeholder(right_layout)
 
         self._main_splitter.addWidget(left_widget)
@@ -203,6 +205,7 @@ class VideoQAPanel(QWidget):
         self.question_edit.setPlaceholderText(
             "Ask a question about the selected local file"
         )
+        self.question_edit.textChanged.connect(self._schedule_preflight_refresh)
         root.addWidget(self.question_edit)
 
     def _build_attachments_group(self, root: QVBoxLayout) -> None:
@@ -256,6 +259,7 @@ class VideoQAPanel(QWidget):
         self.budget_spin.setRange(1024, 262144)
         self.budget_spin.setSingleStep(1024)
         self.budget_spin.setValue(100000)
+        self.budget_spin.valueChanged.connect(self._schedule_preflight_refresh)
         pre_btn_row.addWidget(self.budget_spin)
 
         pre_btn_row.addStretch(1)
@@ -328,43 +332,13 @@ class VideoQAPanel(QWidget):
         out_layout.addWidget(self.evidence_edit)
         root.addWidget(out_box)
 
-    def _build_retry_controls_group(self, root: QVBoxLayout) -> None:
-        # * Scaffold only: chunk retry/resume wiring is not connected from the GUI yet.
-        retry_box = QGroupBox("Retry controls")
-        retry_box.setStyleSheet(_RETRY_GROUP_STYLE)
-        retry_layout = QVBoxLayout(retry_box)
-        retry_note = QLabel(
-            "Retry actions stay disabled until backend chunk execution and manifest "
-            "resume are wired to this panel."
-        )
-        retry_note.setWordWrap(True)
-        retry_layout.addWidget(retry_note)
-        retry_row = QHBoxLayout()
-        self.btn_retry_selected_chunk = QPushButton("Retry selected chunk")
-        self.btn_retry_selected_chunk.setObjectName("video_qa_retry_selected_chunk")
-        self.btn_retry_selected_chunk.setEnabled(False)
-        self.btn_retry_selected_chunk.setToolTip(
-            "Re-run a single chunk without reprocessing the whole video (not wired yet)."
-        )
-        self.btn_resume_last_run = QPushButton("Resume last run")
-        self.btn_resume_last_run.setObjectName("video_qa_resume_last_run")
-        self.btn_resume_last_run.setEnabled(False)
-        self.btn_resume_last_run.setToolTip(
-            "Resume from the last manifest-backed run without full re-ingest (not wired yet)."
-        )
-        retry_row.addWidget(self.btn_retry_selected_chunk)
-        retry_row.addWidget(self.btn_resume_last_run)
-        retry_row.addStretch(1)
-        retry_layout.addLayout(retry_row)
-        root.addWidget(retry_box)
-
     def _build_run_placeholder(self, root: QVBoxLayout) -> None:
         self.btn_run_qa = QPushButton("Run Video QA")
         self.btn_run_qa.setObjectName("video_qa_run")
         self.btn_run_qa.setEnabled(True)
         self.btn_run_qa.setToolTip(
-            "Run ASR, extract frames per chunk, call LM Studio per chunk, "
-            "and aggregate the answer (uses the main output directory)."
+            "Run ASR, sample chunk frames, call LM Studio per chunk, and synthesize "
+            "one final answer (uses the main output directory)."
         )
         self.btn_run_qa.clicked.connect(self._emit_run_requested)
         root.addWidget(self.btn_run_qa)
@@ -399,6 +373,7 @@ class VideoQAPanel(QWidget):
             self._source = None
             self.source_edit.clear()
             self.source_details.setText("No local file selected.")
+            self._schedule_preflight_refresh()
             return False
 
         try:
@@ -407,11 +382,13 @@ class VideoQAPanel(QWidget):
             self._source = None
             self.source_edit.setText(str(path))
             self.source_details.setText(f"Local file unavailable: {exc}")
+            self._schedule_preflight_refresh()
             return False
 
         self._source = source
         self.source_edit.setText(str(source.path))
         self.source_details.setText(source.summary)
+        self._schedule_preflight_refresh()
         return True
 
     def source_path(self) -> Path | None:
@@ -479,6 +456,7 @@ class VideoQAPanel(QWidget):
 
     def refresh_preflight(self) -> None:
         """Build and display a preflight report from the current shell state."""
+        self._preflight_refresh_timer.stop()
         context = self.context_bundle()
         extra_warnings: list[str] = []
         duration_s = 0.0
@@ -570,6 +548,7 @@ class VideoQAPanel(QWidget):
         """Restore attachment rows from persisted data."""
         self._attachment_table.setRowCount(0)
         if not entries:
+            self._schedule_preflight_refresh()
             return
         seen: set[str] = set()
         for raw in entries:
@@ -581,10 +560,15 @@ class VideoQAPanel(QWidget):
             seen.add(path_str)
             enabled = bool(raw.get("enabled", True))
             self._add_attachment_row(path_str, enabled=enabled)
+        self._schedule_preflight_refresh()
 
     def _sync_source_from_edit(self) -> None:
         """Sync the source state from the editable path field."""
         self.set_source_path(self.source_edit.text())
+
+    def _schedule_preflight_refresh(self) -> None:
+        """Queue a debounced preflight refresh after interactive changes."""
+        self._preflight_refresh_timer.start()
 
     def _iter_attachment_requests(self) -> Iterator[VideoQAAttachmentRequest]:
         for row in range(self._attachment_table.rowCount()):
@@ -608,6 +592,7 @@ class VideoQAPanel(QWidget):
         self._attachment_table.insertRow(row)
         cb = QCheckBox()
         cb.setChecked(enabled)
+        cb.stateChanged.connect(self._schedule_preflight_refresh)
         self._attachment_table.setCellWidget(row, 0, cb)
         cell = QTableWidgetItem(path)
         cell.setFlags(cell.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -625,6 +610,7 @@ class VideoQAPanel(QWidget):
             it = self._attachment_table.item(r, 1)
             if it is not None:
                 existing.add(it.text())
+        added_any = False
         for fn in files:
             p = Path(fn)
             if not p.is_file():
@@ -635,6 +621,9 @@ class VideoQAPanel(QWidget):
                 continue
             existing.add(key)
             self._add_attachment_row(key, enabled=True)
+            added_any = True
+        if added_any:
+            self._schedule_preflight_refresh()
 
     def _remove_selected_attachments(self) -> None:
         rows = sorted(
@@ -643,3 +632,5 @@ class VideoQAPanel(QWidget):
         )
         for r in rows:
             self._attachment_table.removeRow(r)
+        if rows:
+            self._schedule_preflight_refresh()

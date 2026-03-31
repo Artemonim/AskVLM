@@ -187,16 +187,22 @@ def build_video_qa_preflight_report(
 ) -> VideoQAPreflightReport:
     """Turn a preflight summary plus context into a user-facing report record."""
     budget = preflight.budget
+    frame_status = (
+        f", {budget.sampled_frame_count} frames≈{budget.frame_tokens_estimate} tokens"
+        if budget.sampled_frame_count > 0
+        else ""
+    )
     fits = budget.fits
     if fits:
         status_line = (
             f"fits ({budget.total_required_tokens} / "
-            f"{budget.context_window_tokens} tokens)"
+            f"{budget.context_window_tokens} tokens{frame_status})"
         )
     else:
         status_line = (
             f"over by {budget.overflow_tokens} tokens "
-            f"({budget.total_required_tokens} / {budget.context_window_tokens})"
+            f"({budget.total_required_tokens} / {budget.context_window_tokens}"
+            f"{frame_status})"
         )
     source_summary = context.source.summary if context.source is not None else None
     overflow_text = format_video_qa_overflow_mitigation_order(preflight.overflow_policy)
@@ -427,9 +433,19 @@ def build_video_qa_preflight_summary(
     if duration_seconds > 0 and not chunk_plan:
         chunk_warnings.append("Chunk plan is empty after normalization.")
 
+    sampled_frame_count = sum(
+        max(
+            1,
+            int(policy.minimum_frames_per_chunk),
+            math.ceil(max(0.0, chunk.t_end - chunk.t_start) * policy.frame_sample_fps),
+        )
+        for chunk in chunk_plan
+    )
+
     budget = build_video_qa_budget_estimate(
         context,
         chunk_count=len(chunk_plan),
+        sampled_frame_count=sampled_frame_count,
         budget_policy=policy,
         runtime_policy=runtime,
     )

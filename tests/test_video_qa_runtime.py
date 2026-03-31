@@ -113,6 +113,9 @@ def test_budget_policy_defaults_are_conservative() -> None:
     assert policy.reserved_output_tokens > 0
     assert policy.reserved_instruction_tokens > 0
     assert policy.reserved_chunk_overhead_tokens > 0
+    assert policy.frame_sample_fps == 2.0
+    assert policy.minimum_frames_per_chunk == 1
+    assert policy.frame_tokens_per_sample > 0
     assert policy.source_bytes_per_token > 0
     assert policy.max_source_tokens >= policy.min_source_tokens
 
@@ -141,11 +144,19 @@ def test_budget_estimate_tracks_source_question_attachments_and_chunks(
             frame,
         ],
     )
-    estimate = build_video_qa_budget_estimate(bundle, chunk_count=3)
+    estimate = build_video_qa_budget_estimate(
+        bundle,
+        chunk_count=3,
+        sampled_frame_count=6,
+    )
 
     assert estimate.source_tokens_estimate == 256
     assert estimate.question_tokens > 0
     assert estimate.attachment_tokens == bundle.attachment_budget_tokens
+    assert estimate.sampled_frame_count == 6
+    assert estimate.frame_tokens_estimate == (
+        6 * estimate.policy.frame_tokens_per_sample
+    )
     assert (
         estimate.chunk_overhead_tokens
         == 3 * estimate.policy.reserved_chunk_overhead_tokens
@@ -173,7 +184,30 @@ def test_budget_estimate_warns_when_chunk_plan_is_missing(
     estimate = build_video_qa_budget_estimate(bundle)
 
     assert any("chunk plan" in warning.lower() for warning in estimate.warnings)
+    assert estimate.sampled_frame_count == 0
+    assert estimate.frame_tokens_estimate == 0
     assert estimate.chunk_overhead_tokens == 0
+
+
+def test_budget_estimate_uses_minimum_frame_cost_when_only_chunk_count_is_known(
+    tmp_path: Path,
+) -> None:
+    """Budget estimate keeps a visible frame cost even without chunk durations."""
+    source_media = tmp_path / "clip.mp4"
+    source_media.write_bytes(b"abc")
+    source = LocalFileProvider().resolve(source_media)
+
+    bundle = normalize_video_qa_context(
+        source=source,
+        question="What is shown?",
+        attachments=(),
+    )
+    estimate = build_video_qa_budget_estimate(bundle, chunk_count=3)
+
+    assert estimate.sampled_frame_count == 3
+    assert estimate.frame_tokens_estimate == (
+        3 * estimate.policy.frame_tokens_per_sample
+    )
 
 
 def test_budget_estimate_marks_overflow_with_small_context_window(

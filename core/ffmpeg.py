@@ -232,3 +232,56 @@ def extract_frame_to_file(
         .run(quiet=True)
     )
     return out
+
+
+def extract_frames_for_span(
+    video_file: str | Path,
+    start_s: float,
+    end_s: float,
+    output_pattern: str | Path,
+    *,
+    fps: float = 2.0,
+) -> tuple[Path, ...]:
+    """Extract multiple frames for a time span into numbered files.
+
+    Args:
+        video_file: Input video path.
+        start_s: Inclusive span start in seconds.
+        end_s: Exclusive span end in seconds.
+        output_pattern: Numbered output pattern such as ``chunk-%03d.png``.
+        fps: Sampling rate for the span.
+
+    Returns:
+        Absolute output paths sorted by filename.
+
+    """
+    v = Path(video_file).resolve()
+    out_pattern = Path(output_pattern).resolve()
+    out_dir = out_pattern.parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stem = out_pattern.stem
+    if "%" not in stem:
+        msg = "Output pattern must contain an ffmpeg image sequence placeholder."
+        raise ValueError(msg)
+
+    prefix = stem.split("%", 1)[0]
+    suffix = out_pattern.suffix
+    for existing in sorted(out_dir.glob(f"{prefix}*{suffix}")):
+        try:
+            existing.unlink()
+        except OSError:
+            logger.debug("Could not remove stale extracted frame: %s", existing)
+
+    duration_s = max(1e-6, float(end_s) - float(start_s))
+    (
+        ffmpeg.input(str(v), ss=max(0.0, float(start_s)), t=duration_s)
+        .filter("fps", fps=max(0.001, float(fps)))
+        .output(str(out_pattern), start_number=1)
+        .overwrite_output()
+        .run(quiet=True)
+    )
+    return tuple(
+        path.resolve()
+        for path in sorted(out_dir.glob(f"{prefix}*{suffix}"))
+        if path.is_file()
+    )

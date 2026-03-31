@@ -183,24 +183,64 @@ def test_main_window_dispatches_video_qa_launch_request(
     assert str(out_dir) == str((tmp_path / "out").resolve())
 
 
-def test_video_qa_retry_controls_present_and_disabled(qtbot: QtBot) -> None:
-    """Retry controls are visible placeholders until backend wiring exists."""
+def test_video_qa_retry_controls_removed(qtbot: QtBot) -> None:
+    """Retry scaffold is removed from the Video QA panel."""
     panel = VideoQAPanel()
     qtbot.addWidget(panel)
     retry_btn = panel.findChild(QPushButton, "video_qa_retry_selected_chunk")
     resume_btn = panel.findChild(QPushButton, "video_qa_resume_last_run")
-    assert retry_btn is not None
-    assert resume_btn is not None
-    assert retry_btn.isEnabled() is False
-    assert resume_btn.isEnabled() is False
-    assert retry_btn.text() == "Retry selected chunk"
-    assert resume_btn.text() == "Resume last run"
+    assert retry_btn is None
+    assert resume_btn is None
 
 
-def test_preflight_refresh_renders_report(tmp_path: Path, qtbot: QtBot) -> None:
+def test_video_qa_auto_preflight_refreshes_after_debounce(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    """Question, source, attachment, and budget changes trigger debounced refreshes."""
+    media = tmp_path / "sample.mp4"
+    media.write_bytes(b"abc")
+    note = tmp_path / "note.txt"
+    note.write_text("hello", encoding="utf-8")
+    monkeypatch.setattr("gui.video_qa.get_media_duration_seconds", lambda _p: 30.0)
+
+    panel = VideoQAPanel(preflight_debounce_ms=40)
+    qtbot.addWidget(panel)
+    panel.set_source_path(media)
+    panel.set_question_text("Auto refresh?")
+
+    qtbot.wait(10)
+    assert panel.preflight_edit.toPlainText() == ""
+
+    qtbot.waitUntil(
+        lambda: "Auto refresh?" in panel.preflight_edit.toPlainText(),
+        timeout=1000,
+    )
+    assert "frames=" in panel.preflight_edit.toPlainText()
+
+    previous_text = panel.preflight_edit.toPlainText()
+    panel.restore_attachments_state([{"path": str(note.resolve()), "enabled": True}])
+    qtbot.waitUntil(
+        lambda: panel.preflight_edit.toPlainText() != previous_text, timeout=1000
+    )
+
+    panel.set_context_window_tokens(120000)
+    qtbot.waitUntil(
+        lambda: "120000" in panel.lbl_preflight_budget.text(),
+        timeout=1000,
+    )
+
+
+def test_preflight_refresh_renders_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
     """Preflight output uses backend formatting and mentions budget."""
     media = tmp_path / "sample.mp4"
     media.write_bytes(b"abc")
+    monkeypatch.setattr("gui.video_qa.get_media_duration_seconds", lambda _p: 30.0)
 
     panel = VideoQAPanel()
     qtbot.addWidget(panel)
@@ -213,9 +253,11 @@ def test_preflight_refresh_renders_report(tmp_path: Path, qtbot: QtBot) -> None:
     assert "Budget:" in text
     assert "Question:" in text
     assert "Describe the scene." in text
+    assert "frames=" in text
 
     assert panel.lbl_preflight_budget.text() != "-"
     assert "100000" in panel.lbl_preflight_budget.text()
+    assert "frames" in panel.lbl_preflight_budget.text()
 
 
 def test_video_qa_layout_has_splitters(qtbot: QtBot) -> None:

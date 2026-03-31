@@ -221,6 +221,9 @@ class VideoQABudgetPolicy:
     reserved_output_tokens: int = 1536
     reserved_instruction_tokens: int = 512
     reserved_chunk_overhead_tokens: int = 128
+    frame_sample_fps: float = 2.0
+    minimum_frames_per_chunk: int = 1
+    frame_tokens_per_sample: int = 256
     source_bytes_per_token: int = 2048
     min_source_tokens: int = 256
     max_source_tokens: int = 4096
@@ -243,6 +246,8 @@ class VideoQABudgetEstimate:
     source_tokens_estimate: int
     question_tokens: int
     attachment_tokens: int
+    sampled_frame_count: int
+    frame_tokens_estimate: int
     chunk_overhead_tokens: int
     reserved_instruction_tokens: int
     reserved_output_tokens: int
@@ -277,6 +282,8 @@ class VideoQABudgetEstimate:
         src = self.source_tokens_estimate
         q = self.question_tokens
         att = self.attachment_tokens
+        sampled_frames = self.sampled_frame_count
+        frame_tokens = self.frame_tokens_estimate
         ch = self.chunk_overhead_tokens
         ro = self.reserved_output_tokens
         tot = self.total_required_tokens
@@ -284,7 +291,8 @@ class VideoQABudgetEstimate:
         tc = self.text_token_counter_mode
         return (
             f"Video QA budget: source={src}, question={q}, attachments={att}, "
-            f"chunks={ch}, reserved_output={ro}, "
+            f"frames={sampled_frames} (~{frame_tokens} tokens), chunks={ch}, "
+            f"reserved_output={ro}, "
             f"total={tot}/{cw} ({status}), text_counter={tc}"
         )
 
@@ -308,6 +316,7 @@ def build_video_qa_budget_estimate(
     context: VideoQAContextBundle,
     *,
     chunk_count: int = 0,
+    sampled_frame_count: int | None = None,
     budget_policy: VideoQABudgetPolicy | None = None,
     runtime_policy: VideoQARuntimePolicy | None = None,
     text_token_counter: TextTokenCounter | None = None,
@@ -338,12 +347,21 @@ def build_video_qa_budget_estimate(
     chunk_total = max(0, int(chunk_count))
     if chunk_total <= 0:
         warnings.append("Chunk plan is not built yet.")
+    default_frame_count = chunk_total * max(1, int(policy.minimum_frames_per_chunk))
+    if sampled_frame_count is None:
+        normalized_frame_count = default_frame_count
+    else:
+        normalized_frame_count = max(default_frame_count, 0, int(sampled_frame_count))
+    frame_tokens_estimate = normalized_frame_count * max(
+        0, policy.frame_tokens_per_sample
+    )
     chunk_overhead_tokens = chunk_total * policy.reserved_chunk_overhead_tokens
 
     total_required_tokens = (
         source_tokens
         + question_tokens
         + attachment_tokens
+        + frame_tokens_estimate
         + chunk_overhead_tokens
         + policy.reserved_instruction_tokens
         + policy.reserved_output_tokens
@@ -357,6 +375,8 @@ def build_video_qa_budget_estimate(
         source_tokens_estimate=source_tokens,
         question_tokens=question_tokens,
         attachment_tokens=attachment_tokens,
+        sampled_frame_count=normalized_frame_count,
+        frame_tokens_estimate=frame_tokens_estimate,
         chunk_overhead_tokens=chunk_overhead_tokens,
         reserved_instruction_tokens=policy.reserved_instruction_tokens,
         reserved_output_tokens=policy.reserved_output_tokens,

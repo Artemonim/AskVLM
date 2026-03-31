@@ -1,14 +1,19 @@
-"""Local Video QA run glue: preflight guards, ASR transcript, ffmpeg frames, LM Studio chunks, deterministic aggregate."""
+"""Local Video QA run glue: preflight guards, ASR transcript, ffmpeg frames, chunk analysis, and final synthesis."""
 
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
 from .audio_io import cleanup_intermediate_audio, prepare_audio
-from .ffmpeg import extract_frame_to_file, get_media_duration_seconds
+from .ffmpeg import (
+    extract_frame_to_file,
+    extract_frames_for_span,
+    get_media_duration_seconds,
+)
 from .pipelines import CancelledError
 from .video_qa_answer_bundle import (
     ANSWER_BUNDLE_SCHEMA_VERSION,
@@ -23,6 +28,10 @@ from .video_qa_executor import (
     run_video_qa_executor,
 )
 from .video_qa_lm_studio_chunk_inferencer import VideoQALMStudioChunkInferencer
+from .video_qa_lm_studio_client import (
+    LMStudioClientError,
+    request_chat_completion,
+)
 from .video_qa_orchestration import (
     build_video_qa_preflight_report,
     build_video_qa_preflight_summary,
@@ -172,7 +181,7 @@ def _whisper_transcribe_to_artifacts(
 ) -> VideoQATranscriptArtifacts:
     """Run faster-whisper transcription and normalize segment tuples."""
     if progress:
-        progress("Preparing audio for transcription", 0.18)
+        progress("Preparing", 0.18)
 
     def _should_cancel_audio() -> bool:
         return bool(should_cancel and should_cancel())
@@ -225,11 +234,18 @@ def _whisper_transcribe_to_artifacts(
 
 
 class VideoQAFFmpegFrameMaterializer:
-    """Extract one representative PNG per chunk using :func:`extract_frame_to_file`."""
+    """Extract sampled chunk frames with a single-frame fallback."""
 
-    def __init__(self, *, video_path: Path, frames_dir: Path) -> None:
+    def __init__(
+        self,
+        *,
+        video_path: Path,
+        frames_dir: Path,
+        sample_fps: float = 2.0,
+    ) -> None:
         self._video_path = video_path
         self._frames_dir = frames_dir
+        self._sample_fps = sample_fps
 
     def materialize_frames(
         self,
@@ -239,57 +255,295 @@ class VideoQAFFmpegFrameMaterializer:
         manifest: VideoQARunManifest,
         transcript: VideoQATranscriptArtifacts,
     ) -> tuple[str, ...]:
-        """Write ``<chunk_id>.png`` under ``frames_dir`` and return its path."""
+        """Write 2 FPS chunk frames under ``frames_dir`` and return their paths."""
         _ = (manifest, transcript)
         self._frames_dir.mkdir(parents=True, exist_ok=True)
         safe = "".join(
             ch if ch.isalnum() or ch in "-._" else "_" for ch in chunk.chunk_id
         )
-        out = self._frames_dir / f"{safe}.png"
-        extract_frame_to_file(self._video_path, representative_timestamp, out)
-        return (str(out.resolve()),)
-
-
-def _first_artifact_answer_and_evidence(
-    raw_cr: VideoQAChunkExecutionResult,
-    rec: VideoQAChunkRecord,
-) -> tuple[str | None, VideoQAEvidenceItem | None, bool]:
-    """Parse the first JSON chunk artifact into answer text, evidence, and low-confidence flag."""
-    for art in rec.artifacts:
-        try:
-            payload = json.loads(art)
-        except json.JSONDecodeError:
-            continue
-        if not isinstance(payload, dict):
-            continue
-        summary = str(payload.get("chunk_summary", "")).strip()
-        conf = str(payload.get("confidence", "medium"))
-        uncertain = conf == "low"
-        obs = payload.get("observations")
-        obs_lines = ""
-        if isinstance(obs, list) and obs:
-            obs_lines = "\n".join(
-                f"- {x}" for x in obs if isinstance(x, str) and str(x).strip()
-            )
-        block = summary
-        if obs_lines:
-            block = f"{summary}\n{obs_lines}" if summary else obs_lines
-        if not block.strip():
-            continue
-        answer_line = f"=== {raw_cr.chunk_id} ===\n{block.strip()}"
-        quote = summary if summary else block[:2000]
-        evidence = VideoQAEvidenceItem(
-            transcript_quote=quote[:8000],
-            t_start=rec.t_start,
-            t_end=rec.t_end,
-            frame_refs=tuple(raw_cr.frames),
+        output_pattern = self._frames_dir / f"{safe}-%03d.png"
+        outputs = extract_frames_for_span(
+            self._video_path,
+            chunk.t_start,
+            chunk.t_end,
+            output_pattern,
+            fps=self._sample_fps,
         )
-        return answer_line, evidence, uncertain
-    return None, None, False
+        if outputs:
+            return tuple(str(path) for path in outputs)
+        fallback_output = self._frames_dir / f"{safe}.png"
+        extract_frame_to_file(
+            self._video_path, representative_timestamp, fallback_output
+        )
+        return (str(fallback_output.resolve()),)
 
 
-class VideoQADeterministicAnswerAggregator:
-    """Build :class:`VideoQAAnswerBundle` from chunk JSON artifacts (no extra LM call)."""
+FINAL_SYNTHESIS_INSTRUCTION: Final[str] = (
+    "Synthesize one final user-facing answer from the internal chunk analysis records. "
+    "Return strictly JSON that matches the provided schema. Do not expose chunk ids, "
+    "hidden analysis steps, or chain-of-thought."
+)
+
+FINAL_SYNTHESIS_JSON_SCHEMA: Final[dict[str, object]] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "answer": {
+            "type": "string",
+            "description": "One final answer to the user's question.",
+        },
+        "evidence": {
+            "type": "array",
+            "description": "Grounded evidence items supporting the final answer.",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "transcript_quote": {"type": "string"},
+                    "t_start": {"type": "number"},
+                    "t_end": {"type": "number"},
+                    "frame_refs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": [
+                    "transcript_quote",
+                    "t_start",
+                    "t_end",
+                    "frame_refs",
+                ],
+            },
+        },
+        "is_uncertain": {"type": "boolean"},
+        "uncertainty_note": {"type": ["string", "null"]},
+    },
+    "required": ["answer", "evidence", "is_uncertain", "uncertainty_note"],
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _VideoQAChunkSynthesisInput:
+    chunk_id: str
+    t_start: float
+    t_end: float
+    transcript_excerpt: str
+    chunk_summary: str
+    observations: tuple[str, ...]
+    confidence: str
+    frame_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ParsedChunkAnalysisArtifact:
+    chunk_summary: str
+    observations: tuple[str, ...]
+    confidence: str
+
+
+def _transcript_excerpt_for_chunk(
+    transcript: VideoQATranscriptArtifacts,
+    chunk: VideoQAChunkRecord,
+    *,
+    max_chars: int = 2000,
+) -> str:
+    """Build a transcript excerpt for the chunk span, with a whole-text fallback."""
+    lines: list[str] = []
+    for t0, t1, text in transcript.segments:
+        if t1 >= chunk.t_start and t0 <= chunk.t_end:
+            stripped = text.strip()
+            if stripped:
+                lines.append(stripped)
+    if lines:
+        joined = "\n".join(lines)
+        return joined if len(joined) <= max_chars else joined[: max_chars - 3] + "..."
+    body = transcript.transcript_text.strip() or transcript.subtitle_text.strip()
+    if not body:
+        return ""
+    return body if len(body) <= max_chars else body[: max_chars - 3] + "..."
+
+
+def _parse_chunk_analysis_artifact(text: str) -> _ParsedChunkAnalysisArtifact | None:
+    """Return a normalized chunk analysis payload or ``None``."""
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    summary = payload.get("chunk_summary")
+    observations = payload.get("observations")
+    confidence = payload.get("confidence")
+    if not isinstance(summary, str):
+        return None
+    if not isinstance(observations, list) or not all(
+        isinstance(item, str) for item in observations
+    ):
+        return None
+    if confidence not in {"low", "medium", "high"}:
+        return None
+    return _ParsedChunkAnalysisArtifact(
+        chunk_summary=summary.strip(),
+        observations=tuple(item.strip() for item in observations if item.strip()),
+        confidence=str(confidence),
+    )
+
+
+def _collect_chunk_synthesis_inputs(
+    *,
+    manifest: VideoQARunManifest,
+    transcript: VideoQATranscriptArtifacts,
+    chunk_results: Sequence[VideoQAChunkExecutionResult],
+) -> tuple[tuple[_VideoQAChunkSynthesisInput, ...], bool]:
+    """Collect normalized chunk analysis records for the final synthesis pass."""
+    manifest_by_id = {chunk.chunk_id: chunk for chunk in manifest.chunks}
+    records: list[_VideoQAChunkSynthesisInput] = []
+    has_low_confidence = False
+    for result in chunk_results:
+        if result.status not in ("completed", "skipped_completed"):
+            continue
+        chunk = manifest_by_id.get(result.chunk_id)
+        if chunk is None:
+            continue
+        parsed = next(
+            (
+                normalized
+                for artifact in chunk.artifacts
+                if (normalized := _parse_chunk_analysis_artifact(artifact)) is not None
+            ),
+            None,
+        )
+        if parsed is None:
+            continue
+        confidence = parsed.confidence
+        has_low_confidence = has_low_confidence or confidence == "low"
+        records.append(
+            _VideoQAChunkSynthesisInput(
+                chunk_id=chunk.chunk_id,
+                t_start=chunk.t_start,
+                t_end=chunk.t_end,
+                transcript_excerpt=_transcript_excerpt_for_chunk(transcript, chunk),
+                chunk_summary=parsed.chunk_summary,
+                observations=parsed.observations,
+                confidence=confidence,
+                frame_refs=tuple(result.frames),
+            )
+        )
+    return tuple(records), has_low_confidence
+
+
+def _build_final_synthesis_prompt(
+    context: VideoQAContextBundle,
+    chunk_inputs: Sequence[_VideoQAChunkSynthesisInput],
+) -> str:
+    """Render the final synthesis prompt from context and chunk analysis records."""
+    prompt_parts = [FINAL_SYNTHESIS_INSTRUCTION]
+    context_block = context.render_prompt_block()
+    if context_block:
+        prompt_parts.append(f"Context:\n{context_block}")
+    prompt_parts.append(
+        "Internal chunk analysis records:\n"
+        + json.dumps(
+            [
+                {
+                    "t_start": record.t_start,
+                    "t_end": record.t_end,
+                    "transcript_excerpt": record.transcript_excerpt,
+                    "chunk_summary": record.chunk_summary,
+                    "observations": list(record.observations),
+                    "confidence": record.confidence,
+                    "frame_refs": list(record.frame_refs),
+                }
+                for record in chunk_inputs
+            ],
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return "\n\n".join(prompt_parts)
+
+
+def _validate_final_synthesis_payload(
+    payload: object,
+) -> tuple[str, tuple[VideoQAEvidenceItem, ...], bool, str | None] | None:
+    """Validate the final synthesis JSON payload."""
+    if not isinstance(payload, Mapping):
+        return None
+    answer = payload.get("answer")
+    evidence_raw = payload.get("evidence")
+    is_uncertain = payload.get("is_uncertain")
+    uncertainty_note = payload.get("uncertainty_note")
+    if not isinstance(answer, str) or not isinstance(is_uncertain, bool):
+        return None
+    if uncertainty_note is not None and not isinstance(uncertainty_note, str):
+        return None
+    if not isinstance(evidence_raw, list):
+        return None
+    evidence = _validate_final_synthesis_evidence_items(evidence_raw)
+    if evidence is None:
+        return None
+    return answer.strip(), tuple(evidence), is_uncertain, uncertainty_note
+
+
+def _validate_final_synthesis_evidence_items(
+    evidence_raw: list[object],
+) -> list[VideoQAEvidenceItem] | None:
+    """Validate the synthesized evidence list."""
+    evidence: list[VideoQAEvidenceItem] = []
+    for index, item in enumerate(evidence_raw):
+        normalized = _validate_final_synthesis_evidence_item(item, index)
+        if normalized is None:
+            return None
+        evidence.append(normalized)
+    return evidence
+
+
+def _validate_final_synthesis_evidence_item(
+    item: object,
+    index: int,
+) -> VideoQAEvidenceItem | None:
+    """Validate one synthesized evidence item."""
+    if not isinstance(item, Mapping):
+        return None
+    transcript_quote = item.get("transcript_quote")
+    t_start = item.get("t_start")
+    t_end = item.get("t_end")
+    frame_refs = item.get("frame_refs")
+    if not isinstance(transcript_quote, str):
+        return None
+    if isinstance(t_start, bool) or not isinstance(t_start, (int, float)):
+        return None
+    if isinstance(t_end, bool) or not isinstance(t_end, (int, float)):
+        return None
+    if not isinstance(frame_refs, list) or not all(
+        isinstance(frame_ref, str) for frame_ref in frame_refs
+    ):
+        return None
+    return VideoQAEvidenceItem(
+        transcript_quote=transcript_quote.strip() or f"Evidence item {index + 1}",
+        t_start=float(t_start),
+        t_end=float(t_end),
+        frame_refs=tuple(frame_refs),
+    )
+
+
+class VideoQALMStudioAnswerSynthesizer:
+    """Build the final answer bundle with a synthesis LM Studio pass."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        temperature: float = 0.0,
+        timeout: float = 120.0,
+        request_chat_fn: Callable[..., object] | None = None,
+    ) -> None:
+        self._base_url = base_url
+        self._model = model
+        self._temperature = temperature
+        self._timeout = timeout
+        self._request_chat_fn = request_chat_fn or request_chat_completion
 
     def aggregate(
         self,
@@ -299,33 +553,52 @@ class VideoQADeterministicAnswerAggregator:
         transcript: VideoQATranscriptArtifacts,
         chunk_results: Sequence[VideoQAChunkExecutionResult],
     ) -> VideoQAAnswerBundle:
-        """Concatenate chunk summaries into the answer and mirror them as evidence rows."""
-        _ = transcript
-
-        lines: list[str] = []
-        evidence_items: list[VideoQAEvidenceItem] = []
-        uncertain = False
-        for raw_cr in chunk_results:
-            if raw_cr.status not in ("completed", "skipped_completed"):
-                continue
-            rec = next(
-                (c for c in manifest.chunks if c.chunk_id == raw_cr.chunk_id),
-                None,
-            )
-            if rec is None:
-                continue
-            ans, ev, low = _first_artifact_answer_and_evidence(raw_cr, rec)
-            if ans is not None:
-                lines.append(ans)
-            if ev is not None:
-                evidence_items.append(ev)
-            uncertain = uncertain or low
-
-        answer = (
-            "\n\n".join(lines)
-            if lines
-            else "No chunk-level analysis artifacts were produced."
+        """Synthesize one final answer from chunk analysis artifacts."""
+        chunk_inputs, has_low_confidence = _collect_chunk_synthesis_inputs(
+            manifest=manifest,
+            transcript=transcript,
+            chunk_results=chunk_results,
         )
+        if not chunk_inputs:
+            return VideoQAAnswerBundle(
+                schema_version=ANSWER_BUNDLE_SCHEMA_VERSION,
+                run_id=f"{manifest.run_id}-answer",
+                created_at=manifest.created_at,
+                question=context.question,
+                answer="No completed chunk analysis artifacts were available to synthesize a final answer.",
+                evidence=(),
+                is_uncertain=True,
+                manifest_run_id=manifest.run_id,
+                uncertainty_note="The synthesis pass had no completed chunk analysis inputs.",
+            )
+        prompt = _build_final_synthesis_prompt(context, chunk_inputs)
+        try:
+            response = self._request_chat_fn(
+                self._base_url,
+                prompt,
+                json_schema=FINAL_SYNTHESIS_JSON_SCHEMA,
+                model=self._model,
+                temperature=self._temperature,
+                timeout=self._timeout,
+            )
+        except LMStudioClientError as exc:
+            msg = f"Final Video QA synthesis failed: {exc}"
+            raise RuntimeError(msg) from exc
+        normalized = _validate_final_synthesis_payload(
+            getattr(response, "parsed_json", None)
+        )
+        if normalized is None:
+            msg = "Final Video QA synthesis returned invalid structured output."
+            raise RuntimeError(msg)
+        answer, evidence_items, is_uncertain, uncertainty_note = normalized
+        final_uncertain = is_uncertain or has_low_confidence
+        final_uncertainty_note = uncertainty_note
+        if final_uncertain and not final_uncertainty_note:
+            final_uncertainty_note = (
+                "Some internal chunk analyses reported low confidence."
+                if has_low_confidence
+                else "The synthesized answer is uncertain."
+            )
         return VideoQAAnswerBundle(
             schema_version=ANSWER_BUNDLE_SCHEMA_VERSION,
             run_id=f"{manifest.run_id}-answer",
@@ -333,11 +606,9 @@ class VideoQADeterministicAnswerAggregator:
             question=context.question,
             answer=answer,
             evidence=tuple(evidence_items),
-            is_uncertain=uncertain,
+            is_uncertain=final_uncertain,
             manifest_run_id=manifest.run_id,
-            uncertainty_note=(
-                "Some chunks reported low confidence." if uncertain else None
-            ),
+            uncertainty_note=final_uncertainty_note,
         )
 
 
@@ -390,6 +661,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
         frame_mat = VideoQAFFmpegFrameMaterializer(
             video_path=media_path,
             frames_dir=frames_dir,
+            sample_fps=default_video_qa_budget_policy().frame_sample_fps,
         )
     inferencer: VideoQAChunkInferencer
     if chunk_inferencer_override is not None:
@@ -404,13 +676,147 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     if aggregator_override is not None:
         aggregator = aggregator_override
     else:
-        aggregator = VideoQADeterministicAnswerAggregator()
+        aggregator = VideoQALMStudioAnswerSynthesizer(
+            base_url=lm_base_url,
+            model=lm_model_id,
+        )
     return VideoQAExecutorDeps(
         transcript=transcript,
         frame_materializer=frame_mat,
         chunk_inferencer=inferencer,
         answer_aggregator=aggregator,
         source_resolver=None,
+    )
+
+
+class _ProgressFrameMaterializer:
+    """Wrap frame extraction to report coarse sampling progress."""
+
+    def __init__(
+        self,
+        inner: VideoQAFrameMaterializer,
+        *,
+        progress: Callable[[str, float], None],
+        total_chunks: int,
+        chunk_state: dict[str, int],
+    ) -> None:
+        self._inner = inner
+        self._progress = progress
+        self._total_chunks = total_chunks
+        self._chunk_state = chunk_state
+
+    def materialize_frames(
+        self,
+        *,
+        chunk: VideoQAChunkRecord,
+        representative_timestamp: float,
+        manifest: VideoQARunManifest,
+        transcript: VideoQATranscriptArtifacts,
+    ) -> tuple[str, ...]:
+        self._chunk_state["i"] += 1
+        chunk_index = self._chunk_state["i"]
+        per_chunk_span = 0.48 / self._total_chunks
+        base = 0.45 + (chunk_index - 1) * per_chunk_span
+        self._progress("Sampling", min(0.93, base))
+        return self._inner.materialize_frames(
+            chunk=chunk,
+            representative_timestamp=representative_timestamp,
+            manifest=manifest,
+            transcript=transcript,
+        )
+
+
+class _ProgressInferencer:
+    """Wrap chunk inference to report coarse processing progress."""
+
+    def __init__(
+        self,
+        inner: VideoQAChunkInferencer,
+        *,
+        progress: Callable[[str, float], None],
+        total_chunks: int,
+        chunk_state: dict[str, int],
+    ) -> None:
+        self._inner = inner
+        self._progress = progress
+        self._total_chunks = total_chunks
+        self._chunk_state = chunk_state
+
+    def infer_chunk(
+        self,
+        *,
+        chunk: VideoQAChunkRecord,
+        frames: tuple[str, ...],
+        transcript: VideoQATranscriptArtifacts,
+        manifest: VideoQARunManifest,
+    ) -> VideoQAChunkInferenceOutcome:
+        chunk_index = max(1, self._chunk_state["i"])
+        per_chunk_span = 0.48 / self._total_chunks
+        base = 0.45 + (chunk_index - 1) * per_chunk_span
+        self._progress("Processing", min(0.93, base + per_chunk_span * 0.5))
+        return self._inner.infer_chunk(
+            chunk=chunk,
+            frames=frames,
+            transcript=transcript,
+            manifest=manifest,
+        )
+
+
+class _ProgressAggregator:
+    """Wrap final answer aggregation to report synthesis progress."""
+
+    def __init__(
+        self,
+        inner: VideoQAAnswerAggregator,
+        *,
+        progress: Callable[[str, float], None],
+    ) -> None:
+        self._inner = inner
+        self._progress = progress
+
+    def aggregate(
+        self,
+        *,
+        context: VideoQAContextBundle,
+        manifest: VideoQARunManifest,
+        transcript: VideoQATranscriptArtifacts,
+        chunk_results: Sequence[VideoQAChunkExecutionResult],
+    ) -> VideoQAAnswerBundle:
+        self._progress("Synthesizing", 0.95)
+        return self._inner.aggregate(
+            context=context,
+            manifest=manifest,
+            transcript=transcript,
+            chunk_results=chunk_results,
+        )
+
+
+def _wrap_local_executor_deps_with_progress(
+    deps: VideoQAExecutorDeps,
+    *,
+    progress: Callable[[str, float], None],
+    total_chunks: int,
+) -> VideoQAExecutorDeps:
+    """Wrap executor dependencies with generic local-run progress reporting."""
+    chunk_state = {"i": 0}
+    return replace(
+        deps,
+        frame_materializer=_ProgressFrameMaterializer(
+            deps.frame_materializer,
+            progress=progress,
+            total_chunks=total_chunks,
+            chunk_state=chunk_state,
+        ),
+        chunk_inferencer=_ProgressInferencer(
+            deps.chunk_inferencer,
+            progress=progress,
+            total_chunks=total_chunks,
+            chunk_state=chunk_state,
+        ),
+        answer_aggregator=_ProgressAggregator(
+            deps.answer_aggregator,
+            progress=progress,
+        ),
     )
 
 
@@ -448,7 +854,7 @@ def run_local_video_qa(
     staging_dir.mkdir(parents=True, exist_ok=True)
 
     if progress:
-        progress("Starting Video QA executor", 0.05)
+        progress("Preparing", 0.05)
 
     deps = build_video_qa_local_executor_deps(
         context=ctx,
@@ -464,43 +870,12 @@ def run_local_video_qa(
         aggregator_override=aggregator_override,
     )
 
-    total_chunks = max(1, len(chunk_plan))
-    chunk_index = {"i": 0}
-
-    class _ProgressInferencer:
-        """Wraps chunk inferencer to report coarse progress per chunk."""
-
-        def __init__(self, inner: VideoQAChunkInferencer) -> None:
-            self._inner = inner
-
-        def infer_chunk(
-            self,
-            *,
-            chunk: VideoQAChunkRecord,
-            frames: tuple[str, ...],
-            transcript: VideoQATranscriptArtifacts,
-            manifest: VideoQARunManifest,
-        ) -> VideoQAChunkInferenceOutcome:
-            chunk_index["i"] += 1
-            i = chunk_index["i"]
-            if progress:
-                base = 0.45 + (i - 1) / total_chunks * 0.48
-                progress(
-                    f"Chunk inference ({i}/{total_chunks}): {chunk.chunk_id}",
-                    min(0.93, base),
-                )
-            return self._inner.infer_chunk(
-                chunk=chunk,
-                frames=frames,
-                transcript=transcript,
-                manifest=manifest,
-            )
-
-    inner_inf = deps.chunk_inferencer
-    wrapped_inf: VideoQAChunkInferencer = (
-        _ProgressInferencer(inner_inf) if progress is not None else inner_inf
-    )
-    deps = replace(deps, chunk_inferencer=wrapped_inf)
+    if progress is not None:
+        deps = _wrap_local_executor_deps_with_progress(
+            deps,
+            progress=progress,
+            total_chunks=max(1, len(chunk_plan)),
+        )
 
     outcome = run_video_qa_executor(
         context=ctx,
@@ -517,6 +892,6 @@ def run_local_video_qa(
     save_answer_bundle_to_json(answer_path, outcome.answer_bundle)
 
     if progress:
-        progress("Video QA run complete", 1.0)
+        progress("Completed", 1.0)
 
     return outcome
