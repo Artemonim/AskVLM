@@ -217,7 +217,7 @@ def test_video_qa_auto_preflight_refreshes_after_debounce(
         lambda: "Auto refresh?" in panel.preflight_edit.toPlainText(),
         timeout=1000,
     )
-    assert "frames=" in panel.preflight_edit.toPlainText()
+    assert "frames_total=" in panel.preflight_edit.toPlainText()
 
     previous_text = panel.preflight_edit.toPlainText()
     panel.restore_attachments_state([{"path": str(note.resolve()), "enabled": True}])
@@ -253,7 +253,7 @@ def test_preflight_refresh_renders_report(
     assert "Budget:" in text
     assert "Question:" in text
     assert "Describe the scene." in text
-    assert "frames=" in text
+    assert "frames_total=" in text
 
     assert panel.lbl_preflight_budget.text() != "-"
     assert "100000" in panel.lbl_preflight_budget.text()

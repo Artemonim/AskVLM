@@ -154,12 +154,12 @@ def test_budget_estimate_tracks_source_question_attachments_and_chunks(
     assert estimate.question_tokens > 0
     assert estimate.attachment_tokens == bundle.attachment_budget_tokens
     assert estimate.sampled_frame_count == 6
+    assert estimate.peak_frames_per_chunk == 2
     assert estimate.frame_tokens_estimate == (
-        6 * estimate.policy.frame_tokens_per_sample
+        2 * estimate.policy.frame_tokens_per_sample
     )
     assert (
-        estimate.chunk_overhead_tokens
-        == 3 * estimate.policy.reserved_chunk_overhead_tokens
+        estimate.chunk_overhead_tokens == estimate.policy.reserved_chunk_overhead_tokens
     )
     assert estimate.available_tokens == (
         estimate.context_window_tokens - estimate.total_required_tokens
@@ -185,8 +185,34 @@ def test_budget_estimate_warns_when_chunk_plan_is_missing(
 
     assert any("chunk plan" in warning.lower() for warning in estimate.warnings)
     assert estimate.sampled_frame_count == 0
+    assert estimate.peak_frames_per_chunk == 0
     assert estimate.frame_tokens_estimate == 0
     assert estimate.chunk_overhead_tokens == 0
+
+
+def test_budget_estimate_respects_explicit_max_frames_per_chunk(
+    tmp_path: Path,
+) -> None:
+    """Peak frames can exceed total/chunk_count when spans are uneven."""
+    source_media = tmp_path / "clip.mp4"
+    source_media.write_bytes(b"abc")
+    source = LocalFileProvider().resolve(source_media)
+    bundle = normalize_video_qa_context(
+        source=source,
+        question="What is shown?",
+        attachments=(),
+    )
+    estimate = build_video_qa_budget_estimate(
+        bundle,
+        chunk_count=2,
+        sampled_frame_count=120,
+        max_frames_per_chunk=100,
+    )
+    assert estimate.sampled_frame_count == 120
+    assert estimate.peak_frames_per_chunk == 100
+    assert estimate.frame_tokens_estimate == (
+        100 * estimate.policy.frame_tokens_per_sample
+    )
 
 
 def test_budget_estimate_uses_minimum_frame_cost_when_only_chunk_count_is_known(
@@ -205,8 +231,9 @@ def test_budget_estimate_uses_minimum_frame_cost_when_only_chunk_count_is_known(
     estimate = build_video_qa_budget_estimate(bundle, chunk_count=3)
 
     assert estimate.sampled_frame_count == 3
+    assert estimate.peak_frames_per_chunk == 1
     assert estimate.frame_tokens_estimate == (
-        3 * estimate.policy.frame_tokens_per_sample
+        1 * estimate.policy.frame_tokens_per_sample
     )
 
 

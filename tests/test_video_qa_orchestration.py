@@ -270,11 +270,10 @@ def test_preflight_overflow_policy_in_summary(tmp_path: Path) -> None:
     assert summary.overflow_policy == custom
     assert len(summary.chunk_plan) == 2
     assert summary.budget.sampled_frame_count == 120
-    assert summary.budget.frame_tokens_estimate == (
-        120 * policy.frame_tokens_per_sample
-    )
+    assert summary.budget.peak_frames_per_chunk == 60
+    assert summary.budget.frame_tokens_estimate == (60 * policy.frame_tokens_per_sample)
     assert summary.budget.chunk_overhead_tokens == (
-        2 * policy.reserved_chunk_overhead_tokens
+        policy.reserved_chunk_overhead_tokens
     )
 
 
@@ -323,7 +322,7 @@ def test_preflight_report_includes_budget_chunks_warnings_overflow_text(
     assert "over by" in report.budget_status_line
     assert "frames" in report.budget_status_line
     assert "total=" in report.budget_estimate_summary
-    assert "frames=" in report.budget_estimate_summary
+    assert "frames_total" in report.budget_estimate_summary
     assert preflight.warnings
     assert report.warnings == preflight.warnings
     assert "1. reduce frame count" in report.overflow_mitigation_order_text
@@ -336,7 +335,7 @@ def test_preflight_report_includes_budget_chunks_warnings_overflow_text(
     assert "Chunks: 2" in text
     assert "Chunk plan:" in text
     assert report.chunk_plan[0].chunk_id in text
-    assert "frames=" in text
+    assert "frames" in text
     assert "Overflow mitigation order:" in text
     assert "Warnings:" in text
 

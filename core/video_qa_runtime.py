@@ -239,7 +239,13 @@ def _estimate_source_tokens(size_bytes: int, policy: VideoQABudgetPolicy) -> int
 
 @dataclass(frozen=True, slots=True)
 class VideoQABudgetEstimate:
-    """Summarize the estimated Video QA token budget."""
+    """Summarize the estimated Video QA token budget.
+
+    Frame counts follow chunked processing: ``sampled_frame_count`` is the total
+    sampled frames across all chunks; ``peak_frames_per_chunk`` is the worst-case
+    single-request frame load. ``frame_tokens_estimate`` and ``total_required_tokens``
+    use that peak so the preflight matches one LM call per chunk.
+    """
 
     policy: VideoQABudgetPolicy
     runtime_policy: VideoQARuntimePolicy
@@ -247,6 +253,7 @@ class VideoQABudgetEstimate:
     question_tokens: int
     attachment_tokens: int
     sampled_frame_count: int
+    peak_frames_per_chunk: int
     frame_tokens_estimate: int
     chunk_overhead_tokens: int
     reserved_instruction_tokens: int
@@ -283,6 +290,7 @@ class VideoQABudgetEstimate:
         q = self.question_tokens
         att = self.attachment_tokens
         sampled_frames = self.sampled_frame_count
+        peak_frames = self.peak_frames_per_chunk
         frame_tokens = self.frame_tokens_estimate
         ch = self.chunk_overhead_tokens
         ro = self.reserved_output_tokens
@@ -291,7 +299,8 @@ class VideoQABudgetEstimate:
         tc = self.text_token_counter_mode
         return (
             f"Video QA budget: source={src}, question={q}, attachments={att}, "
-            f"frames={sampled_frames} (~{frame_tokens} tokens), chunks={ch}, "
+            f"frames_total={sampled_frames} peak_frames_per_chunk={peak_frames} "
+            f"(~{frame_tokens} frame tokens peak), chunk_overhead={ch}, "
             f"reserved_output={ro}, "
             f"total={tot}/{cw} ({status}), text_counter={tc}"
         )
@@ -317,6 +326,7 @@ def build_video_qa_budget_estimate(
     *,
     chunk_count: int = 0,
     sampled_frame_count: int | None = None,
+    max_frames_per_chunk: int | None = None,
     budget_policy: VideoQABudgetPolicy | None = None,
     runtime_policy: VideoQARuntimePolicy | None = None,
     text_token_counter: TextTokenCounter | None = None,
@@ -326,6 +336,12 @@ def build_video_qa_budget_estimate(
     Question text uses ``text_token_counter`` when provided; otherwise the
     conservative heuristic. Attachment totals still come from the context bundle
     (offline heuristics).
+
+    ``sampled_frame_count`` is the total frames sampled across all chunks when
+    known. ``max_frames_per_chunk`` should reflect the heaviest chunk when
+    available; otherwise a conservative peak is derived from the total and chunk
+    count. Token load for ``fits`` uses one chunk's frames plus a single chunk
+    overhead, matching one LM request per chunk.
     """
     policy = budget_policy or default_video_qa_budget_policy()
     runtime = runtime_policy or default_video_qa_runtime_policy()
@@ -347,15 +363,31 @@ def build_video_qa_budget_estimate(
     chunk_total = max(0, int(chunk_count))
     if chunk_total <= 0:
         warnings.append("Chunk plan is not built yet.")
-    default_frame_count = chunk_total * max(1, int(policy.minimum_frames_per_chunk))
+    min_frames = max(1, int(policy.minimum_frames_per_chunk))
+    default_total_frames = chunk_total * min_frames if chunk_total > 0 else 0
     if sampled_frame_count is None:
-        normalized_frame_count = default_frame_count
+        total_frames = default_total_frames
     else:
-        normalized_frame_count = max(default_frame_count, 0, int(sampled_frame_count))
-    frame_tokens_estimate = normalized_frame_count * max(
-        0, policy.frame_tokens_per_sample
+        total_frames = max(default_total_frames, 0, int(sampled_frame_count))
+
+    if chunk_total <= 0:
+        peak_frames = 0
+    elif max_frames_per_chunk is not None:
+        peak_frames = max(min_frames, int(max_frames_per_chunk))
+    elif sampled_frame_count is None:
+        peak_frames = min_frames
+    elif chunk_total == 1:
+        peak_frames = total_frames
+    else:
+        peak_frames = max(
+            min_frames,
+            (total_frames + chunk_total - 1) // chunk_total,
+        )
+
+    frame_tokens_estimate = peak_frames * max(0, policy.frame_tokens_per_sample)
+    chunk_overhead_tokens = (
+        policy.reserved_chunk_overhead_tokens if chunk_total > 0 else 0
     )
-    chunk_overhead_tokens = chunk_total * policy.reserved_chunk_overhead_tokens
 
     total_required_tokens = (
         source_tokens
@@ -375,7 +407,8 @@ def build_video_qa_budget_estimate(
         source_tokens_estimate=source_tokens,
         question_tokens=question_tokens,
         attachment_tokens=attachment_tokens,
-        sampled_frame_count=normalized_frame_count,
+        sampled_frame_count=total_frames,
+        peak_frames_per_chunk=peak_frames,
         frame_tokens_estimate=frame_tokens_estimate,
         chunk_overhead_tokens=chunk_overhead_tokens,
         reserved_instruction_tokens=policy.reserved_instruction_tokens,
