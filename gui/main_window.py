@@ -64,7 +64,6 @@ from core.ffmpeg import (
 from core.pipelines import CancelledError, LocalPipeline
 from core.video_qa_executor import VideoQAExecutorRunOutcome
 from core.video_qa_local_run import (
-    DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
     VideoQAPreflightBlockedError,
     ensure_local_video_qa_run_allowed,
     map_video_qa_progress_frac_to_200,
@@ -77,7 +76,6 @@ from gui.subtitle_preview import SubtitlePreview
 from gui.video_qa import VideoQAPanel
 from gui.video_qa_worker import VideoQALocalRunWorker
 from gui.wysiwyg_editor import TableRow, WysiwygEditor
-from utils.askvlm_defaults import get_default_video_qa_canonical_model_id
 from utils.exporters import (
     SubtitleRules,
     append_askvlm_metadata_to_srt,
@@ -842,7 +840,7 @@ class MainWindow(QMainWindow):
             self._spinner_timer.stop()
 
     def _re_enable_after_video_qa(self) -> None:
-        """Restore main controls after a Video QA worker ends (success, error, or cancel)."""
+        """Restore main controls after a Video QA worker ends."""
         self.progress.setMaximum(100)
         self.progress.setValue(0)
         self.btn_start.setEnabled(True)
@@ -910,14 +908,16 @@ class MainWindow(QMainWindow):
         """Spin up :class:`VideoQALocalRunWorker` on a dedicated thread."""
         self._apply_quality_to_pipeline(force_reload=False)
         self._video_qa_thread = QThread(self)
+        lm = self.video_qa_panel.lm_runtime_settings()
         self._video_qa_worker = VideoQALocalRunWorker(
             context=ctx,
             output_dir=out_dir,
             context_window_tokens=self.video_qa_panel.context_window_tokens(),
             frame_sample_fps=self.video_qa_panel.frame_sample_fps(),
             whisper=self.pipeline.whisperx,
-            lm_base_url=DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
-            lm_model_id=get_default_video_qa_canonical_model_id(),
+            lm_base_url=lm.lm_base_url,
+            lm_model_id=lm.lm_model_id,
+            lm_authorization_bearer=lm.lm_authorization_bearer,
         )
         self._video_qa_worker.moveToThread(self._video_qa_thread)
         self._video_qa_thread.started.connect(self._video_qa_worker.run)
@@ -1317,7 +1317,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "No input",
-                "Add at least one file or folder in the Input tab before burning subtitles.",
+                "Add at least one file or folder in the Input tab before burning "
+                "subtitles.",
             )
             return
         if not self._has_transcript:
@@ -1333,7 +1334,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "No video",
-                "No video files (.mp4, .mov, .mkv, .avi) found among the Input tab entries.",
+                "No video files (.mp4, .mov, .mkv, .avi) found among the Input tab "
+                "entries.",
             )
             return
         # Start burn worker thread
@@ -1510,17 +1512,22 @@ class MainWindow(QMainWindow):
             main_splitter_state,
             left_splitter_state,
         )
-        ratio_raw = s.value("videoqa/answer_area_ratio_percent", "")
+        ans_prog_splitter_state = s.value(
+            "videoqa/answer_progress_splitter_state", None
+        )
+        self.video_qa_panel.restore_answer_progress_splitter_state(
+            ans_prog_splitter_state
+        )
+        scope_raw = s.value("videoqa/lm_scope", 0)
         try:
-            r = (
-                int(ratio_raw)
-                if isinstance(ratio_raw, int)
-                else int(str(ratio_raw).strip())
-            )
+            scope_idx = int(str(scope_raw).strip())
         except (TypeError, ValueError):
-            pass
-        else:
-            self.video_qa_panel.set_answer_area_ratio_percent(r)
+            scope_idx = 0
+        self.video_qa_panel.restore_video_qa_lm_ui(
+            scope_index=scope_idx,
+            local_model_text=str(s.value("videoqa/lm_local_model_text", "")),
+            cloud_model_text=str(s.value("videoqa/lm_cloud_model_text", "")),
+        )
 
     # * Settings persistence
     def _load_settings(self) -> None:
@@ -1615,8 +1622,18 @@ class MainWindow(QMainWindow):
             self.video_qa_panel.left_splitter_state(),
         )
         s.setValue(
-            "videoqa/answer_area_ratio_percent",
-            self.video_qa_panel.answer_area_ratio_percent(),
+            "videoqa/answer_progress_splitter_state",
+            self.video_qa_panel.answer_progress_splitter_state(),
+        )
+        s.setValue(
+            "videoqa/lm_scope", int(self.video_qa_panel.model_type_combo.currentIndex())
+        )
+        s.setValue(
+            "videoqa/lm_local_model_text", self.video_qa_panel.model_combo.currentText()
+        )
+        s.setValue(
+            "videoqa/lm_cloud_model_text",
+            self.video_qa_panel.model_cloud_edit.text(),
         )
         # Phase 1.81
         s.setValue("subs/max_line_chars", int(self.spin_line_len.value()))

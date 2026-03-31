@@ -137,6 +137,7 @@ class VideoQALMStudioChunkInferencer:
         timeout: float | None = None,
         request_chat_fn: Callable[..., LMStudioResponse] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        authorization_bearer: str | None = None,
     ) -> None:
         self._context = context
         self._base_url = base_url
@@ -145,6 +146,7 @@ class VideoQALMStudioChunkInferencer:
         self._timeout = timeout
         self._request_fn = request_chat_fn or request_chat_completion
         self._should_cancel = should_cancel
+        self._authorization_bearer = authorization_bearer
 
     def infer_chunk(
         self,
@@ -174,6 +176,7 @@ class VideoQALMStudioChunkInferencer:
                 temperature=self._temperature,
                 timeout=self._timeout,
                 should_cancel=self._should_cancel,
+                authorization_bearer=self._authorization_bearer,
             )
         except LMStudioClientError as exc:
             return VideoQAChunkInferenceOutcome(ok=False, error=str(exc))

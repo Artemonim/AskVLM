@@ -1,16 +1,21 @@
 from __future__ import annotations
 
 import contextlib
-from dataclasses import replace
+import json
+import os
+import urllib.request
+from dataclasses import dataclass, replace
 from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
 from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
+from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -20,7 +25,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
-    QSlider,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTableWidget,
@@ -35,6 +40,11 @@ from core.video_qa_context import (
     VideoQAAttachmentRequest,
     normalize_video_qa_context,
 )
+from core.video_qa_local_run import (
+    DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
+    DEFAULT_OPENROUTER_OPENAI_BASE_URL,
+    OPENROUTER_API_KEY_ENV,
+)
 from core.video_qa_orchestration import (
     build_video_qa_preflight_report,
     build_video_qa_preflight_summary,
@@ -45,6 +55,7 @@ from core.video_qa_policy import (
 )
 from core.video_qa_runtime import default_video_qa_budget_policy
 from core.video_qa_sources import LocalFileProvider
+from utils.askvlm_defaults import get_default_video_qa_canonical_model_id
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator
@@ -66,22 +77,41 @@ VIDEO_QA_PREFLIGHT_FPS_CHOICES: Final[tuple[float, ...]] = (
 )
 FPS_VALUE_MATCH_EPSILON: Final[float] = 1e-9
 
+# * Combo entries that are not real LM Studio model ids (errors / empty catalog).
+_LOCAL_MODEL_NON_SELECTION_LABELS: Final[frozenset[str]] = frozenset(
+    {"LM Studio not running/reachable", "No models found"}
+)
 
-def _format_preflight_warnings_rich(
+_WARN_ROW_DIV_STYLE: Final[str] = (
+    "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;"
+)
+
+
+def _format_preflight_info_row_html(
     warnings: tuple[str, ...],
     overflow_explanation: str,
 ) -> str:
-    """Build HTML for the preflight warnings row (includes overflow note when present)."""
-    ow = escape((overflow_explanation or "").strip())
+    """Build HTML for the preflight Info row (errors vs offline status text)."""
+    div_open = f"<div style='{_WARN_ROW_DIV_STYLE}'>"
     if warnings:
-        body = "<br/>".join(escape(str(w)) for w in warnings)
+        body = ", ".join(escape(str(w)) for w in warnings)
         warn_html = f"<span style='color:#f48771;font-weight:600;'>{body}</span>"
-    else:
-        warn_html = "<span style='color:#d4d4d4;'>none</span>"
+        return f"{div_open}{warn_html}</div>"
+    ow = escape((overflow_explanation or "").strip())
     if ow:
         muted = f"<span style='color:#9d9d9d;'>{ow}</span>"
-        return f"{warn_html}<br/><br/>{muted}"
-    return warn_html
+        return f"{div_open}{muted}</div>"
+    muted = "<span style='color:#9d9d9d;'>—</span>"
+    return f"{div_open}{muted}</div>"
+
+
+@dataclass(frozen=True, slots=True)
+class VideoQALMRuntimeSettings:
+    """OpenAI-compatible HTTP target for one Video QA worker run."""
+
+    lm_base_url: str
+    lm_model_id: str
+    lm_authorization_bearer: str | None = None
 
 
 # * Supported attachment extensions aligned with core/video_qa_context classification.
@@ -122,8 +152,10 @@ _VIDEO_QA_PANEL_STYLE = (
     "gridline-color: #3f3f46; border: 1px solid #3f3f46; }"
     "QHeaderView::section { background-color: #2d2d30; color: #d4d4d4; "
     "border: 1px solid #3f3f46; padding: 4px 8px; }"
-    "QLineEdit, QSpinBox, QComboBox { background-color: #1e1e1e; color: #d4d4d4; "
+    "QLineEdit, QComboBox { background-color: #1e1e1e; color: #d4d4d4; "
     "border: 1px solid #3f3f46; }"
+    "QSpinBox { background-color: #1e1e1e; color: #d4d4d4; "
+    "border: 1px solid #3f3f46; padding-left: 4px; }"
     "QPushButton { background-color: #2d2d30; color: #d4d4d4; "
     "border: 1px solid #3f3f46; padding: 6px 10px; }"
     "QPushButton:checked { background-color: #0e639c; color: #ffffff; "
@@ -131,7 +163,8 @@ _VIDEO_QA_PANEL_STYLE = (
     "QPushButton:disabled { color: #7a7a7a; background-color: #252526; }"
     "QCheckBox { color: #d4d4d4; }"
     "QSplitter::handle { background-color: #3f3f46; }"
-    "QSlider::groove:horizontal { background: #3f3f46; height: 4px; border-radius: 2px; }"
+    "QSlider::groove:horizontal { background: #3f3f46; height: 4px; "
+    "border-radius: 2px; }"
     "QSlider::handle:horizontal { background: #0e639c; width: 14px; margin: -6px 0; "
     "border-radius: 7px; }"
     "QLabel { color: #d4d4d4; }"
@@ -176,7 +209,9 @@ class VideoQAPanel(QWidget):
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
 
-        self._build_source_and_question(left_layout)
+        self._build_source_row(left_layout)
+
+        question_widget = self._create_question_area_widget()
 
         self._left_splitter = QSplitter(Qt.Orientation.Vertical)
         self._left_splitter.setChildrenCollapsible(False)
@@ -195,8 +230,17 @@ class VideoQAPanel(QWidget):
         self._left_splitter.addWidget(pre_widget)
         self._left_splitter.setStretchFactor(0, 1)
         self._left_splitter.setStretchFactor(1, 2)
-        self._left_splitter.setSizes([240, 360])
-        left_layout.addWidget(self._left_splitter, 1)
+        self._left_splitter.setSizes([200, 200])
+
+        self._question_rest_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._question_rest_splitter.setChildrenCollapsible(False)
+        self._question_rest_splitter.addWidget(question_widget)
+        self._question_rest_splitter.addWidget(self._left_splitter)
+        top_default = self._question_area_splitter_top_size()
+        self._question_rest_splitter.setSizes([top_default, 320])
+        self._question_rest_splitter.setStretchFactor(0, 0)
+        self._question_rest_splitter.setStretchFactor(1, 1)
+        left_layout.addWidget(self._question_rest_splitter, 1)
 
         self._build_answer_evidence_group(right_layout)
         self._build_run_placeholder(right_layout)
@@ -205,7 +249,7 @@ class VideoQAPanel(QWidget):
         self._main_splitter.addWidget(right_widget)
         self._main_splitter.setStretchFactor(0, 1)
         self._main_splitter.setStretchFactor(1, 1)
-        self._main_splitter.setSizes([540, 460])
+        self._main_splitter.setSizes([400, 400])
 
         root.addWidget(self._main_splitter, 1)
 
@@ -221,7 +265,7 @@ class VideoQAPanel(QWidget):
         hint.setWordWrap(True)
         root.addWidget(hint)
 
-    def _build_source_and_question(self, root: QVBoxLayout) -> None:
+    def _build_source_row(self, root: QVBoxLayout) -> None:
         source_row = QHBoxLayout()
         source_row.addWidget(QLabel("Local file:"))
         self.source_edit = QLineEdit()
@@ -239,13 +283,33 @@ class VideoQAPanel(QWidget):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
         root.addWidget(self.source_details)
-        root.addWidget(QLabel("Question:"))
-        self.question_edit = QLineEdit()
+
+    def _create_question_area_widget(self) -> QWidget:
+        """Pack the question label and editor; height is adjusted via splitter."""
+        holder = QWidget()
+        layout = QVBoxLayout(holder)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(QLabel("Question:"))
+        self.question_edit = QTextEdit()
         self.question_edit.setPlaceholderText(
             "Ask a question about the selected local file"
         )
+        fm = QFontMetrics(self.question_edit.font())
+        min_body = max(40, fm.lineSpacing() * 2 + 8)
+        self.question_edit.setMinimumHeight(min_body)
+        self.question_edit.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
         self.question_edit.textChanged.connect(self._schedule_preflight_refresh)
-        root.addWidget(self.question_edit)
+        layout.addWidget(self.question_edit)
+        return holder
+
+    def _question_area_splitter_top_size(self) -> int:
+        """Return default splitter height (question label + ~two editor lines)."""
+        fm = QFontMetrics(self.question_edit.font())
+        label_row = 22
+        body = max(40, fm.lineSpacing() * 2 + 8)
+        return label_row + body + 8
 
     def _build_attachments_group(self, root: QVBoxLayout) -> None:
         att_box = QGroupBox("Attachments")
@@ -254,7 +318,7 @@ class VideoQAPanel(QWidget):
         self._attachment_table = QTableWidget(0, 2)
         self._attachment_table.setHorizontalHeaderLabels(["Include", "Path"])
         self._attachment_table.setAlternatingRowColors(True)
-        self._attachment_table.setMinimumHeight(220)
+        self._attachment_table.setMinimumHeight(100)
         self._attachment_table.horizontalHeader().setSectionResizeMode(
             0, QHeaderView.ResizeMode.Fixed
         )
@@ -287,11 +351,15 @@ class VideoQAPanel(QWidget):
         pre_box = QGroupBox("Preflight")
         pre_box.setStyleSheet(_VIDEO_QA_PANEL_STYLE)
         pre_layout = QVBoxLayout(pre_box)
+        self._build_preflight_toolbar(pre_layout)
+        self._build_preflight_summary_section(pre_layout)
+        root.addWidget(pre_box)
+
+    def _build_preflight_toolbar(self, pre_layout: QVBoxLayout) -> None:
         pre_btn_row = QHBoxLayout()
         self.btn_refresh_preflight = QPushButton("Refresh preflight")
         self.btn_refresh_preflight.clicked.connect(self.refresh_preflight)
         pre_btn_row.addWidget(self.btn_refresh_preflight)
-
         pre_btn_row.addSpacing(16)
         pre_btn_row.addWidget(QLabel("Context window tokens:"))
         self.budget_spin = QSpinBox()
@@ -300,22 +368,53 @@ class VideoQAPanel(QWidget):
         self.budget_spin.setValue(100000)
         self.budget_spin.valueChanged.connect(self._schedule_preflight_refresh)
         pre_btn_row.addWidget(self.budget_spin)
-
         self._setup_preflight_fps_row(pre_btn_row)
-
         pre_btn_row.addStretch(1)
         pre_layout.addLayout(pre_btn_row)
 
+    def _build_preflight_summary_section(self, pre_layout: QVBoxLayout) -> None:
         self.preflight_summary_form = QFormLayout()
-        self.lbl_preflight_source = QLabel("-")
+        self._setup_preflight_model_row()
+        self._setup_preflight_summary_label_rows()
+        summary_widget = QWidget()
+        summary_widget.setLayout(self.preflight_summary_form)
+        summary_widget.setStyleSheet(_PREFLIGHT_SUMMARY_STYLE)
+        pre_layout.addWidget(summary_widget)
+        self.preflight_edit = QPlainTextEdit()
+        self.preflight_edit.setReadOnly(True)
+        self.preflight_edit.setPlaceholderText(
+            "Click “Refresh preflight” to estimate chunks and context budget."
+        )
+        self.preflight_edit.setMinimumHeight(60)
+        self.preflight_edit.setStyleSheet(_READ_ONLY_STYLE)
+        pre_layout.addWidget(self.preflight_edit)
+
+    def _setup_preflight_model_row(self) -> None:
+        self.model_type_combo = QComboBox()
+        self.model_type_combo.addItems(["Local (LM Studio)", "Cloud"])
+        self.model_combo = QComboBox()
+        self.model_combo.setEditable(False)
+        self.model_cloud_edit = QLineEdit()
+        self.model_cloud_edit.setPlaceholderText("Enter cloud model name")
+        self.model_cloud_edit.setVisible(False)
+        self.btn_refresh_models = QPushButton("🔄")
+        self.btn_refresh_models.setToolTip("Refresh models from LM Studio")
+        self.btn_refresh_models.clicked.connect(self._refresh_local_models)
+        self.model_type_combo.currentIndexChanged.connect(self._on_model_scope_changed)
+        model_row = QHBoxLayout()
+        model_row.addWidget(self.model_type_combo)
+        model_row.addWidget(self.model_combo, 1)
+        model_row.addWidget(self.btn_refresh_models)
+        model_row.addWidget(self.model_cloud_edit, 1)
+        self.preflight_summary_form.addRow(QLabel("Model:"), model_row)
+
+    def _setup_preflight_summary_label_rows(self) -> None:
         self.lbl_preflight_question = QLabel("-")
         self.lbl_preflight_duration = QLabel("-")
         self.lbl_preflight_budget = QLabel("-")
-        self.lbl_preflight_warnings = QLabel("-")
-        self.lbl_preflight_warnings.setWordWrap(True)
-        self.lbl_preflight_warnings.setTextFormat(Qt.TextFormat.RichText)
-
-        self.preflight_summary_form.addRow(QLabel("Source:"), self.lbl_preflight_source)
+        self.lbl_preflight_info = QLabel("-")
+        self.lbl_preflight_info.setWordWrap(False)
+        self.lbl_preflight_info.setTextFormat(Qt.TextFormat.RichText)
         self.preflight_summary_form.addRow(
             QLabel("Question:"), self.lbl_preflight_question
         )
@@ -323,24 +422,14 @@ class VideoQAPanel(QWidget):
             QLabel("Video:"), self.lbl_preflight_duration
         )
         self.preflight_summary_form.addRow(QLabel("Budget:"), self.lbl_preflight_budget)
-        self.preflight_summary_form.addRow(
-            QLabel("Warnings:"), self.lbl_preflight_warnings
-        )
+        self.preflight_summary_form.addRow(QLabel("Info:"), self.lbl_preflight_info)
 
-        summary_widget = QWidget()
-        summary_widget.setLayout(self.preflight_summary_form)
-        summary_widget.setStyleSheet(_PREFLIGHT_SUMMARY_STYLE)
-        pre_layout.addWidget(summary_widget)
-
-        self.preflight_edit = QPlainTextEdit()
-        self.preflight_edit.setReadOnly(True)
-        self.preflight_edit.setPlaceholderText(
-            "Click “Refresh preflight” to estimate chunks and context budget."
-        )
-        self.preflight_edit.setMinimumHeight(120)
-        self.preflight_edit.setStyleSheet(_READ_ONLY_STYLE)
-        pre_layout.addWidget(self.preflight_edit)
-        root.addWidget(pre_box)
+    def _on_model_scope_changed(self, idx: int) -> None:
+        """Show LM Studio model picker for local scope; text field for cloud."""
+        is_local = idx == 0
+        self.model_combo.setVisible(is_local)
+        self.btn_refresh_models.setVisible(is_local)
+        self.model_cloud_edit.setVisible(not is_local)
 
     def _setup_preflight_fps_row(self, row: QHBoxLayout) -> None:
         """Add fps toggles; each change runs preflight immediately."""
@@ -369,7 +458,7 @@ class VideoQAPanel(QWidget):
         self.answer_edit.setPlaceholderText(
             "Final answer appears here after a successful Video QA run (Markdown)."
         )
-        self.answer_edit.setMinimumHeight(100)
+        self.answer_edit.setMinimumHeight(60)
         self.answer_edit.setStyleSheet(_ANSWER_STYLE)
 
         self.progress_log_edit = QPlainTextEdit()
@@ -377,32 +466,16 @@ class VideoQAPanel(QWidget):
         self.progress_log_edit.setPlaceholderText(
             "Pipeline stages and LM Studio steps are logged here during a run."
         )
-        self.progress_log_edit.setMinimumHeight(100)
+        self.progress_log_edit.setMinimumHeight(60)
         self.progress_log_edit.setStyleSheet(_EVIDENCE_STYLE)
 
         self._answer_progress_splitter = QSplitter(Qt.Orientation.Vertical)
         self._answer_progress_splitter.setChildrenCollapsible(False)
         self._answer_progress_splitter.addWidget(self.answer_edit)
         self._answer_progress_splitter.addWidget(self.progress_log_edit)
-        self._answer_progress_splitter.setSizes([220, 180])
-        self._answer_progress_splitter.splitterMoved.connect(
-            self._on_answer_progress_splitter_moved
-        )
+        self._answer_progress_splitter.setSizes([500, 100])
         out_layout.addWidget(self._answer_progress_splitter, 1)
 
-        ratio_row = QHBoxLayout()
-        ratio_row.addWidget(QLabel("Answer / progress height:"))
-        self._answer_ratio_slider = QSlider(Qt.Orientation.Horizontal)
-        self._answer_ratio_slider.setRange(15, 85)
-        self._answer_ratio_slider.setValue(55)
-        self._answer_ratio_slider.setToolTip(
-            "Adjust vertical space for the answer versus the progress log."
-        )
-        self._answer_ratio_slider.valueChanged.connect(
-            self._on_answer_ratio_slider_changed
-        )
-        ratio_row.addWidget(self._answer_ratio_slider, 1)
-        out_layout.addLayout(ratio_row)
         root.addWidget(out_box)
 
     def _build_run_placeholder(self, root: QVBoxLayout) -> None:
@@ -455,7 +528,7 @@ class VideoQAPanel(QWidget):
 
     def question_text(self) -> str:
         """Return the current question text."""
-        return self.question_edit.text()
+        return self.question_edit.toPlainText()
 
     def set_source_path(self, path: str | Path | None) -> bool:
         """Set the local source path and refresh the metadata display."""
@@ -529,39 +602,15 @@ class VideoQAPanel(QWidget):
         """Return an empty list; evidence is no longer edited in a dedicated field."""
         return []
 
-    def answer_area_ratio_percent(self) -> int:
-        """Return the slider value controlling answer vs progress log height share."""
-        return int(self._answer_ratio_slider.value())
+    def answer_progress_splitter_state(self) -> QByteArray:
+        """Return the saved state for the answer/progress splitter."""
+        return self._answer_progress_splitter.saveState()
 
-    def set_answer_area_ratio_percent(self, ratio: int) -> None:
-        """Clamp and apply the answer/progress height ratio (15-85)."""
-        v = max(15, min(85, int(ratio)))
-        self._answer_ratio_slider.blockSignals(True)  # noqa: FBT003
-        self._answer_ratio_slider.setValue(v)
-        self._answer_ratio_slider.blockSignals(False)  # noqa: FBT003
-        self._on_answer_ratio_slider_changed(v)
-
-    def _on_answer_ratio_slider_changed(self, value: int) -> None:
-        """Resize the vertical splitter from the horizontal ratio slider."""
-        v = max(15, min(85, int(value)))
-        total = max(sum(self._answer_progress_splitter.sizes()), 200)
-        top = max(80, int(total * v / 100))
-        bottom = max(80, total - top)
-        self._answer_progress_splitter.blockSignals(True)  # noqa: FBT003
-        self._answer_progress_splitter.setSizes([top, bottom])
-        self._answer_progress_splitter.blockSignals(False)  # noqa: FBT003
-
-    def _on_answer_progress_splitter_moved(self, _pos: int, _index: int) -> None:
-        """Keep the ratio slider aligned when the user drags the splitter."""
-        sizes = self._answer_progress_splitter.sizes()
-        total = sum(sizes)
-        if total <= 0:
-            return
-        top_pct = round(100 * sizes[0] / total)
-        top_pct = max(15, min(85, top_pct))
-        self._answer_ratio_slider.blockSignals(True)  # noqa: FBT003
-        self._answer_ratio_slider.setValue(top_pct)
-        self._answer_ratio_slider.blockSignals(False)  # noqa: FBT003
+    def restore_answer_progress_splitter_state(self, state: object | None) -> None:
+        """Restore the answer/progress splitter state."""
+        if isinstance(state, QByteArray):
+            with contextlib.suppress(Exception):
+                self._answer_progress_splitter.restoreState(state)
 
     def context_window_tokens(self) -> int:
         """Return the current GUI budget limit in tokens."""
@@ -590,6 +639,48 @@ class VideoQAPanel(QWidget):
     def set_context_window_tokens(self, tokens: int) -> None:
         """Set the current GUI budget limit."""
         self.budget_spin.setValue(tokens)
+
+    def lm_runtime_settings(self) -> VideoQALMRuntimeSettings:
+        """Resolve base URL, model id, and optional Bearer for the model scope."""
+        default_id = get_default_video_qa_canonical_model_id()
+        if self.model_type_combo.currentIndex() == 0:
+            base = DEFAULT_LM_STUDIO_OPENAI_BASE_URL
+            raw = self.model_combo.currentText().strip()
+            if not raw or raw in _LOCAL_MODEL_NON_SELECTION_LABELS:
+                model_id = default_id
+            else:
+                model_id = raw
+            return VideoQALMRuntimeSettings(base, model_id, None)
+        base = DEFAULT_OPENROUTER_OPENAI_BASE_URL
+        cloud_raw = self.model_cloud_edit.text().strip()
+        model_id = cloud_raw if cloud_raw else default_id
+        token = os.environ.get(OPENROUTER_API_KEY_ENV, "")
+        stripped = token.strip()
+        bearer = stripped if stripped else None
+        return VideoQALMRuntimeSettings(base, model_id, bearer)
+
+    def restore_video_qa_lm_ui(
+        self,
+        *,
+        scope_index: int = 0,
+        local_model_text: str = "",
+        cloud_model_text: str = "",
+    ) -> None:
+        """Restore model scope widgets from persisted settings."""
+        idx = 0 if int(scope_index) <= 0 else 1
+        self.model_type_combo.blockSignals(True)  # noqa: FBT003
+        self.model_type_combo.setCurrentIndex(idx)
+        self.model_type_combo.blockSignals(False)  # noqa: FBT003
+        self._on_model_scope_changed(idx)
+        local_t = local_model_text.strip()
+        if local_t:
+            found = self.model_combo.findText(local_t, Qt.MatchFlag.MatchExactly)
+            if found >= 0:
+                self.model_combo.setCurrentIndex(found)
+            else:
+                self.model_combo.insertItem(0, local_t)
+                self.model_combo.setCurrentIndex(0)
+        self.model_cloud_edit.setText(cloud_model_text)
 
     def main_splitter_state(self) -> QByteArray:
         """Return the saved state for the main left/right splitter."""
@@ -648,12 +739,11 @@ class VideoQAPanel(QWidget):
 
         report = build_video_qa_preflight_report(context, preflight)
 
-        self.lbl_preflight_source.setText(report.source_summary or "(not selected)")
         self.lbl_preflight_question.setText(report.question.strip() or "(empty)")
         self.lbl_preflight_duration.setText(f"{duration_s:.2f}s")
         self.lbl_preflight_budget.setText(report.budget_status_line)
-        self.lbl_preflight_warnings.setText(
-            _format_preflight_warnings_rich(
+        self.lbl_preflight_info.setText(
+            _format_preflight_info_row_html(
                 report.warnings,
                 report.overflow_fallback_explanation,
             )
@@ -799,3 +889,20 @@ class VideoQAPanel(QWidget):
             self._attachment_table.removeRow(r)
         if rows:
             self._schedule_preflight_refresh()
+
+    def _refresh_local_models(self) -> None:
+        try:
+            req = urllib.request.Request(
+                "http://127.0.0.1:1234/v1/models", method="GET"
+            )
+            with urllib.request.urlopen(req, timeout=2.0) as response:  # noqa: S310
+                data = json.loads(response.read().decode("utf-8"))
+                models = [m["id"] for m in data.get("data", []) if "id" in m]
+                self.model_combo.clear()
+                if models:
+                    self.model_combo.addItems(models)
+                else:
+                    self.model_combo.addItem("No models found")
+        except Exception:  # noqa: BLE001
+            self.model_combo.clear()
+            self.model_combo.addItem("LM Studio not running/reachable")

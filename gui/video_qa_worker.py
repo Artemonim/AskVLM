@@ -39,6 +39,7 @@ class VideoQALocalRunWorker(QObject):
         whisper: WhisperXWrapper,
         lm_base_url: str,
         lm_model_id: str,
+        lm_authorization_bearer: str | None = None,
     ) -> None:
         super().__init__()
         self._params = VideoQALocalRunParams(
@@ -48,6 +49,7 @@ class VideoQALocalRunWorker(QObject):
             lm_base_url=lm_base_url,
             lm_model_id=lm_model_id,
             frame_sample_fps=frame_sample_fps,
+            lm_authorization_bearer=lm_authorization_bearer,
         )
         self._whisper = whisper
         self._cancel = False

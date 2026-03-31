@@ -190,6 +190,7 @@ def _http_post_json_cancellable(  # noqa: C901, PLR0915
     *,
     timeout: float | None,
     should_cancel: Callable[[], bool],
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """POST JSON on a worker thread; close the socket when cancel is requested."""
     parsed = urllib.parse.urlsplit(url)
@@ -207,6 +208,8 @@ def _http_post_json_cancellable(  # noqa: C901, PLR0915
     if parsed.query:
         path = f"{path}?{parsed.query}"
     headers = {"Content-Type": "application/json"}
+    if extra_headers:
+        headers.update(extra_headers)
 
     conn_holder: list[
         http.client.HTTPConnection | http.client.HTTPSConnection | None
@@ -268,7 +271,7 @@ def _http_post_json_cancellable(  # noqa: C901, PLR0915
     return _decode_json_body(raw)
 
 
-def request_chat_completion(  # noqa: C901
+def request_chat_completion(  # noqa: C901, PLR0913
     base_url: str,
     prompt: str,
     image_paths: Sequence[Path | str] | None = None,
@@ -278,6 +281,7 @@ def request_chat_completion(  # noqa: C901
     timeout: float | None = None,
     *,
     should_cancel: Callable[[], bool] | None = None,
+    authorization_bearer: str | None = None,
 ) -> LMStudioResponse:
     """Send a multimodal chat completion request to LM Studio.
 
@@ -292,6 +296,9 @@ def request_chat_completion(  # noqa: C901
     """
     normalized_image_paths = tuple(Path(path) for path in (image_paths or ()))
     url = f"{base_url.rstrip('/')}/chat/completions"
+    auth_headers: dict[str, str] | None = None
+    if authorization_bearer:
+        auth_headers = {"Authorization": f"Bearer {authorization_bearer}"}
 
     def do_request(schema: dict[str, Any] | None) -> dict[str, Any]:
         if should_cancel and should_cancel():
@@ -315,11 +322,15 @@ def request_chat_completion(  # noqa: C901
                 data,
                 timeout=timeout,
                 should_cancel=should_cancel,
+                extra_headers=auth_headers,
             )
+        req_headers: dict[str, str] = {"Content-Type": "application/json"}
+        if auth_headers:
+            req_headers.update(auth_headers)
         req = urllib.request.Request(  # noqa: S310
             url,
             data=data,
-            headers={"Content-Type": "application/json"},
+            headers=req_headers,
             method="POST",
         )
         return _http_post_json(req, timeout=timeout)

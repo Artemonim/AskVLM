@@ -227,10 +227,6 @@ def build_video_qa_preflight_report(
 def format_video_qa_preflight_report_text(report: VideoQAPreflightReport) -> str:
     """Format a :class:`VideoQAPreflightReport` as multi-line plain text."""
     lines: list[str] = []
-    if report.source_summary:
-        lines.append(f"Source: {report.source_summary}")
-    else:
-        lines.append("Source: (not selected)")
     q = report.question.strip()
     lines.append(f"Question: {q if q else '(empty)'}")
     lines.append(f"Chunks: {report.chunk_count}")
@@ -250,10 +246,10 @@ def format_video_qa_preflight_report_text(report: VideoQAPreflightReport) -> str
     lines.append(f"Overflow mitigation order: {report.overflow_mitigation_order_text}")
     lines.append(report.overflow_fallback_explanation)
     if report.warnings:
-        lines.append("Warnings:")
+        lines.append("Info:")
         lines.extend(f"- {warning}" for warning in report.warnings)
     else:
-        lines.append("Warnings: none")
+        lines.append(f"Info: {report.overflow_fallback_explanation}")
     return "\n".join(lines)
 
 

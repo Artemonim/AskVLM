@@ -73,6 +73,22 @@ def test_request_chat_completion_success(mock_urlopen: MagicMock) -> None:
 
 
 @patch("core.video_qa_lm_studio_client.urllib.request.urlopen")
+def test_request_chat_completion_sends_bearer_header(mock_urlopen: MagicMock) -> None:
+    """Optional ``authorization_bearer`` adds an Authorization header on HTTP POST."""
+    mock_response = MagicMock()
+    mock_response.read.return_value = json.dumps(
+        {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}]}
+    ).encode("utf-8")
+    mock_response.__enter__.return_value = mock_response
+    mock_urlopen.return_value = mock_response
+
+    request_chat_completion("http://test", "Hello", authorization_bearer="secret-token")
+    req = mock_urlopen.call_args[0][0]
+    headers = dict(req.header_items())
+    assert headers.get("Authorization") == "Bearer secret-token"
+
+
+@patch("core.video_qa_lm_studio_client.urllib.request.urlopen")
 def test_request_chat_completion_json_schema_success(
     mock_urlopen: MagicMock,
 ) -> None:

@@ -64,6 +64,10 @@ if TYPE_CHECKING:
 
 # * OpenAI-compatible LM Studio HTTP API base (chat completions live under /chat/completions).
 DEFAULT_LM_STUDIO_OPENAI_BASE_URL: Final[str] = "http://127.0.0.1:1234/v1"
+# * OpenAI-compatible OpenRouter base (same paths as local OpenAI-compatible servers).
+DEFAULT_OPENROUTER_OPENAI_BASE_URL: Final[str] = "https://openrouter.ai/api/v1"
+# * Environment variable read by the GUI when Video QA scope is Cloud (Bearer auth).
+OPENROUTER_API_KEY_ENV: Final[str] = "OPENROUTER_API_KEY"
 
 # * Fraction of the 0..1 progress curve treated as pre-VLM (maps to 0-100 on a 0-200 bar).
 _VIDEO_QA_PRE_VLM_PROGRESS_FRAC: Final[float] = 0.45
@@ -598,6 +602,7 @@ class VideoQALMStudioAnswerSynthesizer:
         timeout: float | None = None,
         request_chat_fn: Callable[..., object] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        authorization_bearer: str | None = None,
     ) -> None:
         self._base_url = base_url
         self._model = model
@@ -605,6 +610,7 @@ class VideoQALMStudioAnswerSynthesizer:
         self._timeout = timeout
         self._request_chat_fn = request_chat_fn or request_chat_completion
         self._should_cancel = should_cancel
+        self._authorization_bearer = authorization_bearer
 
     def aggregate(
         self,
@@ -642,6 +648,7 @@ class VideoQALMStudioAnswerSynthesizer:
                 temperature=self._temperature,
                 timeout=self._timeout,
                 should_cancel=self._should_cancel,
+                authorization_bearer=self._authorization_bearer,
             )
         except LMStudioClientError as exc:
             msg = f"Final Video QA synthesis failed: {exc}"
@@ -684,6 +691,7 @@ class VideoQALocalRunParams:
     lm_base_url: str
     lm_model_id: str
     frame_sample_fps: float = field(default_factory=_default_frame_sample_fps)
+    lm_authorization_bearer: str | None = None
 
 
 def build_video_qa_local_executor_deps(  # noqa: PLR0913
@@ -693,6 +701,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     staging_dir: Path,
     lm_base_url: str,
     lm_model_id: str,
+    lm_authorization_bearer: str | None = None,
     should_cancel: Callable[[], bool] | None,
     progress: Callable[[str, float], None] | None,
     pipeline_log: Callable[[str], None] | None = None,
@@ -743,6 +752,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
             base_url=lm_base_url,
             model=lm_model_id,
             should_cancel=should_cancel,
+            authorization_bearer=lm_authorization_bearer,
         )
     aggregator: VideoQAAnswerAggregator
     if aggregator_override is not None:
@@ -752,6 +762,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
             base_url=lm_base_url,
             model=lm_model_id,
             should_cancel=should_cancel,
+            authorization_bearer=lm_authorization_bearer,
         )
     return VideoQAExecutorDeps(
         transcript=transcript,
@@ -1014,6 +1025,7 @@ def run_local_video_qa(  # noqa: PLR0913
         staging_dir=staging_dir,
         lm_base_url=params.lm_base_url,
         lm_model_id=params.lm_model_id,
+        lm_authorization_bearer=params.lm_authorization_bearer,
         should_cancel=should_cancel,
         progress=progress,
         pipeline_log=pipeline_log,

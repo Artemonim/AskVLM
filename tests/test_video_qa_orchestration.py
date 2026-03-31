@@ -337,7 +337,7 @@ def test_preflight_report_includes_budget_chunks_warnings_overflow_text(
     assert report.chunk_plan[0].chunk_id in text
     assert "frames" in text
     assert "Overflow mitigation order:" in text
-    assert "Warnings:" in text
+    assert "Info:" in text
 
 
 def test_preflight_report_fits_shows_non_overflow_explanation(tmp_path: Path) -> None:

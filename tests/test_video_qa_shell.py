@@ -6,8 +6,14 @@ from unittest.mock import MagicMock
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QPushButton, QSplitter, QTableWidget
 
+from core.video_qa_local_run import (
+    DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
+    DEFAULT_OPENROUTER_OPENAI_BASE_URL,
+    OPENROUTER_API_KEY_ENV,
+)
 from gui.main_window import MainWindow
 from gui.video_qa import VIDEO_QA_PREFLIGHT_FPS_CHOICES, VideoQAPanel
+from gui.video_qa_worker import VideoQALocalRunWorker
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -42,9 +48,9 @@ def test_video_qa_shell_restores_screen_and_source(
     window.video_qa_panel.set_question_text("What is shown?")
     window.video_qa_panel.set_context_window_tokens(123456)
     window.video_qa_panel.set_frame_sample_fps(0.1)
-    window.video_qa_panel.set_answer_area_ratio_percent(72)
     main_splitter_state = window.video_qa_panel.main_splitter_state()
     left_splitter_state = window.video_qa_panel.left_splitter_state()
+    ans_prog_splitter_state = window.video_qa_panel.answer_progress_splitter_state()
     window.shell_tabs.setCurrentIndex(1)
     window._save_settings()  # noqa: SLF001
 
@@ -56,9 +62,12 @@ def test_video_qa_shell_restores_screen_and_source(
     assert restored.video_qa_panel.question_text() == "What is shown?"
     assert restored.video_qa_panel.context_window_tokens() == 123456
     assert restored.video_qa_panel.frame_sample_fps() == 0.1
-    assert restored.video_qa_panel.answer_area_ratio_percent() == 72
     assert restored.video_qa_panel.main_splitter_state() == main_splitter_state
     assert restored.video_qa_panel.left_splitter_state() == left_splitter_state
+    assert (
+        restored.video_qa_panel.answer_progress_splitter_state()
+        == ans_prog_splitter_state
+    )
 
 
 def test_video_qa_restores_attachments(
@@ -131,6 +140,87 @@ def test_context_bundle_respects_attachment_include(
     assert "b.txt" not in names
     disabled = {att.name for att in bundle.disabled_attachments}
     assert "b.txt" in disabled
+
+
+def test_video_qa_lm_runtime_local_uses_combo_selection(qtbot: QtBot) -> None:
+    """Local scope forwards the LM Studio combo selection to the worker settings."""
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    panel.model_combo.clear()
+    panel.model_combo.addItems(["alpha", "beta"])
+    panel.model_combo.setCurrentText("beta")
+    s = panel.lm_runtime_settings()
+    assert s.lm_model_id == "beta"
+    assert s.lm_base_url == DEFAULT_LM_STUDIO_OPENAI_BASE_URL
+    assert s.lm_authorization_bearer is None
+
+
+def test_video_qa_lm_runtime_local_fallback_when_placeholder_combo(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Placeholder refresh rows map to the configured default canonical model id."""
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    monkeypatch.setattr(
+        "gui.video_qa.get_default_video_qa_canonical_model_id",
+        lambda: "default-model-x",
+    )
+    panel.model_combo.clear()
+    panel.model_combo.addItem("LM Studio not running/reachable")
+    panel.model_combo.setCurrentIndex(0)
+    s = panel.lm_runtime_settings()
+    assert s.lm_model_id == "default-model-x"
+
+
+def test_video_qa_lm_runtime_cloud_openrouter_and_env_key(
+    qtbot: QtBot,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cloud scope targets OpenRouter and attaches ``OPENROUTER_API_KEY`` when set."""
+    monkeypatch.setenv(OPENROUTER_API_KEY_ENV, "rk_test")
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    panel.model_type_combo.setCurrentIndex(1)
+    panel.model_cloud_edit.setText("vendor/model-id")
+    s = panel.lm_runtime_settings()
+    assert s.lm_base_url == DEFAULT_OPENROUTER_OPENAI_BASE_URL
+    assert s.lm_model_id == "vendor/model-id"
+    assert s.lm_authorization_bearer == "rk_test"
+
+
+def test_video_qa_restore_lm_ui_restores_cloud_scope(qtbot: QtBot) -> None:
+    """Persisted cloud scope and model text restore into the panel widgets."""
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    panel.restore_video_qa_lm_ui(
+        scope_index=1,
+        local_model_text="local-ghost",
+        cloud_model_text="openai/gpt-4o",
+    )
+    assert panel.model_type_combo.currentIndex() == 1
+    assert panel.model_cloud_edit.text() == "openai/gpt-4o"
+
+
+def test_video_qa_worker_params_carry_lm_model_and_bearer(
+    tmp_path: Path,
+) -> None:
+    """Worker stores GUI-provided base URL, model id, and optional Bearer on params."""
+    ctx = MagicMock()
+    worker = VideoQALocalRunWorker(
+        context=ctx,
+        output_dir=tmp_path,
+        context_window_tokens=2048,
+        frame_sample_fps=0.5,
+        whisper=MagicMock(),
+        lm_base_url="https://openrouter.ai/api/v1",
+        lm_model_id="vendor/vision-model",
+        lm_authorization_bearer="tok",
+    )
+    p = worker._params  # noqa: SLF001
+    assert p.lm_base_url == "https://openrouter.ai/api/v1"
+    assert p.lm_model_id == "vendor/vision-model"
+    assert p.lm_authorization_bearer == "tok"
 
 
 def test_video_qa_run_button_enabled_and_emits_request(qtbot: QtBot) -> None:
@@ -313,7 +403,7 @@ def test_preflight_fps_toggle_refreshes_without_debounce_wait(
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
 ) -> None:
-    """FPS toggle triggers an immediate preflight refresh (not only the debounced timer)."""
+    """FPS toggle runs preflight immediately (not only via debounced timer)."""
     media = tmp_path / "sample.mp4"
     media.write_bytes(b"abc")
     monkeypatch.setattr("gui.video_qa.get_media_duration_seconds", lambda _p: 30.0)
@@ -377,8 +467,8 @@ def test_video_qa_layout_has_splitters(qtbot: QtBot) -> None:
     )
     attachments_table = panel.findChild(QTableWidget)
     assert attachments_table is not None
-    assert attachments_table.minimumHeight() >= 220
-    assert panel.preflight_edit.minimumHeight() >= 120
+    assert attachments_table.minimumHeight() >= 100
+    assert panel.preflight_edit.minimumHeight() >= 60
 
 
 def test_text_subtitles_shell_layout_unchanged(qtbot: QtBot) -> None:
@@ -393,12 +483,12 @@ def test_text_subtitles_shell_layout_unchanged(qtbot: QtBot) -> None:
     assert isinstance(w.video_qa_panel, VideoQAPanel)
 
 
-def test_preflight_warnings_summary_neutral_when_clean(
+def test_preflight_info_row_shows_status_when_clean(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     qtbot: QtBot,
 ) -> None:
-    """Preflight warnings row stays non-red when the backend reports no warnings."""
+    """Preflight Info row shows offline estimate text when there are no warnings."""
     media = tmp_path / "clean.mp4"
     media.write_bytes(b"a")
     monkeypatch.setattr("gui.video_qa.get_media_duration_seconds", lambda _p: 10.0)
@@ -407,18 +497,18 @@ def test_preflight_warnings_summary_neutral_when_clean(
     panel.set_source_path(media)
     panel.set_question_text("Q?")
     panel.refresh_preflight()
-    html = panel.lbl_preflight_warnings.text()
-    assert "none" in html
+    html = panel.lbl_preflight_info.text()
+    assert "Offline estimate" in html
     assert "#f48771" not in html
 
 
-def test_preflight_warnings_summary_red_when_source_missing(qtbot: QtBot) -> None:
-    """Missing media produces a real warning and uses the warning styling."""
+def test_preflight_info_row_red_when_source_missing(qtbot: QtBot) -> None:
+    """Missing media shows the error in the Info row with warning styling."""
     panel = VideoQAPanel()
     qtbot.addWidget(panel)
     panel.set_question_text("Q?")
     panel.refresh_preflight()
-    html = panel.lbl_preflight_warnings.text()
+    html = panel.lbl_preflight_info.text()
     assert "#f48771" in html
 
 
