@@ -870,6 +870,7 @@ class MainWindow(QMainWindow):
             ctx,
             duration_seconds=duration_s,
             context_window_tokens=self.video_qa_panel.context_window_tokens(),
+            frame_sample_fps=self.video_qa_panel.frame_sample_fps(),
         )
         try:
             ensure_local_video_qa_run_allowed(report, chunk_plan)
@@ -901,6 +902,7 @@ class MainWindow(QMainWindow):
             context=ctx,
             output_dir=out_dir,
             context_window_tokens=self.video_qa_panel.context_window_tokens(),
+            frame_sample_fps=self.video_qa_panel.frame_sample_fps(),
             whisper=self.pipeline.whisperx,
             lm_base_url=DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
             lm_model_id=get_default_video_qa_canonical_model_id(),
@@ -1472,6 +1474,11 @@ class MainWindow(QMainWindow):
         budget_str = str(s.value("videoqa/context_window_tokens", ""))
         if budget_str.isdigit():
             self.video_qa_panel.set_context_window_tokens(int(budget_str))
+        fps_raw = s.value("videoqa/frame_sample_fps", "")
+        fps_text = str(fps_raw).strip()
+        if fps_text:
+            with contextlib.suppress(TypeError, ValueError):
+                self.video_qa_panel.set_frame_sample_fps(float(fps_text))
         raw_attach = s.value("videoqa/attachments_json", "")
         if isinstance(raw_attach, str) and raw_attach.strip():
             try:
@@ -1566,6 +1573,7 @@ class MainWindow(QMainWindow):
         s.setValue(
             "videoqa/context_window_tokens", self.video_qa_panel.context_window_tokens()
         )
+        s.setValue("videoqa/frame_sample_fps", self.video_qa_panel.frame_sample_fps())
         s.setValue(
             "videoqa/attachments_json",
             json.dumps(self.video_qa_panel.attachments_for_persistence()),

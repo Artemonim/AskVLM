@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final
 
@@ -68,16 +68,29 @@ class VideoQAPreflightBlockedError(ValueError):
     """Raised when a Video QA run is not allowed to start (preflight / validation)."""
 
 
+def _default_frame_sample_fps() -> float:
+    """Return the default frame sampling rate from the global Video QA budget policy."""
+    return float(default_video_qa_budget_policy().frame_sample_fps)
+
+
 def preflight_local_video_qa(
     context: VideoQAContextBundle,
     *,
     duration_seconds: float,
     context_window_tokens: int,
+    frame_sample_fps: float | None = None,
 ) -> tuple[VideoQAPreflightReport, tuple[VideoQAPlannedChunk, ...]]:
     """Build preflight report and chunk plan without executing ASR or LM calls."""
+    base_policy = default_video_qa_budget_policy()
+    fps = (
+        float(frame_sample_fps)
+        if frame_sample_fps is not None
+        else float(base_policy.frame_sample_fps)
+    )
     budget_policy = replace(
-        default_video_qa_budget_policy(),
+        base_policy,
         context_window_tokens=int(context_window_tokens),
+        frame_sample_fps=fps,
     )
     preflight = build_video_qa_preflight_summary(
         context,
@@ -255,7 +268,7 @@ class VideoQAFFmpegFrameMaterializer:
         manifest: VideoQARunManifest,
         transcript: VideoQATranscriptArtifacts,
     ) -> tuple[str, ...]:
-        """Write 2 FPS chunk frames under ``frames_dir`` and return their paths."""
+        """Write sampled chunk frames under ``frames_dir`` and return their paths."""
         _ = (manifest, transcript)
         self._frames_dir.mkdir(parents=True, exist_ok=True)
         safe = "".join(
@@ -538,12 +551,14 @@ class VideoQALMStudioAnswerSynthesizer:
         temperature: float = 0.0,
         timeout: float | None = None,
         request_chat_fn: Callable[..., object] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> None:
         self._base_url = base_url
         self._model = model
         self._temperature = temperature
         self._timeout = timeout
         self._request_chat_fn = request_chat_fn or request_chat_completion
+        self._should_cancel = should_cancel
 
     def aggregate(
         self,
@@ -580,6 +595,7 @@ class VideoQALMStudioAnswerSynthesizer:
                 model=self._model,
                 temperature=self._temperature,
                 timeout=self._timeout,
+                should_cancel=self._should_cancel,
             )
         except LMStudioClientError as exc:
             msg = f"Final Video QA synthesis failed: {exc}"
@@ -621,6 +637,7 @@ class VideoQALocalRunParams:
     context_window_tokens: int
     lm_base_url: str
     lm_model_id: str
+    frame_sample_fps: float = field(default_factory=_default_frame_sample_fps)
 
 
 def build_video_qa_local_executor_deps(  # noqa: PLR0913
@@ -632,6 +649,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     lm_model_id: str,
     should_cancel: Callable[[], bool] | None,
     progress: Callable[[str, float], None] | None,
+    frame_sample_fps: float | None = None,
     chunk_inferencer_override: VideoQAChunkInferencer | None = None,
     transcript_override: VideoQATranscriptProvider | None = None,
     frame_override: VideoQAFrameMaterializer | None = None,
@@ -658,10 +676,15 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     if frame_override is not None:
         frame_mat = frame_override
     else:
+        fps_val = (
+            float(frame_sample_fps)
+            if frame_sample_fps is not None
+            else float(default_video_qa_budget_policy().frame_sample_fps)
+        )
         frame_mat = VideoQAFFmpegFrameMaterializer(
             video_path=media_path,
             frames_dir=frames_dir,
-            sample_fps=default_video_qa_budget_policy().frame_sample_fps,
+            sample_fps=fps_val,
         )
     inferencer: VideoQAChunkInferencer
     if chunk_inferencer_override is not None:
@@ -671,6 +694,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
             context,
             base_url=lm_base_url,
             model=lm_model_id,
+            should_cancel=should_cancel,
         )
     aggregator: VideoQAAnswerAggregator
     if aggregator_override is not None:
@@ -679,6 +703,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
         aggregator = VideoQALMStudioAnswerSynthesizer(
             base_url=lm_base_url,
             model=lm_model_id,
+            should_cancel=should_cancel,
         )
     return VideoQAExecutorDeps(
         transcript=transcript,
@@ -846,6 +871,7 @@ def run_local_video_qa(
         ctx,
         duration_seconds=duration_s,
         context_window_tokens=params.context_window_tokens,
+        frame_sample_fps=params.frame_sample_fps,
     )
     ensure_local_video_qa_run_allowed(report, chunk_plan)
 
@@ -864,6 +890,7 @@ def run_local_video_qa(
         lm_model_id=params.lm_model_id,
         should_cancel=should_cancel,
         progress=progress,
+        frame_sample_fps=params.frame_sample_fps,
         chunk_inferencer_override=chunk_inferencer_override,
         transcript_override=transcript_override,
         frame_override=frame_override,
@@ -883,6 +910,7 @@ def run_local_video_qa(
         planned_chunks=chunk_plan,
         deps=deps,
         representative_frame_policy=default_representative_frame_policy(),
+        should_cancel=should_cancel,
     )
 
     final_manifest = outcome.manifest

@@ -3,11 +3,12 @@ from __future__ import annotations
 import contextlib
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Final
 
 from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QButtonGroup,
     QCheckBox,
     QFileDialog,
     QFormLayout,
@@ -51,6 +52,17 @@ if TYPE_CHECKING:
     )
     from core.video_qa_sources import LocalFileSource
 
+# * Preflight / run frame sampling rates (uniform grid budget and ffmpeg extraction).
+VIDEO_QA_PREFLIGHT_FPS_CHOICES: Final[tuple[float, ...]] = (
+    2.0,
+    1.0,
+    0.5,
+    0.25,
+    0.1,
+    0.05,
+)
+FPS_VALUE_MATCH_EPSILON: Final[float] = 1e-9
+
 # * Supported attachment extensions aligned with core/video_qa_context classification.
 _ATTACHMENT_NAME_FILTER = (
     "Attachments (*.txt *.md *.rst *.json *.csv *.xml *.yaml *.yml *.ini *.log *.html "
@@ -85,14 +97,16 @@ _VIDEO_QA_PANEL_STYLE = (
     "padding-top: 10px; background-color: #2b2b2f; }"
     "QGroupBox::title { subcontrol-origin: margin; left: 8px; padding: 0 4px; "
     "color: #d4d4d4; }"
-    "QTableWidget { background-color: #1e1e1e; color: #d4d4d4; gridline-color: #3f3f46; "
-    "border: 1px solid #3f3f46; }"
+    "QTableWidget { background-color: #1e1e1e; color: #d4d4d4; "
+    "gridline-color: #3f3f46; border: 1px solid #3f3f46; }"
     "QHeaderView::section { background-color: #2d2d30; color: #d4d4d4; "
     "border: 1px solid #3f3f46; padding: 4px 8px; }"
     "QLineEdit, QSpinBox, QComboBox { background-color: #1e1e1e; color: #d4d4d4; "
     "border: 1px solid #3f3f46; }"
     "QPushButton { background-color: #2d2d30; color: #d4d4d4; "
     "border: 1px solid #3f3f46; padding: 6px 10px; }"
+    "QPushButton:checked { background-color: #0e639c; color: #ffffff; "
+    "border: 1px solid #1177bb; }"
     "QPushButton:disabled { color: #7a7a7a; background-color: #252526; }"
     "QCheckBox { color: #d4d4d4; }"
     "QSplitter::handle { background-color: #3f3f46; }"
@@ -101,7 +115,7 @@ _VIDEO_QA_PANEL_STYLE = (
 
 
 class VideoQAPanel(QWidget):
-    """Video QA workspace: source, question, attachments, preflight, answer, and evidence."""
+    """Video QA workspace: source, question, attachments, and results."""
 
     video_qa_run_requested = Signal()
     video_qa_cancel_requested = Signal()
@@ -263,6 +277,8 @@ class VideoQAPanel(QWidget):
         self.budget_spin.valueChanged.connect(self._schedule_preflight_refresh)
         pre_btn_row.addWidget(self.budget_spin)
 
+        self._setup_preflight_fps_row(pre_btn_row)
+
         pre_btn_row.addStretch(1)
         pre_layout.addLayout(pre_btn_row)
 
@@ -309,6 +325,22 @@ class VideoQAPanel(QWidget):
         pre_layout.addWidget(self.preflight_edit)
         root.addWidget(pre_box)
 
+    def _setup_preflight_fps_row(self, row: QHBoxLayout) -> None:
+        """Add fps toggles; each change runs preflight immediately."""
+        row.addSpacing(12)
+        self._fps_button_group = QButtonGroup(self)
+        self._fps_button_group.setExclusive(True)
+        for idx, fps_val in enumerate(VIDEO_QA_PREFLIGHT_FPS_CHOICES):
+            btn = QPushButton(f"{fps_val:.2f}")
+            btn.setCheckable(True)
+            self._fps_button_group.addButton(btn, idx)
+            row.addWidget(btn)
+        first_fps_btn = self._fps_button_group.button(0)
+        if first_fps_btn is not None:
+            first_fps_btn.setChecked(True)
+        self._fps_button_group.idClicked.connect(self._on_preflight_fps_group_changed)
+        row.addWidget(QLabel("fps"))
+
     def _build_answer_evidence_group(self, root: QVBoxLayout) -> None:
         out_box = QGroupBox("Answer and evidence")
         out_box.setStyleSheet(_VIDEO_QA_PANEL_STYLE)
@@ -347,8 +379,9 @@ class VideoQAPanel(QWidget):
         self.btn_cancel_qa.setObjectName("video_qa_cancel")
         self.btn_cancel_qa.setEnabled(False)
         self.btn_cancel_qa.setToolTip(
-            "Request stop after the current step (LM Studio may finish the in-flight "
-            "chunk first)."
+            "Request stop: skips further chunks, aborts an in-flight LM Studio HTTP "
+            "request when the stack allows, and stops uploading more images for the "
+            "current chunk."
         )
         self.btn_cancel_qa.clicked.connect(self._emit_cancel_requested)
         run_row.addWidget(self.btn_run_qa)
@@ -446,6 +479,26 @@ class VideoQAPanel(QWidget):
         """Return the current GUI budget limit in tokens."""
         return self.budget_spin.value()
 
+    def frame_sample_fps(self) -> float:
+        """Return the selected uniform frame sampling rate for preflight and runs."""
+        bid = self._fps_button_group.checkedId()
+        if bid < 0:
+            return VIDEO_QA_PREFLIGHT_FPS_CHOICES[0]
+        return VIDEO_QA_PREFLIGHT_FPS_CHOICES[bid]
+
+    def set_frame_sample_fps(self, fps: float) -> None:
+        """Select the sampling toggle that matches ``fps``, or default to 2.0 fps."""
+        target = float(fps)
+        for idx, val in enumerate(VIDEO_QA_PREFLIGHT_FPS_CHOICES):
+            if abs(val - target) < FPS_VALUE_MATCH_EPSILON:
+                btn = self._fps_button_group.button(idx)
+                if btn is not None:
+                    btn.setChecked(True)
+                return
+        fallback = self._fps_button_group.button(0)
+        if fallback is not None:
+            fallback.setChecked(True)
+
     def set_context_window_tokens(self, tokens: int) -> None:
         """Set the current GUI budget limit."""
         self.budget_spin.setValue(tokens)
@@ -491,7 +544,9 @@ class VideoQAPanel(QWidget):
 
         budget_policy = default_video_qa_budget_policy()
         budget_policy = replace(
-            budget_policy, context_window_tokens=self.budget_spin.value()
+            budget_policy,
+            context_window_tokens=self.budget_spin.value(),
+            frame_sample_fps=self.frame_sample_fps(),
         )
 
         preflight = build_video_qa_preflight_summary(
@@ -586,6 +641,10 @@ class VideoQAPanel(QWidget):
     def _schedule_preflight_refresh(self) -> None:
         """Queue a debounced preflight refresh after interactive changes."""
         self._preflight_refresh_timer.start()
+
+    def _on_preflight_fps_group_changed(self, _button_id: int) -> None:
+        """Recompute preflight immediately when the sampling rate toggle changes."""
+        self.refresh_preflight()
 
     def _iter_attachment_requests(self) -> Iterator[VideoQAAttachmentRequest]:
         for row in range(self._attachment_table.rowCount()):

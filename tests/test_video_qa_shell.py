@@ -7,7 +7,7 @@ from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QPushButton, QSplitter, QTableWidget
 
 from gui.main_window import MainWindow
-from gui.video_qa import VideoQAPanel
+from gui.video_qa import VIDEO_QA_PREFLIGHT_FPS_CHOICES, VideoQAPanel
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -41,6 +41,7 @@ def test_video_qa_shell_restores_screen_and_source(
     window.video_qa_panel.set_source_path(media)
     window.video_qa_panel.set_question_text("What is shown?")
     window.video_qa_panel.set_context_window_tokens(123456)
+    window.video_qa_panel.set_frame_sample_fps(0.1)
     main_splitter_state = window.video_qa_panel.main_splitter_state()
     left_splitter_state = window.video_qa_panel.left_splitter_state()
     window.shell_tabs.setCurrentIndex(1)
@@ -53,6 +54,7 @@ def test_video_qa_shell_restores_screen_and_source(
     assert restored.video_qa_panel.source_path() == media.resolve()
     assert restored.video_qa_panel.question_text() == "What is shown?"
     assert restored.video_qa_panel.context_window_tokens() == 123456
+    assert restored.video_qa_panel.frame_sample_fps() == 0.1
     assert restored.video_qa_panel.main_splitter_state() == main_splitter_state
     assert restored.video_qa_panel.left_splitter_state() == left_splitter_state
 
@@ -277,6 +279,57 @@ def test_video_qa_auto_preflight_refreshes_after_debounce(
     qtbot.waitUntil(
         lambda: "120000" in panel.lbl_preflight_budget.text(),
         timeout=1000,
+    )
+
+
+def test_preflight_fps_changes_budget_estimate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    """Lower fps reduces the offline frame budget shown in the preflight summary."""
+    media = tmp_path / "sample.mp4"
+    media.write_bytes(b"abc")
+    monkeypatch.setattr("gui.video_qa.get_media_duration_seconds", lambda _p: 100.0)
+
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    panel.set_source_path(media)
+    panel.set_question_text("FPS test")
+    panel.refresh_preflight()
+    high = panel.lbl_preflight_budget.text()
+    panel.set_frame_sample_fps(0.05)
+    panel.refresh_preflight()
+    low = panel.lbl_preflight_budget.text()
+    assert high != low
+    assert "frames" in high
+    assert "frames" in low
+
+
+def test_preflight_fps_toggle_refreshes_without_debounce_wait(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    """FPS toggle triggers an immediate preflight refresh (not only the debounced timer)."""
+    media = tmp_path / "sample.mp4"
+    media.write_bytes(b"abc")
+    monkeypatch.setattr("gui.video_qa.get_media_duration_seconds", lambda _p: 30.0)
+
+    panel = VideoQAPanel(preflight_debounce_ms=8000)
+    qtbot.addWidget(panel)
+    panel.set_source_path(media)
+    panel.set_question_text("Immediate fps refresh")
+    qtbot.wait(400)
+    assert panel.preflight_edit.toPlainText() == ""
+
+    idx = VIDEO_QA_PREFLIGHT_FPS_CHOICES.index(1.0)
+    btn = panel._fps_button_group.button(idx)  # noqa: SLF001
+    assert btn is not None
+    qtbot.mouseClick(btn, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(
+        lambda: "Immediate fps refresh" in panel.preflight_edit.toPlainText(),
+        timeout=3000,
     )
 
 

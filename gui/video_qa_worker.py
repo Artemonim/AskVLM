@@ -34,6 +34,7 @@ class VideoQALocalRunWorker(QObject):
         context: VideoQAContextBundle,
         output_dir: Path,
         context_window_tokens: int,
+        frame_sample_fps: float,
         whisper: WhisperXWrapper,
         lm_base_url: str,
         lm_model_id: str,
@@ -45,6 +46,7 @@ class VideoQALocalRunWorker(QObject):
             context_window_tokens=context_window_tokens,
             lm_base_url=lm_base_url,
             lm_model_id=lm_model_id,
+            frame_sample_fps=frame_sample_fps,
         )
         self._whisper = whisper
         self._cancel = False

@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final, Literal, Protocol, runtime_checkable
 
+from .pipelines import CancelledError
 from .video_qa_orchestration import (
     default_representative_frame_policy,
     merge_planned_chunks_into_manifest,
@@ -184,6 +185,13 @@ def _map_chunk(
     return replace(manifest, chunks=tuple(new_chunks))
 
 
+def _raise_if_user_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    """Raise :class:`CancelledError` when the injected cancel predicate is true."""
+    if should_cancel and should_cancel():
+        msg = "Canceled"
+        raise CancelledError(msg)
+
+
 def run_video_qa_executor(
     *,
     context: VideoQAContextBundle,
@@ -191,6 +199,7 @@ def run_video_qa_executor(
     planned_chunks: Sequence[VideoQAPlannedChunk],
     deps: VideoQAExecutorDeps,
     representative_frame_policy: VideoQARepresentativeFramePolicy | None = None,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> VideoQAExecutorRunOutcome:
     """Run the Video QA pipeline with injected backends and manifest resume semantics.
 
@@ -208,6 +217,8 @@ def run_video_qa_executor(
         planned_chunks: Planned chunk rows merged into ``manifest`` before execution.
         deps: Injectable providers for transcript, frames, inference, and aggregation.
         representative_frame_policy: Policy for timestamps; defaults to chunk midpoints.
+        should_cancel: Optional polling hook that aborts before chunk work, after
+            frame extraction, and before the final aggregate LM call.
 
     Returns:
         Transcript artifacts, final answer bundle, updated manifest, per-chunk
@@ -236,6 +247,8 @@ def run_video_qa_executor(
     planned_ids = [chunk.chunk_id for chunk in planned_chunks]
 
     for chunk_id in planned_ids:
+        _raise_if_user_cancelled(should_cancel)
+
         record = next((c for c in working.chunks if c.chunk_id == chunk_id), None)
         if record is None:
             continue
@@ -262,6 +275,8 @@ def run_video_qa_executor(
             manifest=working,
             transcript=transcript,
         )
+
+        _raise_if_user_cancelled(should_cancel)
 
         def _patch_running(
             r: VideoQAChunkRecord,
@@ -334,6 +349,8 @@ def run_video_qa_executor(
                     inference_attempted=True,
                 )
             )
+
+    _raise_if_user_cancelled(should_cancel)
 
     stages.append("answer_aggregate")
     answer_bundle = deps.answer_aggregator.aggregate(

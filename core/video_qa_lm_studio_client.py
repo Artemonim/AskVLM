@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import base64
+import contextlib
+import http.client
 import json
 import logging
 import mimetypes
+import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from .pipelines import CancelledError
+
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -58,10 +65,16 @@ def _build_payload(
     json_schema: dict[str, Any] | None,
     model: str = "local-model",
     temperature: float = 0.0,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Build the request payload for the chat completion endpoint."""
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
-    content.extend(_read_image_part(image_path) for image_path in image_paths)
+    for image_path in image_paths:
+        if should_cancel and should_cancel():
+            msg = "Canceled"
+            raise CancelledError(msg)
+        content.append(_read_image_part(image_path))
 
     payload: dict[str, Any] = {
         "model": model,
@@ -152,7 +165,10 @@ def _http_post_json(
     *,
     timeout: float | None,
 ) -> dict[str, Any]:
-    """POST ``req`` and decode JSON; ``timeout`` None omits the socket cap (blocking read)."""
+    """POST ``req`` and decode JSON.
+
+    When ``timeout`` is ``None``, the socket read has no fixed deadline.
+    """
     try:
         if timeout is None:
             with urllib.request.urlopen(req) as response:  # noqa: S310
@@ -168,7 +184,91 @@ def _http_post_json(
         raise LMStudioClientError(msg) from exc
 
 
-def request_chat_completion(
+def _http_post_json_cancellable(  # noqa: C901, PLR0915
+    url: str,
+    body: bytes,
+    *,
+    timeout: float | None,
+    should_cancel: Callable[[], bool],
+) -> dict[str, Any]:
+    """POST JSON on a worker thread; close the socket when cancel is requested."""
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("http", "https"):
+        msg = f"Unsupported URL scheme for LM Studio: {parsed.scheme!r}"
+        raise LMStudioClientError(msg)
+    host = parsed.hostname
+    if not host:
+        msg = "LM Studio URL is missing a host."
+        raise LMStudioClientError(msg)
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme == "https" else 80
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    headers = {"Content-Type": "application/json"}
+
+    conn_holder: list[
+        http.client.HTTPConnection | http.client.HTTPSConnection | None
+    ] = [None]
+    worker_error: list[BaseException] = []
+    response_status: list[int] = []
+    response_body: list[bytes] = []
+
+    def worker() -> None:
+        try:
+            conn: http.client.HTTPConnection | http.client.HTTPSConnection
+            if parsed.scheme == "https":
+                conn = http.client.HTTPSConnection(host, port, timeout=timeout)
+            else:
+                conn = http.client.HTTPConnection(host, port, timeout=timeout)
+            conn_holder[0] = conn
+            conn.request("POST", path, body, headers)
+            resp = conn.getresponse()
+            status = int(resp.status)
+            data = resp.read()
+            response_status.append(status)
+            response_body.append(data)
+        except Exception as exc:  # noqa: BLE001
+            # * Capture any transport failure so the parent can join cleanly.
+            worker_error.append(exc)
+        finally:
+            c = conn_holder[0]
+            if c is not None:
+                with contextlib.suppress(Exception):
+                    c.close()
+
+    thread = threading.Thread(target=worker, name="askvlm-lmstudio-http", daemon=True)
+    thread.start()
+    poll_s = 0.05
+    while thread.is_alive():
+        if should_cancel():
+            c = conn_holder[0]
+            if c is not None:
+                with contextlib.suppress(Exception):
+                    c.close()
+            thread.join(timeout=15.0)
+            msg = "Canceled"
+            raise CancelledError(msg)
+        thread.join(timeout=poll_s)
+
+    if worker_error:
+        exc = worker_error[0]
+        msg = f"LM Studio HTTP worker failed: {exc}"
+        raise LMStudioClientError(msg) from exc
+    if not response_status or not response_body:
+        msg = "Empty HTTP response from LM Studio."
+        raise LMStudioClientError(msg)
+    status = response_status[0]
+    raw = response_body[0]
+    if status >= HTTPStatus.BAD_REQUEST:
+        text = raw.decode("utf-8", errors="replace")
+        msg = f"HTTP {status}: {text}"
+        raise LMStudioClientError(msg)
+    return _decode_json_body(raw)
+
+
+def request_chat_completion(  # noqa: C901
     base_url: str,
     prompt: str,
     image_paths: Sequence[Path | str] | None = None,
@@ -176,6 +276,8 @@ def request_chat_completion(
     model: str = "local-model",
     temperature: float = 0.0,
     timeout: float | None = None,
+    *,
+    should_cancel: Callable[[], bool] | None = None,
 ) -> LMStudioResponse:
     """Send a multimodal chat completion request to LM Studio.
 
@@ -184,15 +286,36 @@ def request_chat_completion(
     response. This keeps the caller usable even when the local build rejects
     structured output. When ``timeout`` is ``None``, the HTTP read has no fixed
     deadline so long local inference is not cut off mid-chunk.
+
+    When ``should_cancel`` is set, the client polls it while the HTTP call runs and
+    closes the socket to stop waiting on LM Studio prefill/inference.
     """
     normalized_image_paths = tuple(Path(path) for path in (image_paths or ()))
     url = f"{base_url.rstrip('/')}/chat/completions"
 
     def do_request(schema: dict[str, Any] | None) -> dict[str, Any]:
+        if should_cancel and should_cancel():
+            msg = "Canceled"
+            raise CancelledError(msg)
         payload = _build_payload(
-            prompt, normalized_image_paths, schema, model, temperature
+            prompt,
+            normalized_image_paths,
+            schema,
+            model,
+            temperature,
+            should_cancel=should_cancel,
         )
         data = json.dumps(payload).encode("utf-8")
+        if should_cancel and should_cancel():
+            msg = "Canceled"
+            raise CancelledError(msg)
+        if should_cancel is not None:
+            return _http_post_json_cancellable(
+                url,
+                data,
+                timeout=timeout,
+                should_cancel=should_cancel,
+            )
         req = urllib.request.Request(  # noqa: S310
             url,
             data=data,

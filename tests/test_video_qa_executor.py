@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
+import pytest
+
+from core.pipelines import CancelledError
 from core.video_qa_answer_bundle import (
     ANSWER_BUNDLE_SCHEMA_VERSION,
     VideoQAAnswerBundle,
@@ -489,3 +492,35 @@ def test_manifest_schema_preserved(tmp_path: Path) -> None:
     )
     assert out.manifest.schema_version == SCHEMA_VERSION
     assert out.manifest.run_id == "fixed-run"
+
+
+def test_executor_should_cancel_aborts_before_chunk_work(tmp_path: Path) -> None:
+    """``should_cancel`` stops the executor before starting pending chunk work."""
+    bundle = _minimal_bundle(tmp_path)
+    plan = (
+        VideoQAPlannedChunk(
+            chunk_id="c0", t_start=0.0, t_end=1.0, planning_mode="uniform_grid"
+        ),
+    )
+    manifest = merge_planned_chunks_into_manifest(
+        _manifest_with_chunks(bundle, ()),
+        plan,
+    )
+    frames = _RecordingFrames()
+    inf = _GateInferencer(fail_ids=frozenset())
+    deps = VideoQAExecutorDeps(
+        transcript=_RecordingTranscript("t"),
+        frame_materializer=frames,
+        chunk_inferencer=inf,
+        answer_aggregator=_Aggregator("run-cancel"),
+    )
+    with pytest.raises(CancelledError):
+        run_video_qa_executor(
+            context=bundle,
+            manifest=manifest,
+            planned_chunks=plan,
+            deps=deps,
+            should_cancel=lambda: True,
+        )
+    assert frames.calls == []
+    assert inf.calls == []

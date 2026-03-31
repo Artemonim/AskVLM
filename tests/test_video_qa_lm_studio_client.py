@@ -7,6 +7,9 @@ import urllib.error
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from core.pipelines import CancelledError
 from core.video_qa_lm_studio_client import (
     _build_payload,
     request_chat_completion,
@@ -157,3 +160,27 @@ def test_request_chat_completion_reasoning_content_json(
     assert res.content == '{"answer": "reasoning_yes"}'
     assert res.parsed_json == {"answer": "reasoning_yes"}
     assert res.used_fallback is False
+
+
+def test_request_chat_completion_cancel_before_http() -> None:
+    """``should_cancel`` can abort before any HTTP work starts."""
+    with pytest.raises(CancelledError):
+        request_chat_completion(
+            "http://127.0.0.1:9/v1", "x", should_cancel=lambda: True
+        )
+
+
+def test_build_payload_cancel_between_images(tmp_path: Path) -> None:
+    """``should_cancel`` is consulted before each embedded image is read."""
+    p1 = tmp_path / "a.png"
+    p2 = tmp_path / "b.png"
+    p1.write_bytes(b"x")
+    p2.write_bytes(b"y")
+    calls = {"n": 0}
+
+    def sc() -> bool:
+        calls["n"] += 1
+        return calls["n"] >= 2
+
+    with pytest.raises(CancelledError):
+        _build_payload("t", [p1, p2], None, should_cancel=sc)
