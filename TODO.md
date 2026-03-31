@@ -30,13 +30,13 @@
 
 ## GUI tracking
 
-**Активный workstream:** базовый `Video QA` surface в GUI (источник, вопрос, вложения, preflight, read-only answer/evidence) развивается отдельно от стабильного `Text + Subtitles`. Полноценный запуск LLM из GUI (`Run Video QA`, worker в `MainWindow`, glue `core/video_qa_local_run.py`) уже есть; retry по чанкам и расширенный overflow-UX — следующие этапы (см. Wave 4+). Детализация сценариев по-прежнему в `## 2. MVP UX` и `## 10. Tests and verification`.
+**Активный workstream:** базовый `Video QA` surface в GUI (источник, вопрос, вложения, preflight, read-only ответ в Markdown и progress log на время прогона) развивается отдельно от стабильного `Text + Subtitles`. Полноценный запуск LLM из GUI (`Run Video QA`, worker в `MainWindow`, glue `core/video_qa_local_run.py`) уже есть; retry по чанкам из GUI и расширенный overflow-UX — следующие этапы (см. Wave 4+). Детализация сценариев по-прежнему в `## 2. MVP UX` и `## 10. Tests and verification`.
 
-- [x] Ответ и evidence surface для `Video QA` (read-only зоны; методы для будущей подводки backend; контракт §5/§8 — по мере появления реального run).
+- [x] Ответ (Markdown) и progress log для `Video QA` (read-only; evidence после успешного run дописывается в log; контракт §5/§8).
 - [x] Split layout: `Video QA` разделён на левую панель подготовки и правую для процесса/результатов с редактируемым бюджетом токенов.
 - [x] Preflight summary перед запуском (структурированные поля и формы вместо текстового blob'а; стык с §6).
 - [x] Attachments controls: список вложений расширяется по вертикали (resizable), include/exclude; переполнение budget отображается в тексте preflight.
-- [x] Retry controls: повтор по чанку / resume без полной переобработки видео — **UX scaffold** (секция `Retry controls`, disabled кнопки + пояснение); реальная связка с manifest/orchestration/backend run из GUI — следующий этап (§5).
+- [ ] Stop-resume из GUI: backend и manifest уже поддерживают idempotent resume по `chunk_id` (§5), но отдельных кнопок в UI нет (ранний UX scaffold снят по тестам); добавить явные controls, когда будет решена связка с выбором чанка и output dir.
 - [ ] Ручные regression checks по `Text + Subtitles`: preview, export, burn-in и переключение экранов не ломают subtitle-first path (дублирует дух §10, но как явный GUI-focused прогон).
 
 ## 1. Product guardrails
@@ -53,11 +53,11 @@
 - [x] Сделать отдельный экран `Video QA` со своим layout и своей зоной результата.
 - [x] При старте приложения спрашивать, какой экран открыть, либо восстанавливать экран прошлой сессии.
 - [x] Сохранять последний выбранный экран в settings и добавлять явный переключатель экрана внутри приложения.
-- [x] Для `Video QA` добавить поле задания, отдельную область ответа и список evidence-блоков (MVP: read-only зоны + API для будущей подводки).
+- [x] Для `Video QA` добавить поле задания, отдельную область ответа (Markdown) и зону прогресса/лога пайплайна; evidence после run выводится в log (read-only).
 - [x] Добавить секцию вложений к заданию: `txt`, `md`, кодовые файлы, `jpg`/`jpeg`, `png`, `webp` (через общий фильтр и нормализацию в `core/video_qa_context`).
 - [x] Показать preflight перед запуском: источник, число чанков, примерный бюджет контекста, предупреждения (кнопка Refresh preflight).
 - [x] Не смешивать subtitle editor и chat-like output; у каждого экрана должна быть своя зона результата.
-- [x] Подготовить UX для повторного запуска по ошибочному чанку без повторной обработки всего видео (scaffold: disabled `Retry selected chunk` / `Resume last run`; backend — позже).
+- [ ] Автоматический повторный запуск по ошибочному чанку без повторной обработки всего видео (backend resume есть; GUI-кнопки и сценарий — позже, см. GUI tracking).
 
 ## 3. Input providers and source acquisition
 
@@ -118,7 +118,7 @@
 - [x] Для `Video QA` добавить machine-readable export ответа и evidence-списка.
 - [x] Сохранять итоговый answer bundle рядом с manifest, чтобы можно было разбирать run post factum.
 - [x] Для ответа по видео дать формат с цитатами, таймкодами и ссылками на кадры.
-- [ ] **Журнал / полный артефакт прогона:** сейчас `Video QA` пишет на диск `{run_id}.manifest.json` и answer bundle; транскрипт ASR целиком в manifest не хранится, сырой ответ LM почти не логируется (кроме best-effort `logging` при сбое парсинга). Нет единого файла «run log» (стадии, тайминги, ошибки, опционально redacted payloads). Решить: что сохранять рядом с output dir (transcript.json / `.log`), уровень детализации и опциональный verbose-режим.
+- [ ] **Персистентный журнал / полный артефакт прогона:** на диск пишутся `{run_id}.manifest.json` и answer bundle; **во время прогона** GUI показывает in-session progress log (стадии пайплайна, `pipeline_log` в `run_local_video_qa`). Транскрипт ASR целиком в manifest не хранится, сырой ответ LM почти не логируется (кроме best-effort `logging` при сбое парсинга). Нет единого **файла** «run log» (стадии, тайминги, ошибки, опционально redacted payloads). Решить: что сохранять рядом с output dir (transcript.json / `.log`), уровень детализации и опциональный verbose-режим.
 
 ## 9. Naming, legal and release prep
 
@@ -147,3 +147,10 @@
 - Не тянуть тяжёлые research-репозитории long-video / Video QA в ближайший этап.
 - Не делать `LangChain` обязательным ядром orchestrator без отдельной необходимости.
 - Не обещать точный offline token count для изображений, пока нет model-specific расчёта.
+
+## 12. Расширение (post-MVP)
+
+- Блок задач по **загрузке видео из сети** (не только YouTube): унифицировать URL providers, политики temp/cleanup, UX импорта и ToS/лицензии в одном workstream, чтобы не размазывать сетевой ввод по разным §.
+- **Чат с финальным ответом Video QA**, а не только read-only просмотр: возможность уточнять ответ в диалоге (контекст: evidence, manifest, вопрос), с отдельным контрактом от subtitle-first. Опциональное подключение Filesystem MCP.
+- **Другие локальные LLM-провайдеры** помимо LM Studio: абстракция над OpenAI-compatible HTTP (base URL, auth, capabilities), плюс опциональные адаптеры (ollama, llama.cpp server, …) без смешения с subtitle pipeline.
+- **LLM-via-API** (облачные ключи, rate limits, redaction): отдельный provider слой для Video QA / Text с явной политикой данных и opt-in.
