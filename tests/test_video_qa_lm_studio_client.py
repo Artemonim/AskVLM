@@ -64,6 +64,9 @@ def test_request_chat_completion_success(mock_urlopen: MagicMock) -> None:
     assert res.finish_reason == "stop"
     assert res.parsed_json is None
     assert res.used_fallback is False
+    assert mock_urlopen.call_count == 1
+    _args, kwargs = mock_urlopen.call_args
+    assert "timeout" not in kwargs
 
 
 @patch("core.video_qa_lm_studio_client.urllib.request.urlopen")

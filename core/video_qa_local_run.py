@@ -536,7 +536,7 @@ class VideoQALMStudioAnswerSynthesizer:
         base_url: str,
         model: str,
         temperature: float = 0.0,
-        timeout: float = 120.0,
+        timeout: float | None = None,
         request_chat_fn: Callable[..., object] | None = None,
     ) -> None:
         self._base_url = base_url

@@ -134,7 +134,7 @@ class VideoQALMStudioChunkInferencer:
         base_url: str,
         model: str = "local-model",
         temperature: float = 0.0,
-        timeout: float = 120.0,
+        timeout: float | None = None,
         request_chat_fn: Callable[..., LMStudioResponse] | None = None,
     ) -> None:
         self._context = context

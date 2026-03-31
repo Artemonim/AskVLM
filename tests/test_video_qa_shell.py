@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
 
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QPushButton, QSplitter, QTableWidget
@@ -136,8 +137,23 @@ def test_video_qa_run_button_enabled_and_emits_request(qtbot: QtBot) -> None:
     assert run_btn is not None
     assert run_btn.isEnabled()
     assert "Run Video QA" in run_btn.text()
+    cancel_btn = panel.findChild(QPushButton, "video_qa_cancel")
+    assert cancel_btn is not None
+    assert cancel_btn.text() == "Cancel"
+    assert not cancel_btn.isEnabled()
     with qtbot.waitSignal(panel.video_qa_run_requested, timeout=2000):
         qtbot.mouseClick(run_btn, Qt.MouseButton.LeftButton)
+
+
+def test_video_qa_cancel_button_emits_when_enabled(qtbot: QtBot) -> None:
+    """Cancel notifies the shell via ``video_qa_cancel_requested`` when enabled."""
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    cancel_btn = panel.findChild(QPushButton, "video_qa_cancel")
+    assert cancel_btn is not None
+    cancel_btn.setEnabled(True)
+    with qtbot.waitSignal(panel.video_qa_cancel_requested, timeout=2000):
+        qtbot.mouseClick(cancel_btn, Qt.MouseButton.LeftButton)
 
 
 def test_main_window_dispatches_video_qa_launch_request(
@@ -181,6 +197,38 @@ def test_main_window_dispatches_video_qa_launch_request(
     assert getattr(ctx, "question", "") == "What is shown?"
     assert getattr(getattr(ctx, "source", None), "path", None) == media.resolve()
     assert str(out_dir) == str((tmp_path / "out").resolve())
+
+
+def test_main_window_dispatches_video_qa_cancel_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    """The shell forwards the Video QA cancel click to the cooperative cancel path."""
+    settings_path = tmp_path / "settings.ini"
+
+    class MockSettings(QSettings):
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            super().__init__(str(settings_path), QSettings.Format.IniFormat)
+
+    monkeypatch.setattr("gui.main_window.QSettings", MockSettings)
+
+    window = MainWindow()
+    qtbot.addWidget(window)
+    cancel_btn = window.video_qa_panel.findChild(QPushButton, "video_qa_cancel")
+    assert cancel_btn is not None
+    cancel_btn.setEnabled(True)
+
+    worker = MagicMock()
+    window._video_qa_worker = worker  # noqa: SLF001
+    fake_thread = MagicMock()
+    fake_thread.isRunning.return_value = True
+    window._video_qa_thread = fake_thread  # noqa: SLF001
+
+    qtbot.mouseClick(cancel_btn, Qt.MouseButton.LeftButton)
+    qtbot.waitUntil(lambda: worker.request_cancel.called, timeout=2000)
+
+    assert worker.request_cancel.call_count == 1
 
 
 def test_video_qa_retry_controls_removed(qtbot: QtBot) -> None:

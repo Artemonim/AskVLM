@@ -566,6 +566,9 @@ class MainWindow(QMainWindow):
         self.video_qa_panel.video_qa_run_requested.connect(
             self._log_wrap(self._on_video_qa_run_requested, "Video QA run")
         )
+        self.video_qa_panel.video_qa_cancel_requested.connect(
+            self._log_wrap(self._on_video_qa_cancel_requested, "Video QA cancel")
+        )
 
     def choose_file(self) -> None:
         """Choose a single media file for processing."""
@@ -832,6 +835,7 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.btn_start.setEnabled(True)
         self.video_qa_panel.btn_run_qa.setEnabled(True)
+        self.video_qa_panel.btn_cancel_qa.setEnabled(False)
         self.btn_cancel.setEnabled(False)
 
     def _on_video_qa_run_requested(self) -> None:
@@ -874,6 +878,17 @@ class MainWindow(QMainWindow):
             return
         self._start_video_qa_worker(ctx, out_dir)
 
+    def _on_video_qa_cancel_requested(self) -> None:
+        """Cooperatively cancel the Video QA worker if it is running."""
+        vq = self._video_qa_worker
+        if vq is None:
+            return
+        if self._video_qa_thread is None or not self._video_qa_thread.isRunning():
+            return
+        with contextlib.suppress(RuntimeError):
+            vq.request_cancel()
+        self.status.showMessage("Video QA cancel requested…")
+
     def _start_video_qa_worker(
         self,
         ctx: VideoQAContextBundle,
@@ -905,7 +920,8 @@ class MainWindow(QMainWindow):
         self._video_qa_thread.finished.connect(self._video_qa_thread.deleteLater)
         self.btn_start.setEnabled(False)
         self.video_qa_panel.btn_run_qa.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
+        self.video_qa_panel.btn_cancel_qa.setEnabled(True)
         self.progress.setValue(0)
         self.status.showMessage("Video QA…")
         self._video_qa_thread.start()

@@ -147,6 +147,27 @@ def _extract_message_fields(raw_res: dict[str, Any]) -> tuple[str, str, str]:
     return content, reasoning_content, finish_reason
 
 
+def _http_post_json(
+    req: urllib.request.Request,
+    *,
+    timeout: float | None,
+) -> dict[str, Any]:
+    """POST ``req`` and decode JSON; ``timeout`` None omits the socket cap (blocking read)."""
+    try:
+        if timeout is None:
+            with urllib.request.urlopen(req) as response:  # noqa: S310
+                return _decode_json_body(response.read())
+        with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
+            return _decode_json_body(response.read())
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        msg = f"HTTP {exc.code}: {error_body}"
+        raise LMStudioClientError(msg) from exc
+    except urllib.error.URLError as exc:
+        msg = f"URL Error: {exc.reason}"
+        raise LMStudioClientError(msg) from exc
+
+
 def request_chat_completion(
     base_url: str,
     prompt: str,
@@ -154,14 +175,15 @@ def request_chat_completion(
     json_schema: dict[str, Any] | None = None,
     model: str = "local-model",
     temperature: float = 0.0,
-    timeout: float = 120.0,
+    timeout: float | None = None,
 ) -> LMStudioResponse:
     """Send a multimodal chat completion request to LM Studio.
 
     If `json_schema` is provided and the structured output path fails, the client
     retries once without the schema and attempts to parse JSON from the plain-text
     response. This keeps the caller usable even when the local build rejects
-    structured output.
+    structured output. When ``timeout`` is ``None``, the HTTP read has no fixed
+    deadline so long local inference is not cut off mid-chunk.
     """
     normalized_image_paths = tuple(Path(path) for path in (image_paths or ()))
     url = f"{base_url.rstrip('/')}/chat/completions"
@@ -177,16 +199,7 @@ def request_chat_completion(
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310
-                return _decode_json_body(response.read())
-        except urllib.error.HTTPError as exc:
-            error_body = exc.read().decode("utf-8", errors="replace")
-            msg = f"HTTP {exc.code}: {error_body}"
-            raise LMStudioClientError(msg) from exc
-        except urllib.error.URLError as exc:
-            msg = f"URL Error: {exc.reason}"
-            raise LMStudioClientError(msg) from exc
+        return _http_post_json(req, timeout=timeout)
 
     used_fallback = False
 

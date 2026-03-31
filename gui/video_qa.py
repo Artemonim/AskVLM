@@ -104,6 +104,7 @@ class VideoQAPanel(QWidget):
     """Video QA workspace: source, question, attachments, preflight, answer, and evidence."""
 
     video_qa_run_requested = Signal()
+    video_qa_cancel_requested = Signal()
 
     def __init__(
         self,
@@ -333,6 +334,7 @@ class VideoQAPanel(QWidget):
         root.addWidget(out_box)
 
     def _build_run_placeholder(self, root: QVBoxLayout) -> None:
+        run_row = QHBoxLayout()
         self.btn_run_qa = QPushButton("Run Video QA")
         self.btn_run_qa.setObjectName("video_qa_run")
         self.btn_run_qa.setEnabled(True)
@@ -341,11 +343,26 @@ class VideoQAPanel(QWidget):
             "one final answer (uses the main output directory)."
         )
         self.btn_run_qa.clicked.connect(self._emit_run_requested)
-        root.addWidget(self.btn_run_qa)
+        self.btn_cancel_qa = QPushButton("Cancel")
+        self.btn_cancel_qa.setObjectName("video_qa_cancel")
+        self.btn_cancel_qa.setEnabled(False)
+        self.btn_cancel_qa.setToolTip(
+            "Request stop after the current step (LM Studio may finish the in-flight "
+            "chunk first)."
+        )
+        self.btn_cancel_qa.clicked.connect(self._emit_cancel_requested)
+        run_row.addWidget(self.btn_run_qa)
+        run_row.addWidget(self.btn_cancel_qa)
+        run_row.addStretch(1)
+        root.addLayout(run_row)
 
     def _emit_run_requested(self) -> None:
         """Notify the main window that the user wants to start a Video QA run."""
         self.video_qa_run_requested.emit()
+
+    def _emit_cancel_requested(self) -> None:
+        """Notify the main window that the user wants to cancel the Video QA worker."""
+        self.video_qa_cancel_requested.emit()
 
     def browse_for_source(self) -> None:
         """Open a file dialog and attach the selected local source."""
