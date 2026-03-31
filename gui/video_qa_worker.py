@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from core.video_qa_context import VideoQAContextBundle
+    from core.video_qa_local_run import (
+        VideoQALMHttpTarget,
+    )
     from core.whisperx_wrapper import WhisperXWrapper
 
 
@@ -37,19 +40,17 @@ class VideoQALocalRunWorker(QObject):
         context_window_tokens: int,
         frame_sample_fps: float,
         whisper: WhisperXWrapper,
-        lm_base_url: str,
-        lm_model_id: str,
-        lm_authorization_bearer: str | None = None,
+        chunk_lm: VideoQALMHttpTarget,
+        final_lm: VideoQALMHttpTarget,
     ) -> None:
         super().__init__()
         self._params = VideoQALocalRunParams(
             context=context,
             output_dir=output_dir,
             context_window_tokens=context_window_tokens,
-            lm_base_url=lm_base_url,
-            lm_model_id=lm_model_id,
+            chunk_lm=chunk_lm,
+            final_lm=final_lm,
             frame_sample_fps=frame_sample_fps,
-            lm_authorization_bearer=lm_authorization_bearer,
         )
         self._whisper = whisper
         self._cancel = False

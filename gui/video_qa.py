@@ -9,7 +9,7 @@ from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
-from PySide6.QtCore import QByteArray, Qt, QTimer, Signal
+from PySide6.QtCore import QByteArray, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QFontMetrics
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -28,9 +28,11 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSpinBox,
     QSplitter,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +46,7 @@ from core.video_qa_local_run import (
     DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
     DEFAULT_OPENROUTER_OPENAI_BASE_URL,
     OPENROUTER_API_KEY_ENV,
+    VideoQALMHttpTarget,
 )
 from core.video_qa_orchestration import (
     build_video_qa_preflight_report,
@@ -58,7 +61,7 @@ from core.video_qa_sources import LocalFileProvider
 from utils.askvlm_defaults import get_default_video_qa_canonical_model_id
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
     from core.video_qa_context import VideoQAContextBundle
     from core.video_qa_policy import (
@@ -106,12 +109,11 @@ def _format_preflight_info_row_html(
 
 
 @dataclass(frozen=True, slots=True)
-class VideoQALMRuntimeSettings:
-    """OpenAI-compatible HTTP target for one Video QA worker run."""
+class VideoQALMRuntimePair:
+    """Per-chunk and final-synthesis HTTP targets for one Video QA run."""
 
-    lm_base_url: str
-    lm_model_id: str
-    lm_authorization_bearer: str | None = None
+    chunk: VideoQALMHttpTarget
+    final_answer: VideoQALMHttpTarget
 
 
 # * Supported attachment extensions aligned with core/video_qa_context classification.
@@ -161,6 +163,9 @@ _VIDEO_QA_PANEL_STYLE = (
     "QPushButton:checked { background-color: #0e639c; color: #ffffff; "
     "border: 1px solid #1177bb; }"
     "QPushButton:disabled { color: #7a7a7a; background-color: #252526; }"
+    "QToolButton#video_qa_lm_refresh { background-color: #2d2d30; color: #d4d4d4; "
+    "border: 1px solid #3f3f46; padding: 0px; margin: 0px; }"
+    "QToolButton#video_qa_lm_refresh:hover { background-color: #3e3e42; }"
     "QCheckBox { color: #d4d4d4; }"
     "QSplitter::handle { background-color: #3f3f46; }"
     "QSlider::groove:horizontal { background: #3f3f46; height: 4px; "
@@ -355,11 +360,35 @@ class VideoQAPanel(QWidget):
         self._build_preflight_summary_section(pre_layout)
         root.addWidget(pre_box)
 
+    def _make_lm_model_row_widgets(self) -> tuple[QComboBox, QComboBox, QLineEdit]:
+        """Build one Local/Cloud row: type combo, LM model combo, cloud model field."""
+        type_combo = QComboBox()
+        type_combo.addItems(["Local (LM Studio)", "Cloud"])
+        local_combo = QComboBox()
+        local_combo.setEditable(False)
+        cloud_edit = QLineEdit()
+        cloud_edit.setPlaceholderText("Enter cloud model name")
+        cloud_edit.setVisible(False)
+        return type_combo, local_combo, cloud_edit
+
     def _build_preflight_toolbar(self, pre_layout: QVBoxLayout) -> None:
         pre_btn_row = QHBoxLayout()
         self.btn_refresh_preflight = QPushButton("Refresh preflight")
         self.btn_refresh_preflight.clicked.connect(self.refresh_preflight)
         pre_btn_row.addWidget(self.btn_refresh_preflight)
+        self.btn_refresh_lm_models = QToolButton()
+        self.btn_refresh_lm_models.setObjectName("video_qa_lm_refresh")
+        self.btn_refresh_lm_models.setToolTip(
+            "Refresh LM Studio model lists (chunk + final rows)"
+        )
+        self.btn_refresh_lm_models.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_BrowserReload)
+        )
+        self.btn_refresh_lm_models.setIconSize(QSize(16, 16))
+        self.btn_refresh_lm_models.setFixedSize(26, 26)
+        self.btn_refresh_lm_models.setAutoRaise(True)
+        self.btn_refresh_lm_models.clicked.connect(self._refresh_local_models)
+        pre_btn_row.addWidget(self.btn_refresh_lm_models)
         pre_btn_row.addSpacing(16)
         pre_btn_row.addWidget(QLabel("Context window tokens:"))
         self.budget_spin = QSpinBox()
@@ -374,7 +403,7 @@ class VideoQAPanel(QWidget):
 
     def _build_preflight_summary_section(self, pre_layout: QVBoxLayout) -> None:
         self.preflight_summary_form = QFormLayout()
-        self._setup_preflight_model_row()
+        self._setup_preflight_model_rows()
         self._setup_preflight_summary_label_rows()
         summary_widget = QWidget()
         summary_widget.setLayout(self.preflight_summary_form)
@@ -389,47 +418,67 @@ class VideoQAPanel(QWidget):
         self.preflight_edit.setStyleSheet(_READ_ONLY_STYLE)
         pre_layout.addWidget(self.preflight_edit)
 
-    def _setup_preflight_model_row(self) -> None:
-        self.model_type_combo = QComboBox()
-        self.model_type_combo.addItems(["Local (LM Studio)", "Cloud"])
-        self.model_combo = QComboBox()
-        self.model_combo.setEditable(False)
-        self.model_cloud_edit = QLineEdit()
-        self.model_cloud_edit.setPlaceholderText("Enter cloud model name")
-        self.model_cloud_edit.setVisible(False)
-        self.btn_refresh_models = QPushButton("🔄")
-        self.btn_refresh_models.setToolTip("Refresh models from LM Studio")
-        self.btn_refresh_models.clicked.connect(self._refresh_local_models)
-        self.model_type_combo.currentIndexChanged.connect(self._on_model_scope_changed)
-        model_row = QHBoxLayout()
-        model_row.addWidget(self.model_type_combo)
-        model_row.addWidget(self.model_combo, 1)
-        model_row.addWidget(self.btn_refresh_models)
-        model_row.addWidget(self.model_cloud_edit, 1)
-        self.preflight_summary_form.addRow(QLabel("Model:"), model_row)
+    def _setup_preflight_model_rows(self) -> None:
+        """Two identical model rows: per-chunk summarizer vs final user-facing answer."""
+        (
+            self.chunk_model_type_combo,
+            self.chunk_model_combo,
+            self.chunk_model_cloud_edit,
+        ) = self._make_lm_model_row_widgets()
+        self.chunk_model_type_combo.currentIndexChanged.connect(
+            self._on_chunk_model_scope_changed
+        )
+        chunk_row = QHBoxLayout()
+        chunk_row.addWidget(self.chunk_model_type_combo)
+        chunk_row.addWidget(self.chunk_model_combo, 1)
+        chunk_row.addWidget(self.chunk_model_cloud_edit, 1)
+        lbl_chunk = QLabel("Chunk summarizer:")
+        lbl_chunk.setToolTip(
+            "Smaller / faster model is often enough for per-chunk frame+transcript JSON."
+        )
+        self.preflight_summary_form.addRow(lbl_chunk, chunk_row)
+
+        (
+            self.final_model_type_combo,
+            self.final_model_combo,
+            self.final_model_cloud_edit,
+        ) = self._make_lm_model_row_widgets()
+        self.final_model_type_combo.currentIndexChanged.connect(
+            self._on_final_model_scope_changed
+        )
+        final_row = QHBoxLayout()
+        final_row.addWidget(self.final_model_type_combo)
+        final_row.addWidget(self.final_model_combo, 1)
+        final_row.addWidget(self.final_model_cloud_edit, 1)
+        lbl_final = QLabel("Final answer:")
+        lbl_final.setToolTip(
+            "Model for the last synthesis step that answers your question in full."
+        )
+        self.preflight_summary_form.addRow(lbl_final, final_row)
 
     def _setup_preflight_summary_label_rows(self) -> None:
-        self.lbl_preflight_question = QLabel("-")
         self.lbl_preflight_duration = QLabel("-")
         self.lbl_preflight_budget = QLabel("-")
         self.lbl_preflight_info = QLabel("-")
         self.lbl_preflight_info.setWordWrap(False)
         self.lbl_preflight_info.setTextFormat(Qt.TextFormat.RichText)
         self.preflight_summary_form.addRow(
-            QLabel("Question:"), self.lbl_preflight_question
-        )
-        self.preflight_summary_form.addRow(
             QLabel("Video:"), self.lbl_preflight_duration
         )
         self.preflight_summary_form.addRow(QLabel("Budget:"), self.lbl_preflight_budget)
         self.preflight_summary_form.addRow(QLabel("Info:"), self.lbl_preflight_info)
 
-    def _on_model_scope_changed(self, idx: int) -> None:
-        """Show LM Studio model picker for local scope; text field for cloud."""
+    def _on_chunk_model_scope_changed(self, idx: int) -> None:
+        """Show LM Studio model picker for chunk row local scope; text field for cloud."""
         is_local = idx == 0
-        self.model_combo.setVisible(is_local)
-        self.btn_refresh_models.setVisible(is_local)
-        self.model_cloud_edit.setVisible(not is_local)
+        self.chunk_model_combo.setVisible(is_local)
+        self.chunk_model_cloud_edit.setVisible(not is_local)
+
+    def _on_final_model_scope_changed(self, idx: int) -> None:
+        """Show LM Studio model picker for final-answer row local scope; cloud field."""
+        is_local = idx == 0
+        self.final_model_combo.setVisible(is_local)
+        self.final_model_cloud_edit.setVisible(not is_local)
 
     def _setup_preflight_fps_row(self, row: QHBoxLayout) -> None:
         """Add fps toggles; each change runs preflight immediately."""
@@ -640,47 +689,100 @@ class VideoQAPanel(QWidget):
         """Set the current GUI budget limit."""
         self.budget_spin.setValue(tokens)
 
-    def lm_runtime_settings(self) -> VideoQALMRuntimeSettings:
-        """Resolve base URL, model id, and optional Bearer for the model scope."""
+    def _lm_row_target(
+        self,
+        type_combo: QComboBox,
+        local_combo: QComboBox,
+        cloud_edit: QLineEdit,
+    ) -> VideoQALMHttpTarget:
+        """Map one Local/Cloud row to a :class:`VideoQALMHttpTarget`."""
         default_id = get_default_video_qa_canonical_model_id()
-        if self.model_type_combo.currentIndex() == 0:
+        if type_combo.currentIndex() == 0:
             base = DEFAULT_LM_STUDIO_OPENAI_BASE_URL
-            raw = self.model_combo.currentText().strip()
+            raw = local_combo.currentText().strip()
             if not raw or raw in _LOCAL_MODEL_NON_SELECTION_LABELS:
                 model_id = default_id
             else:
                 model_id = raw
-            return VideoQALMRuntimeSettings(base, model_id, None)
+            return VideoQALMHttpTarget(base, model_id, None)
         base = DEFAULT_OPENROUTER_OPENAI_BASE_URL
-        cloud_raw = self.model_cloud_edit.text().strip()
+        cloud_raw = cloud_edit.text().strip()
         model_id = cloud_raw if cloud_raw else default_id
         token = os.environ.get(OPENROUTER_API_KEY_ENV, "")
         stripped = token.strip()
         bearer = stripped if stripped else None
-        return VideoQALMRuntimeSettings(base, model_id, bearer)
+        return VideoQALMHttpTarget(base, model_id, bearer)
+
+    def lm_runtime_settings_pair(self) -> VideoQALMRuntimePair:
+        """Resolve per-chunk and final OpenAI-compatible targets for the worker."""
+        return VideoQALMRuntimePair(
+            chunk=self._lm_row_target(
+                self.chunk_model_type_combo,
+                self.chunk_model_combo,
+                self.chunk_model_cloud_edit,
+            ),
+            final_answer=self._lm_row_target(
+                self.final_model_type_combo,
+                self.final_model_combo,
+                self.final_model_cloud_edit,
+            ),
+        )
+
+    def _restore_one_lm_row(
+        self,
+        *,
+        type_combo: QComboBox,
+        local_combo: QComboBox,
+        cloud_edit: QLineEdit,
+        on_scope: Callable[[int], None],
+        scope_index: int,
+        local_model_text: str,
+        cloud_model_text: str,
+    ) -> None:
+        idx = 0 if int(scope_index) <= 0 else 1
+        type_combo.blockSignals(True)  # noqa: FBT003
+        type_combo.setCurrentIndex(idx)
+        type_combo.blockSignals(False)  # noqa: FBT003
+        on_scope(idx)
+        local_t = local_model_text.strip()
+        if local_t:
+            found = local_combo.findText(local_t, Qt.MatchFlag.MatchExactly)
+            if found >= 0:
+                local_combo.setCurrentIndex(found)
+            else:
+                local_combo.insertItem(0, local_t)
+                local_combo.setCurrentIndex(0)
+        cloud_edit.setText(cloud_model_text)
 
     def restore_video_qa_lm_ui(
         self,
         *,
-        scope_index: int = 0,
-        local_model_text: str = "",
-        cloud_model_text: str = "",
+        chunk_scope_index: int = 0,
+        chunk_local_model_text: str = "",
+        chunk_cloud_model_text: str = "",
+        final_scope_index: int = 0,
+        final_local_model_text: str = "",
+        final_cloud_model_text: str = "",
     ) -> None:
-        """Restore model scope widgets from persisted settings."""
-        idx = 0 if int(scope_index) <= 0 else 1
-        self.model_type_combo.blockSignals(True)  # noqa: FBT003
-        self.model_type_combo.setCurrentIndex(idx)
-        self.model_type_combo.blockSignals(False)  # noqa: FBT003
-        self._on_model_scope_changed(idx)
-        local_t = local_model_text.strip()
-        if local_t:
-            found = self.model_combo.findText(local_t, Qt.MatchFlag.MatchExactly)
-            if found >= 0:
-                self.model_combo.setCurrentIndex(found)
-            else:
-                self.model_combo.insertItem(0, local_t)
-                self.model_combo.setCurrentIndex(0)
-        self.model_cloud_edit.setText(cloud_model_text)
+        """Restore both model rows from persisted settings."""
+        self._restore_one_lm_row(
+            type_combo=self.chunk_model_type_combo,
+            local_combo=self.chunk_model_combo,
+            cloud_edit=self.chunk_model_cloud_edit,
+            on_scope=self._on_chunk_model_scope_changed,
+            scope_index=chunk_scope_index,
+            local_model_text=chunk_local_model_text,
+            cloud_model_text=chunk_cloud_model_text,
+        )
+        self._restore_one_lm_row(
+            type_combo=self.final_model_type_combo,
+            local_combo=self.final_model_combo,
+            cloud_edit=self.final_model_cloud_edit,
+            on_scope=self._on_final_model_scope_changed,
+            scope_index=final_scope_index,
+            local_model_text=final_local_model_text,
+            cloud_model_text=final_cloud_model_text,
+        )
 
     def main_splitter_state(self) -> QByteArray:
         """Return the saved state for the main left/right splitter."""
@@ -739,7 +841,6 @@ class VideoQAPanel(QWidget):
 
         report = build_video_qa_preflight_report(context, preflight)
 
-        self.lbl_preflight_question.setText(report.question.strip() or "(empty)")
         self.lbl_preflight_duration.setText(f"{duration_s:.2f}s")
         self.lbl_preflight_budget.setText(report.budget_status_line)
         self.lbl_preflight_info.setText(
@@ -891,6 +992,7 @@ class VideoQAPanel(QWidget):
             self._schedule_preflight_refresh()
 
     def _refresh_local_models(self) -> None:
+        """Populate both local model combos from LM Studio ``/v1/models``."""
         try:
             req = urllib.request.Request(
                 "http://127.0.0.1:1234/v1/models", method="GET"
@@ -898,11 +1000,17 @@ class VideoQAPanel(QWidget):
             with urllib.request.urlopen(req, timeout=2.0) as response:  # noqa: S310
                 data = json.loads(response.read().decode("utf-8"))
                 models = [m["id"] for m in data.get("data", []) if "id" in m]
-                self.model_combo.clear()
-                if models:
-                    self.model_combo.addItems(models)
-                else:
-                    self.model_combo.addItem("No models found")
+
+                def fill_combo(cb: QComboBox) -> None:
+                    cb.clear()
+                    if models:
+                        cb.addItems(models)
+                    else:
+                        cb.addItem("No models found")
+
+                fill_combo(self.chunk_model_combo)
+                fill_combo(self.final_model_combo)
         except Exception:  # noqa: BLE001
-            self.model_combo.clear()
-            self.model_combo.addItem("LM Studio not running/reachable")
+            for cb in (self.chunk_model_combo, self.final_model_combo):
+                cb.clear()
+                cb.addItem("LM Studio not running/reachable")

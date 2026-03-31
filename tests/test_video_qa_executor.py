@@ -163,6 +163,61 @@ def _manifest_with_chunks(
     return replace(base, chunks=chunks)
 
 
+def test_before_answer_aggregate_runs_before_synthesis_aggregate(
+    tmp_path: Path,
+) -> None:
+    """Optional hook runs immediately before ``answer_aggregator.aggregate``."""
+    order: list[str] = []
+    bundle = _minimal_bundle(tmp_path)
+    plan = (
+        VideoQAPlannedChunk(
+            chunk_id="c0",
+            t_start=0.0,
+            t_end=1.0,
+            planning_mode="uniform_grid",
+        ),
+    )
+    manifest = merge_planned_chunks_into_manifest(
+        _manifest_with_chunks(bundle, ()),
+        plan,
+    )
+
+    class OrderAgg(_Aggregator):
+        def aggregate(
+            self,
+            *,
+            context: VideoQAContextBundle,
+            manifest: VideoQARunManifest,
+            transcript: VideoQATranscriptArtifacts,
+            chunk_results: Sequence[VideoQAChunkExecutionResult],
+        ) -> VideoQAAnswerBundle:
+            order.append("aggregate")
+            return super().aggregate(
+                context=context,
+                manifest=manifest,
+                transcript=transcript,
+                chunk_results=chunk_results,
+            )
+
+    def hook() -> None:
+        order.append("hook")
+
+    deps = VideoQAExecutorDeps(
+        transcript=_RecordingTranscript("t"),
+        frame_materializer=_RecordingFrames(),
+        chunk_inferencer=_GateInferencer(fail_ids=frozenset()),
+        answer_aggregator=OrderAgg("ord"),
+        before_answer_aggregate=hook,
+    )
+    run_video_qa_executor(
+        context=bundle,
+        manifest=manifest,
+        planned_chunks=plan,
+        deps=deps,
+    )
+    assert order == ["hook", "aggregate"]
+
+
 def test_transcript_separate_from_answer_bundle(tmp_path: Path) -> None:
     """Transcript artifacts are not embedded in the answer bundle object graph."""
     bundle = _minimal_bundle(tmp_path)

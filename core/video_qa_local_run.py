@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import logging
 import math
 import time
 from collections.abc import Mapping
@@ -15,6 +17,12 @@ from .ffmpeg import (
     extract_frame_to_file,
     extract_frames_for_span,
     get_media_duration_seconds,
+)
+from .lm_studio_rest import (
+    LMStudioRestError,
+    lm_studio_load_model,
+    lm_studio_unload_model,
+    openai_chat_base_to_local_rest_root,
 )
 from .pipelines import CancelledError
 from .video_qa_answer_bundle import (
@@ -68,6 +76,18 @@ DEFAULT_LM_STUDIO_OPENAI_BASE_URL: Final[str] = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_OPENAI_BASE_URL: Final[str] = "https://openrouter.ai/api/v1"
 # * Environment variable read by the GUI when Video QA scope is Cloud (Bearer auth).
 OPENROUTER_API_KEY_ENV: Final[str] = "OPENROUTER_API_KEY"
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class VideoQALMHttpTarget:
+    """OpenAI-compatible chat base (…/v1), model id, and optional Bearer token."""
+
+    base_url: str
+    model_id: str
+    authorization_bearer: str | None = None
+
 
 # * Fraction of the 0..1 progress curve treated as pre-VLM (maps to 0-100 on a 0-200 bar).
 _VIDEO_QA_PRE_VLM_PROGRESS_FRAC: Final[float] = 0.45
@@ -224,6 +244,9 @@ class VideoQAWhisperTranscriptProvider:
         )
         if self._pipeline_log:
             self._pipeline_log("✓ Stage: transcript_prepare complete")
+        # * Drop faster-whisper weights from VRAM before chunk VLM / LM HTTP work.
+        with contextlib.suppress(Exception):
+            self._whisper.unload(safe=False)
         return artifacts
 
 
@@ -688,10 +711,64 @@ class VideoQALocalRunParams:
     context: VideoQAContextBundle
     output_dir: Path
     context_window_tokens: int
-    lm_base_url: str
-    lm_model_id: str
+    chunk_lm: VideoQALMHttpTarget
+    final_lm: VideoQALMHttpTarget
     frame_sample_fps: float = field(default_factory=_default_frame_sample_fps)
-    lm_authorization_bearer: str | None = None
+
+
+def _build_lm_studio_dual_local_swap_hook(
+    *,
+    chunk_lm: VideoQALMHttpTarget,
+    final_lm: VideoQALMHttpTarget,
+    context_window_tokens: int,
+    pipeline_log: Callable[[str], None] | None,
+    should_cancel: Callable[[], bool] | None,
+) -> Callable[[], None] | None:
+    """Return a hook that unloads the chunk LM Studio model and loads the final one.
+
+    Runs only when both targets use the same local LM Studio REST origin and use
+    different ``model_id`` strings. ``instance_id`` for unload matches LM Studio
+    docs (often the same string as the loaded model id).
+    """
+    rest_c = openai_chat_base_to_local_rest_root(chunk_lm.base_url)
+    rest_f = openai_chat_base_to_local_rest_root(final_lm.base_url)
+    if rest_c is None or rest_f is None or rest_c != rest_f:
+        return None
+    if chunk_lm.model_id == final_lm.model_id:
+        return None
+
+    def hook() -> None:
+        if should_cancel and should_cancel():
+            msg = "Canceled"
+            raise CancelledError(msg)
+        bearer = chunk_lm.authorization_bearer or final_lm.authorization_bearer
+        if pipeline_log:
+            pipeline_log(
+                "LM Studio REST: unload chunk model "
+                f"{chunk_lm.model_id!r}, load final model {final_lm.model_id!r} "
+                f"(context_length={int(context_window_tokens)})."
+            )
+        try:
+            lm_studio_unload_model(rest_c, chunk_lm.model_id, bearer=bearer)
+        except LMStudioRestError as exc:
+            logger.warning("LM Studio unload before final synthesis failed: %s", exc)
+            if pipeline_log:
+                pipeline_log(
+                    f"LM Studio unload failed (safe if the model was not loaded): {exc}"
+                )
+        if should_cancel and should_cancel():
+            msg = "Canceled"
+            raise CancelledError(msg)
+        lm_studio_load_model(
+            rest_c,
+            final_lm.model_id,
+            context_length=int(context_window_tokens),
+            bearer=bearer,
+        )
+        if pipeline_log:
+            pipeline_log(f"LM Studio REST: loaded final model {final_lm.model_id!r}.")
+
+    return hook
 
 
 def build_video_qa_local_executor_deps(  # noqa: PLR0913
@@ -699,9 +776,8 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     context: VideoQAContextBundle,
     whisper: WhisperXWrapper,
     staging_dir: Path,
-    lm_base_url: str,
-    lm_model_id: str,
-    lm_authorization_bearer: str | None = None,
+    chunk_lm: VideoQALMHttpTarget,
+    final_lm: VideoQALMHttpTarget,
     should_cancel: Callable[[], bool] | None,
     progress: Callable[[str, float], None] | None,
     pipeline_log: Callable[[str], None] | None = None,
@@ -710,6 +786,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     transcript_override: VideoQATranscriptProvider | None = None,
     frame_override: VideoQAFrameMaterializer | None = None,
     aggregator_override: VideoQAAnswerAggregator | None = None,
+    before_answer_aggregate: Callable[[], None] | None = None,
 ) -> VideoQAExecutorDeps:
     """Construct executor dependencies for a local file run (injectable for tests)."""
     if context.source is None:
@@ -749,20 +826,20 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     else:
         inferencer = VideoQALMStudioChunkInferencer(
             context,
-            base_url=lm_base_url,
-            model=lm_model_id,
+            base_url=chunk_lm.base_url,
+            model=chunk_lm.model_id,
             should_cancel=should_cancel,
-            authorization_bearer=lm_authorization_bearer,
+            authorization_bearer=chunk_lm.authorization_bearer,
         )
     aggregator: VideoQAAnswerAggregator
     if aggregator_override is not None:
         aggregator = aggregator_override
     else:
         aggregator = VideoQALMStudioAnswerSynthesizer(
-            base_url=lm_base_url,
-            model=lm_model_id,
+            base_url=final_lm.base_url,
+            model=final_lm.model_id,
             should_cancel=should_cancel,
-            authorization_bearer=lm_authorization_bearer,
+            authorization_bearer=final_lm.authorization_bearer,
         )
     return VideoQAExecutorDeps(
         transcript=transcript,
@@ -770,6 +847,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
         chunk_inferencer=inferencer,
         answer_aggregator=aggregator,
         source_resolver=None,
+        before_answer_aggregate=before_answer_aggregate,
     )
 
 
@@ -1019,13 +1097,19 @@ def run_local_video_qa(  # noqa: PLR0913
     if progress:
         progress("Preparing", 0.05)
 
+    swap_hook = _build_lm_studio_dual_local_swap_hook(
+        chunk_lm=params.chunk_lm,
+        final_lm=params.final_lm,
+        context_window_tokens=params.context_window_tokens,
+        pipeline_log=pipeline_log,
+        should_cancel=should_cancel,
+    )
     deps = build_video_qa_local_executor_deps(
         context=ctx,
         whisper=whisper,
         staging_dir=staging_dir,
-        lm_base_url=params.lm_base_url,
-        lm_model_id=params.lm_model_id,
-        lm_authorization_bearer=params.lm_authorization_bearer,
+        chunk_lm=params.chunk_lm,
+        final_lm=params.final_lm,
         should_cancel=should_cancel,
         progress=progress,
         pipeline_log=pipeline_log,
@@ -1034,6 +1118,7 @@ def run_local_video_qa(  # noqa: PLR0913
         transcript_override=transcript_override,
         frame_override=frame_override,
         aggregator_override=aggregator_override,
+        before_answer_aggregate=swap_hook,
     )
 
     if progress is not None or pipeline_log is not None:

@@ -152,6 +152,7 @@ class VideoQAExecutorDeps:
     chunk_inferencer: VideoQAChunkInferencer
     answer_aggregator: VideoQAAnswerAggregator
     source_resolver: VideoQASourceResolver | None = None
+    before_answer_aggregate: Callable[[], None] | None = None
 
 
 def _run_status_from_chunk_results(
@@ -351,6 +352,9 @@ def run_video_qa_executor(
             )
 
     _raise_if_user_cancelled(should_cancel)
+
+    if deps.before_answer_aggregate is not None:
+        deps.before_answer_aggregate()
 
     stages.append("answer_aggregate")
     answer_bundle = deps.answer_aggregator.aggregate(

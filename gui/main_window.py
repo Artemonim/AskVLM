@@ -908,16 +908,15 @@ class MainWindow(QMainWindow):
         """Spin up :class:`VideoQALocalRunWorker` on a dedicated thread."""
         self._apply_quality_to_pipeline(force_reload=False)
         self._video_qa_thread = QThread(self)
-        lm = self.video_qa_panel.lm_runtime_settings()
+        lm = self.video_qa_panel.lm_runtime_settings_pair()
         self._video_qa_worker = VideoQALocalRunWorker(
             context=ctx,
             output_dir=out_dir,
             context_window_tokens=self.video_qa_panel.context_window_tokens(),
             frame_sample_fps=self.video_qa_panel.frame_sample_fps(),
             whisper=self.pipeline.whisperx,
-            lm_base_url=lm.lm_base_url,
-            lm_model_id=lm.lm_model_id,
-            lm_authorization_bearer=lm.lm_authorization_bearer,
+            chunk_lm=lm.chunk,
+            final_lm=lm.final_answer,
         )
         self._video_qa_worker.moveToThread(self._video_qa_thread)
         self._video_qa_thread.started.connect(self._video_qa_worker.run)
@@ -1518,16 +1517,47 @@ class MainWindow(QMainWindow):
         self.video_qa_panel.restore_answer_progress_splitter_state(
             ans_prog_splitter_state
         )
-        scope_raw = s.value("videoqa/lm_scope", 0)
-        try:
-            scope_idx = int(str(scope_raw).strip())
-        except (TypeError, ValueError):
-            scope_idx = 0
-        self.video_qa_panel.restore_video_qa_lm_ui(
-            scope_index=scope_idx,
-            local_model_text=str(s.value("videoqa/lm_local_model_text", "")),
-            cloud_model_text=str(s.value("videoqa/lm_cloud_model_text", "")),
-        )
+        chunk_scope_raw = s.value("videoqa/lm_chunk_scope", None)
+        if chunk_scope_raw is None:
+            try:
+                legacy_scope = int(str(s.value("videoqa/lm_scope", 0)).strip())
+            except (TypeError, ValueError):
+                legacy_scope = 0
+            legacy_local = str(s.value("videoqa/lm_local_model_text", ""))
+            legacy_cloud = str(s.value("videoqa/lm_cloud_model_text", ""))
+            self.video_qa_panel.restore_video_qa_lm_ui(
+                chunk_scope_index=legacy_scope,
+                chunk_local_model_text=legacy_local,
+                chunk_cloud_model_text=legacy_cloud,
+                final_scope_index=legacy_scope,
+                final_local_model_text=legacy_local,
+                final_cloud_model_text=legacy_cloud,
+            )
+        else:
+            try:
+                cs = int(str(chunk_scope_raw).strip())
+            except (TypeError, ValueError):
+                cs = 0
+            try:
+                fs = int(str(s.value("videoqa/lm_final_scope", 0)).strip())
+            except (TypeError, ValueError):
+                fs = 0
+            self.video_qa_panel.restore_video_qa_lm_ui(
+                chunk_scope_index=cs,
+                chunk_local_model_text=str(
+                    s.value("videoqa/lm_chunk_local_model_text", "")
+                ),
+                chunk_cloud_model_text=str(
+                    s.value("videoqa/lm_chunk_cloud_model_text", "")
+                ),
+                final_scope_index=fs,
+                final_local_model_text=str(
+                    s.value("videoqa/lm_final_local_model_text", "")
+                ),
+                final_cloud_model_text=str(
+                    s.value("videoqa/lm_final_cloud_model_text", "")
+                ),
+            )
 
     # * Settings persistence
     def _load_settings(self) -> None:
@@ -1626,14 +1656,28 @@ class MainWindow(QMainWindow):
             self.video_qa_panel.answer_progress_splitter_state(),
         )
         s.setValue(
-            "videoqa/lm_scope", int(self.video_qa_panel.model_type_combo.currentIndex())
+            "videoqa/lm_chunk_scope",
+            int(self.video_qa_panel.chunk_model_type_combo.currentIndex()),
         )
         s.setValue(
-            "videoqa/lm_local_model_text", self.video_qa_panel.model_combo.currentText()
+            "videoqa/lm_chunk_local_model_text",
+            self.video_qa_panel.chunk_model_combo.currentText(),
         )
         s.setValue(
-            "videoqa/lm_cloud_model_text",
-            self.video_qa_panel.model_cloud_edit.text(),
+            "videoqa/lm_chunk_cloud_model_text",
+            self.video_qa_panel.chunk_model_cloud_edit.text(),
+        )
+        s.setValue(
+            "videoqa/lm_final_scope",
+            int(self.video_qa_panel.final_model_type_combo.currentIndex()),
+        )
+        s.setValue(
+            "videoqa/lm_final_local_model_text",
+            self.video_qa_panel.final_model_combo.currentText(),
+        )
+        s.setValue(
+            "videoqa/lm_final_cloud_model_text",
+            self.video_qa_panel.final_model_cloud_edit.text(),
         )
         # Phase 1.81
         s.setValue("subs/max_line_chars", int(self.spin_line_len.value()))

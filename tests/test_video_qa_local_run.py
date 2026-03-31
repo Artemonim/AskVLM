@@ -23,9 +23,11 @@ from core.video_qa_lm_studio_client import LMStudioResponse
 from core.video_qa_local_run import (
     FINAL_SYNTHESIS_JSON_SCHEMA,
     VideoQAFFmpegFrameMaterializer,
+    VideoQALMHttpTarget,
     VideoQALMStudioAnswerSynthesizer,
     VideoQALocalRunParams,
     VideoQAPreflightBlockedError,
+    VideoQAWhisperTranscriptProvider,
     ensure_local_video_qa_run_allowed,
     map_video_qa_progress_frac_to_200,
     run_local_video_qa,
@@ -302,12 +304,13 @@ def test_run_local_video_qa_with_injected_stack(
             )
 
     whisper = MagicMock()
+    lm = VideoQALMHttpTarget("http://127.0.0.1:9/v1", "fake-model")
     params = VideoQALocalRunParams(
         context=ctx,
         output_dir=tmp_path,
         context_window_tokens=200_000,
-        lm_base_url="http://127.0.0.1:9/v1",
-        lm_model_id="fake-model",
+        chunk_lm=lm,
+        final_lm=lm,
     )
     outcome = run_local_video_qa(
         params=params,
@@ -321,6 +324,30 @@ def test_run_local_video_qa_with_injected_stack(
     manifest_path = tmp_path / f"{outcome.manifest.run_id}.manifest.json"
     assert manifest_path.is_file()
     assert "seen" in outcome.answer_bundle.answer
+
+
+def test_whisper_transcript_provider_unloads_after_transcribe(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ASR stage releases GPU weights before chunk LM work (best-effort unload)."""
+    clip = tmp_path / "v.mp4"
+    clip.write_bytes(b"x")
+    work = tmp_path / "w"
+    work.mkdir()
+    artifacts = VideoQATranscriptArtifacts("hi", segments=((0.0, 1.0, "hi"),))
+    monkeypatch.setattr(
+        "core.video_qa_local_run._whisper_transcribe_to_artifacts",
+        lambda *_a, **_k: artifacts,
+    )
+    whisper = MagicMock()
+    prov = VideoQAWhisperTranscriptProvider(
+        whisper,
+        media_path=clip,
+        work_dir=work,
+    )
+    prov.prepare_transcript(MagicMock(), MagicMock())
+    whisper.unload.assert_called_once_with(safe=False)
 
 
 def test_map_video_qa_progress_frac_to_200_splits_pre_vlm_and_vlm() -> None:

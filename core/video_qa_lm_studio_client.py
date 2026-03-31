@@ -8,6 +8,7 @@ import http.client
 import json
 import logging
 import mimetypes
+import socket
 import threading
 import urllib.error
 import urllib.parse
@@ -38,6 +39,18 @@ class LMStudioResponse:
 
 class LMStudioClientError(Exception):
     """Base exception for LM Studio client errors."""
+
+
+def _force_disconnect_http_connection(
+    conn: http.client.HTTPConnection | http.client.HTTPSConnection,
+) -> None:
+    """Tear down the transport so a blocked worker thread exits promptly."""
+    sock = getattr(conn, "sock", None)
+    if sock is not None:
+        with contextlib.suppress(Exception):
+            sock.shutdown(socket.SHUT_RDWR)
+    with contextlib.suppress(Exception):
+        conn.close()
 
 
 def _guess_image_mime_type(path: Path) -> str:
@@ -238,19 +251,17 @@ def _http_post_json_cancellable(  # noqa: C901, PLR0915
         finally:
             c = conn_holder[0]
             if c is not None:
-                with contextlib.suppress(Exception):
-                    c.close()
+                _force_disconnect_http_connection(c)
 
     thread = threading.Thread(target=worker, name="askvlm-lmstudio-http", daemon=True)
     thread.start()
-    poll_s = 0.05
+    poll_s = 0.01
     while thread.is_alive():
         if should_cancel():
             c = conn_holder[0]
             if c is not None:
-                with contextlib.suppress(Exception):
-                    c.close()
-            thread.join(timeout=15.0)
+                _force_disconnect_http_connection(c)
+            thread.join(timeout=30.0)
             msg = "Canceled"
             raise CancelledError(msg)
         thread.join(timeout=poll_s)

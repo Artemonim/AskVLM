@@ -10,6 +10,7 @@ from core.video_qa_local_run import (
     DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
     DEFAULT_OPENROUTER_OPENAI_BASE_URL,
     OPENROUTER_API_KEY_ENV,
+    VideoQALMHttpTarget,
 )
 from gui.main_window import MainWindow
 from gui.video_qa import VIDEO_QA_PREFLIGHT_FPS_CHOICES, VideoQAPanel
@@ -143,16 +144,20 @@ def test_context_bundle_respects_attachment_include(
 
 
 def test_video_qa_lm_runtime_local_uses_combo_selection(qtbot: QtBot) -> None:
-    """Local scope forwards the LM Studio combo selection to the worker settings."""
+    """Local scope forwards each row's LM Studio combo to chunk vs final targets."""
     panel = VideoQAPanel()
     qtbot.addWidget(panel)
-    panel.model_combo.clear()
-    panel.model_combo.addItems(["alpha", "beta"])
-    panel.model_combo.setCurrentText("beta")
-    s = panel.lm_runtime_settings()
-    assert s.lm_model_id == "beta"
-    assert s.lm_base_url == DEFAULT_LM_STUDIO_OPENAI_BASE_URL
-    assert s.lm_authorization_bearer is None
+    panel.chunk_model_combo.clear()
+    panel.chunk_model_combo.addItems(["alpha", "beta"])
+    panel.chunk_model_combo.setCurrentText("beta")
+    panel.final_model_combo.clear()
+    panel.final_model_combo.addItems(["small", "large"])
+    panel.final_model_combo.setCurrentText("large")
+    pair = panel.lm_runtime_settings_pair()
+    assert pair.chunk.model_id == "beta"
+    assert pair.final_answer.model_id == "large"
+    assert pair.chunk.base_url == DEFAULT_LM_STUDIO_OPENAI_BASE_URL
+    assert pair.chunk.authorization_bearer is None
 
 
 def test_video_qa_lm_runtime_local_fallback_when_placeholder_combo(
@@ -166,11 +171,11 @@ def test_video_qa_lm_runtime_local_fallback_when_placeholder_combo(
         "gui.video_qa.get_default_video_qa_canonical_model_id",
         lambda: "default-model-x",
     )
-    panel.model_combo.clear()
-    panel.model_combo.addItem("LM Studio not running/reachable")
-    panel.model_combo.setCurrentIndex(0)
-    s = panel.lm_runtime_settings()
-    assert s.lm_model_id == "default-model-x"
+    panel.chunk_model_combo.clear()
+    panel.chunk_model_combo.addItem("LM Studio not running/reachable")
+    panel.chunk_model_combo.setCurrentIndex(0)
+    pair = panel.lm_runtime_settings_pair()
+    assert pair.chunk.model_id == "default-model-x"
 
 
 def test_video_qa_lm_runtime_cloud_openrouter_and_env_key(
@@ -181,46 +186,51 @@ def test_video_qa_lm_runtime_cloud_openrouter_and_env_key(
     monkeypatch.setenv(OPENROUTER_API_KEY_ENV, "rk_test")
     panel = VideoQAPanel()
     qtbot.addWidget(panel)
-    panel.model_type_combo.setCurrentIndex(1)
-    panel.model_cloud_edit.setText("vendor/model-id")
-    s = panel.lm_runtime_settings()
-    assert s.lm_base_url == DEFAULT_OPENROUTER_OPENAI_BASE_URL
-    assert s.lm_model_id == "vendor/model-id"
-    assert s.lm_authorization_bearer == "rk_test"
+    panel.final_model_type_combo.setCurrentIndex(1)
+    panel.final_model_cloud_edit.setText("vendor/model-id")
+    pair = panel.lm_runtime_settings_pair()
+    assert pair.final_answer.base_url == DEFAULT_OPENROUTER_OPENAI_BASE_URL
+    assert pair.final_answer.model_id == "vendor/model-id"
+    assert pair.final_answer.authorization_bearer == "rk_test"
 
 
 def test_video_qa_restore_lm_ui_restores_cloud_scope(qtbot: QtBot) -> None:
-    """Persisted cloud scope and model text restore into the panel widgets."""
+    """Persisted cloud scope and model text restore into both panel rows."""
     panel = VideoQAPanel()
     qtbot.addWidget(panel)
     panel.restore_video_qa_lm_ui(
-        scope_index=1,
-        local_model_text="local-ghost",
-        cloud_model_text="openai/gpt-4o",
+        chunk_scope_index=1,
+        chunk_local_model_text="local-ghost",
+        chunk_cloud_model_text="openai/gpt-4o-mini",
+        final_scope_index=1,
+        final_local_model_text="",
+        final_cloud_model_text="openai/gpt-4o",
     )
-    assert panel.model_type_combo.currentIndex() == 1
-    assert panel.model_cloud_edit.text() == "openai/gpt-4o"
+    assert panel.chunk_model_type_combo.currentIndex() == 1
+    assert panel.chunk_model_cloud_edit.text() == "openai/gpt-4o-mini"
+    assert panel.final_model_cloud_edit.text() == "openai/gpt-4o"
 
 
-def test_video_qa_worker_params_carry_lm_model_and_bearer(
+def test_video_qa_worker_params_carry_chunk_and_final_lm(
     tmp_path: Path,
 ) -> None:
-    """Worker stores GUI-provided base URL, model id, and optional Bearer on params."""
+    """Worker stores separate chunk vs final HTTP targets on params."""
     ctx = MagicMock()
+    chunk = VideoQALMHttpTarget("http://127.0.0.1:1234/v1", "chunk-m", None)
+    final = VideoQALMHttpTarget("https://openrouter.ai/api/v1", "vendor/big", "tok")
     worker = VideoQALocalRunWorker(
         context=ctx,
         output_dir=tmp_path,
         context_window_tokens=2048,
         frame_sample_fps=0.5,
         whisper=MagicMock(),
-        lm_base_url="https://openrouter.ai/api/v1",
-        lm_model_id="vendor/vision-model",
-        lm_authorization_bearer="tok",
+        chunk_lm=chunk,
+        final_lm=final,
     )
     p = worker._params  # noqa: SLF001
-    assert p.lm_base_url == "https://openrouter.ai/api/v1"
-    assert p.lm_model_id == "vendor/vision-model"
-    assert p.lm_authorization_bearer == "tok"
+    assert p.chunk_lm.model_id == "chunk-m"
+    assert p.final_lm.model_id == "vendor/big"
+    assert p.final_lm.authorization_bearer == "tok"
 
 
 def test_video_qa_run_button_enabled_and_emits_request(qtbot: QtBot) -> None:
