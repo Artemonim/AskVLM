@@ -27,6 +27,7 @@ from core.video_qa_local_run import (
     VideoQALocalRunParams,
     VideoQAPreflightBlockedError,
     ensure_local_video_qa_run_allowed,
+    map_video_qa_progress_frac_to_200,
     run_local_video_qa,
 )
 from core.video_qa_manifest import VideoQAChunkRecord, VideoQARunManifest
@@ -320,3 +321,11 @@ def test_run_local_video_qa_with_injected_stack(
     manifest_path = tmp_path / f"{outcome.manifest.run_id}.manifest.json"
     assert manifest_path.is_file()
     assert "seen" in outcome.answer_bundle.answer
+
+
+def test_map_video_qa_progress_frac_to_200_splits_pre_vlm_and_vlm() -> None:
+    """First ~45% of internal progress maps to 0-100; remainder maps to 100-200."""
+    assert map_video_qa_progress_frac_to_200(0.0) == 0
+    assert map_video_qa_progress_frac_to_200(0.225) == 50
+    assert map_video_qa_progress_frac_to_200(0.45) == 100
+    assert map_video_qa_progress_frac_to_200(1.0) == 200

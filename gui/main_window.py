@@ -67,6 +67,7 @@ from core.video_qa_local_run import (
     DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
     VideoQAPreflightBlockedError,
     ensure_local_video_qa_run_allowed,
+    map_video_qa_progress_frac_to_200,
     preflight_local_video_qa,
 )
 from core.whisperx_wrapper import WhisperXWrapper
@@ -781,7 +782,17 @@ class MainWindow(QMainWindow):
 
     def on_progress(self, frac: float, msg: str) -> None:
         """Update progress bar and status message."""
-        # Show progress percentage, elapsed and ETA when encoded in msg
+        vqa_running = (
+            self._video_qa_thread is not None and self._video_qa_thread.isRunning()
+        )
+        if vqa_running:
+            self.progress.setMaximum(200)
+            pct200 = map_video_qa_progress_frac_to_200(frac)
+            self.progress.setValue(pct200)
+            suffix = f" — {msg}" if msg else ""
+            self.status.showMessage(f"{pct200}/200 ({pct200 // 2}%){suffix}")
+            return
+        self.progress.setMaximum(100)
         self.progress.setValue(int(max(0.0, min(1.0, frac)) * 100))
         if msg:
             self.status.showMessage(msg)
@@ -832,6 +843,7 @@ class MainWindow(QMainWindow):
 
     def _re_enable_after_video_qa(self) -> None:
         """Restore main controls after a Video QA worker ends (success, error, or cancel)."""
+        self.progress.setMaximum(100)
         self.progress.setValue(0)
         self.btn_start.setEnabled(True)
         self.video_qa_panel.btn_run_qa.setEnabled(True)
@@ -910,6 +922,9 @@ class MainWindow(QMainWindow):
         self._video_qa_worker.moveToThread(self._video_qa_thread)
         self._video_qa_thread.started.connect(self._video_qa_worker.run)
         self._video_qa_worker.progress.connect(self.on_progress)
+        self._video_qa_worker.pipeline_log_line.connect(
+            self.video_qa_panel.append_progress_log_line
+        )
         self._video_qa_worker.finished.connect(self._on_video_qa_finished)
         self._video_qa_worker.error.connect(self._on_video_qa_error)
         self._video_qa_worker.canceled.connect(self._on_video_qa_canceled)
@@ -924,7 +939,9 @@ class MainWindow(QMainWindow):
         self.video_qa_panel.btn_run_qa.setEnabled(False)
         self.btn_cancel.setEnabled(False)
         self.video_qa_panel.btn_cancel_qa.setEnabled(True)
+        self.progress.setMaximum(200)
         self.progress.setValue(0)
+        self.video_qa_panel.clear_progress_log()
         self.status.showMessage("Video QA…")
         self._video_qa_thread.start()
 
@@ -1493,6 +1510,17 @@ class MainWindow(QMainWindow):
             main_splitter_state,
             left_splitter_state,
         )
+        ratio_raw = s.value("videoqa/answer_area_ratio_percent", "")
+        try:
+            r = (
+                int(ratio_raw)
+                if isinstance(ratio_raw, int)
+                else int(str(ratio_raw).strip())
+            )
+        except (TypeError, ValueError):
+            pass
+        else:
+            self.video_qa_panel.set_answer_area_ratio_percent(r)
 
     # * Settings persistence
     def _load_settings(self) -> None:
@@ -1585,6 +1613,10 @@ class MainWindow(QMainWindow):
         s.setValue(
             "videoqa/left_splitter_state",
             self.video_qa_panel.left_splitter_state(),
+        )
+        s.setValue(
+            "videoqa/answer_area_ratio_percent",
+            self.video_qa_panel.answer_area_ratio_percent(),
         )
         # Phase 1.81
         s.setValue("subs/max_line_chars", int(self.spin_line_len.value()))

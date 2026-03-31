@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 from dataclasses import replace
+from html import escape
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Final
 
@@ -19,10 +20,12 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPlainTextEdit,
     QPushButton,
+    QSlider,
     QSpinBox,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -63,6 +66,24 @@ VIDEO_QA_PREFLIGHT_FPS_CHOICES: Final[tuple[float, ...]] = (
 )
 FPS_VALUE_MATCH_EPSILON: Final[float] = 1e-9
 
+
+def _format_preflight_warnings_rich(
+    warnings: tuple[str, ...],
+    overflow_explanation: str,
+) -> str:
+    """Build HTML for the preflight warnings row (includes overflow note when present)."""
+    ow = escape((overflow_explanation or "").strip())
+    if warnings:
+        body = "<br/>".join(escape(str(w)) for w in warnings)
+        warn_html = f"<span style='color:#f48771;font-weight:600;'>{body}</span>"
+    else:
+        warn_html = "<span style='color:#d4d4d4;'>none</span>"
+    if ow:
+        muted = f"<span style='color:#9d9d9d;'>{ow}</span>"
+        return f"{warn_html}<br/><br/>{muted}"
+    return warn_html
+
+
 # * Supported attachment extensions aligned with core/video_qa_context classification.
 _ATTACHMENT_NAME_FILTER = (
     "Attachments (*.txt *.md *.rst *.json *.csv *.xml *.yaml *.yml *.ini *.log *.html "
@@ -79,7 +100,7 @@ _READ_ONLY_STYLE = (
     "border: 1px solid #3f3f46; }"
 )
 _ANSWER_STYLE = (
-    "QPlainTextEdit { background-color: #252526; color: #d4d4d4; "
+    "QTextEdit { background-color: #252526; color: #d4d4d4; "
     "font-family: 'Segoe UI', system-ui, sans-serif; font-size: 12px; "
     "border: 1px solid #3f3f46; }"
 )
@@ -110,6 +131,9 @@ _VIDEO_QA_PANEL_STYLE = (
     "QPushButton:disabled { color: #7a7a7a; background-color: #252526; }"
     "QCheckBox { color: #d4d4d4; }"
     "QSplitter::handle { background-color: #3f3f46; }"
+    "QSlider::groove:horizontal { background: #3f3f46; height: 4px; border-radius: 2px; }"
+    "QSlider::handle:horizontal { background: #0e639c; width: 14px; margin: -6px 0; "
+    "border-radius: 7px; }"
     "QLabel { color: #d4d4d4; }"
 )
 
@@ -286,28 +310,21 @@ class VideoQAPanel(QWidget):
         self.lbl_preflight_source = QLabel("-")
         self.lbl_preflight_question = QLabel("-")
         self.lbl_preflight_duration = QLabel("-")
-        self.lbl_preflight_chunks = QLabel("-")
         self.lbl_preflight_budget = QLabel("-")
         self.lbl_preflight_warnings = QLabel("-")
         self.lbl_preflight_warnings.setWordWrap(True)
-        self.lbl_preflight_warnings.setProperty("isWarning", "true")
-        self.lbl_preflight_overflow = QLabel("-")
-        self.lbl_preflight_overflow.setWordWrap(True)
+        self.lbl_preflight_warnings.setTextFormat(Qt.TextFormat.RichText)
 
         self.preflight_summary_form.addRow(QLabel("Source:"), self.lbl_preflight_source)
         self.preflight_summary_form.addRow(
             QLabel("Question:"), self.lbl_preflight_question
         )
         self.preflight_summary_form.addRow(
-            QLabel("Duration:"), self.lbl_preflight_duration
+            QLabel("Video:"), self.lbl_preflight_duration
         )
-        self.preflight_summary_form.addRow(QLabel("Chunks:"), self.lbl_preflight_chunks)
         self.preflight_summary_form.addRow(QLabel("Budget:"), self.lbl_preflight_budget)
         self.preflight_summary_form.addRow(
             QLabel("Warnings:"), self.lbl_preflight_warnings
-        )
-        self.preflight_summary_form.addRow(
-            QLabel("Overflow:"), self.lbl_preflight_overflow
         )
 
         summary_widget = QWidget()
@@ -342,27 +359,50 @@ class VideoQAPanel(QWidget):
         row.addWidget(QLabel("fps"))
 
     def _build_answer_evidence_group(self, root: QVBoxLayout) -> None:
-        out_box = QGroupBox("Answer and evidence")
+        out_box = QGroupBox("Answer and progress")
         out_box.setStyleSheet(_VIDEO_QA_PANEL_STYLE)
         out_layout = QVBoxLayout(out_box)
-        out_layout.addWidget(QLabel("Answer (read-only until backend run):"))
-        self.answer_edit = QPlainTextEdit()
+        out_layout.addWidget(QLabel("Answer (markdown, read-only until backend run):"))
+        self.answer_edit = QTextEdit()
         self.answer_edit.setReadOnly(True)
+        self.answer_edit.setAcceptRichText(False)
         self.answer_edit.setPlaceholderText(
-            "Final answer appears here after a successful Video QA run."
+            "Final answer appears here after a successful Video QA run (Markdown)."
         )
         self.answer_edit.setMinimumHeight(100)
         self.answer_edit.setStyleSheet(_ANSWER_STYLE)
-        out_layout.addWidget(self.answer_edit)
-        out_layout.addWidget(QLabel("Evidence (read-only until backend run):"))
-        self.evidence_edit = QPlainTextEdit()
-        self.evidence_edit.setReadOnly(True)
-        self.evidence_edit.setPlaceholderText(
-            "Evidence items (quotes, timecodes, frame refs) will appear here."
+
+        self.progress_log_edit = QPlainTextEdit()
+        self.progress_log_edit.setReadOnly(True)
+        self.progress_log_edit.setPlaceholderText(
+            "Pipeline stages and LM Studio steps are logged here during a run."
         )
-        self.evidence_edit.setMinimumHeight(100)
-        self.evidence_edit.setStyleSheet(_EVIDENCE_STYLE)
-        out_layout.addWidget(self.evidence_edit)
+        self.progress_log_edit.setMinimumHeight(100)
+        self.progress_log_edit.setStyleSheet(_EVIDENCE_STYLE)
+
+        self._answer_progress_splitter = QSplitter(Qt.Orientation.Vertical)
+        self._answer_progress_splitter.setChildrenCollapsible(False)
+        self._answer_progress_splitter.addWidget(self.answer_edit)
+        self._answer_progress_splitter.addWidget(self.progress_log_edit)
+        self._answer_progress_splitter.setSizes([220, 180])
+        self._answer_progress_splitter.splitterMoved.connect(
+            self._on_answer_progress_splitter_moved
+        )
+        out_layout.addWidget(self._answer_progress_splitter, 1)
+
+        ratio_row = QHBoxLayout()
+        ratio_row.addWidget(QLabel("Answer / progress height:"))
+        self._answer_ratio_slider = QSlider(Qt.Orientation.Horizontal)
+        self._answer_ratio_slider.setRange(15, 85)
+        self._answer_ratio_slider.setValue(55)
+        self._answer_ratio_slider.setToolTip(
+            "Adjust vertical space for the answer versus the progress log."
+        )
+        self._answer_ratio_slider.valueChanged.connect(
+            self._on_answer_ratio_slider_changed
+        )
+        ratio_row.addWidget(self._answer_ratio_slider, 1)
+        out_layout.addLayout(ratio_row)
         root.addWidget(out_box)
 
     def _build_run_placeholder(self, root: QVBoxLayout) -> None:
@@ -456,24 +496,72 @@ class VideoQAPanel(QWidget):
         return list(self._iter_attachment_requests())
 
     def set_answer_text(self, text: str) -> None:
-        """Set the read-only answer surface (for future backend wiring)."""
-        self.answer_edit.setPlainText(text)
+        """Set the read-only answer surface as Markdown."""
+        self.answer_edit.setMarkdown(text)
 
     def answer_text(self) -> str:
-        """Return the current answer text."""
+        """Return the current answer as Markdown when possible, else plain text."""
+        md = self.answer_edit.toMarkdown()
+        if md.strip():
+            return md
         return self.answer_edit.toPlainText()
 
+    def clear_progress_log(self) -> None:
+        """Clear the pipeline progress log."""
+        self.progress_log_edit.clear()
+
+    def append_progress_log_line(self, line: str) -> None:
+        """Append one line to the progress log and scroll to the end."""
+        self.progress_log_edit.appendPlainText(line.rstrip("\n"))
+        bar = self.progress_log_edit.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
     def set_evidence_items(self, items: list[str]) -> None:
-        """Set evidence lines (for future backend wiring)."""
-        self.evidence_edit.setPlainText("\n".join(items))
+        """Append grounded evidence lines to the progress log after a run."""
+        if not items:
+            return
+        self.append_progress_log_line("")
+        self.append_progress_log_line("--- Evidence (from answer bundle) ---")
+        for ln in items:
+            self.append_progress_log_line(ln)
 
     def evidence_items(self) -> list[str]:
-        """Return non-empty evidence lines."""
-        return [
-            ln.strip()
-            for ln in self.evidence_edit.toPlainText().splitlines()
-            if ln.strip()
-        ]
+        """Return an empty list; evidence is no longer edited in a dedicated field."""
+        return []
+
+    def answer_area_ratio_percent(self) -> int:
+        """Return the slider value controlling answer vs progress log height share."""
+        return int(self._answer_ratio_slider.value())
+
+    def set_answer_area_ratio_percent(self, ratio: int) -> None:
+        """Clamp and apply the answer/progress height ratio (15-85)."""
+        v = max(15, min(85, int(ratio)))
+        self._answer_ratio_slider.blockSignals(True)  # noqa: FBT003
+        self._answer_ratio_slider.setValue(v)
+        self._answer_ratio_slider.blockSignals(False)  # noqa: FBT003
+        self._on_answer_ratio_slider_changed(v)
+
+    def _on_answer_ratio_slider_changed(self, value: int) -> None:
+        """Resize the vertical splitter from the horizontal ratio slider."""
+        v = max(15, min(85, int(value)))
+        total = max(sum(self._answer_progress_splitter.sizes()), 200)
+        top = max(80, int(total * v / 100))
+        bottom = max(80, total - top)
+        self._answer_progress_splitter.blockSignals(True)  # noqa: FBT003
+        self._answer_progress_splitter.setSizes([top, bottom])
+        self._answer_progress_splitter.blockSignals(False)  # noqa: FBT003
+
+    def _on_answer_progress_splitter_moved(self, _pos: int, _index: int) -> None:
+        """Keep the ratio slider aligned when the user drags the splitter."""
+        sizes = self._answer_progress_splitter.sizes()
+        total = sum(sizes)
+        if total <= 0:
+            return
+        top_pct = round(100 * sizes[0] / total)
+        top_pct = max(15, min(85, top_pct))
+        self._answer_ratio_slider.blockSignals(True)  # noqa: FBT003
+        self._answer_ratio_slider.setValue(top_pct)
+        self._answer_ratio_slider.blockSignals(False)  # noqa: FBT003
 
     def context_window_tokens(self) -> int:
         """Return the current GUI budget limit in tokens."""
@@ -563,12 +651,13 @@ class VideoQAPanel(QWidget):
         self.lbl_preflight_source.setText(report.source_summary or "(not selected)")
         self.lbl_preflight_question.setText(report.question.strip() or "(empty)")
         self.lbl_preflight_duration.setText(f"{duration_s:.2f}s")
-        self.lbl_preflight_chunks.setText(str(report.chunk_count))
         self.lbl_preflight_budget.setText(report.budget_status_line)
         self.lbl_preflight_warnings.setText(
-            "\n".join(report.warnings) if report.warnings else "none"
+            _format_preflight_warnings_rich(
+                report.warnings,
+                report.overflow_fallback_explanation,
+            )
         )
-        self.lbl_preflight_overflow.setText(report.overflow_fallback_explanation)
 
         self.preflight_edit.setPlainText(format_video_qa_preflight_report_text(report))
 

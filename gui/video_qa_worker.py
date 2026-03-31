@@ -24,6 +24,7 @@ class VideoQALocalRunWorker(QObject):
     """Runs :func:`run_local_video_qa` on a worker thread."""
 
     progress = Signal(float, str)
+    pipeline_log_line = Signal(str)
     finished = Signal(object)
     error = Signal(str)
     canceled = Signal()
@@ -61,12 +62,16 @@ class VideoQALocalRunWorker(QObject):
         def _progress(msg: str, frac: float) -> None:
             self.progress.emit(float(frac), msg)
 
+        def _pipeline_log(line: str) -> None:
+            self.pipeline_log_line.emit(line)
+
         try:
             outcome = run_local_video_qa(
                 params=self._params,
                 whisper=self._whisper,
                 should_cancel=lambda: self._cancel,
                 progress=_progress,
+                pipeline_log=_pipeline_log,
             )
             self.finished.emit(outcome)
         except VideoQAPreflightBlockedError as exc:

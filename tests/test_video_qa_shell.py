@@ -42,6 +42,7 @@ def test_video_qa_shell_restores_screen_and_source(
     window.video_qa_panel.set_question_text("What is shown?")
     window.video_qa_panel.set_context_window_tokens(123456)
     window.video_qa_panel.set_frame_sample_fps(0.1)
+    window.video_qa_panel.set_answer_area_ratio_percent(72)
     main_splitter_state = window.video_qa_panel.main_splitter_state()
     left_splitter_state = window.video_qa_panel.left_splitter_state()
     window.shell_tabs.setCurrentIndex(1)
@@ -55,6 +56,7 @@ def test_video_qa_shell_restores_screen_and_source(
     assert restored.video_qa_panel.question_text() == "What is shown?"
     assert restored.video_qa_panel.context_window_tokens() == 123456
     assert restored.video_qa_panel.frame_sample_fps() == 0.1
+    assert restored.video_qa_panel.answer_area_ratio_percent() == 72
     assert restored.video_qa_panel.main_splitter_state() == main_splitter_state
     assert restored.video_qa_panel.left_splitter_state() == left_splitter_state
 
@@ -366,7 +368,7 @@ def test_video_qa_layout_has_splitters(qtbot: QtBot) -> None:
     panel = VideoQAPanel()
     qtbot.addWidget(panel)
     splitters = panel.findChildren(QSplitter)
-    assert len(splitters) >= 2, "Expected horizontal and vertical splitters."
+    assert len(splitters) >= 3, "Expected main, left, and answer/progress splitters."
     assert any(
         splitter.orientation() == Qt.Orientation.Horizontal for splitter in splitters
     )
@@ -389,3 +391,42 @@ def test_text_subtitles_shell_layout_unchanged(qtbot: QtBot) -> None:
     assert hasattr(w, "tabs")
     assert hasattr(w, "video_qa_panel")
     assert isinstance(w.video_qa_panel, VideoQAPanel)
+
+
+def test_preflight_warnings_summary_neutral_when_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    qtbot: QtBot,
+) -> None:
+    """Preflight warnings row stays non-red when the backend reports no warnings."""
+    media = tmp_path / "clean.mp4"
+    media.write_bytes(b"a")
+    monkeypatch.setattr("gui.video_qa.get_media_duration_seconds", lambda _p: 10.0)
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    panel.set_source_path(media)
+    panel.set_question_text("Q?")
+    panel.refresh_preflight()
+    html = panel.lbl_preflight_warnings.text()
+    assert "none" in html
+    assert "#f48771" not in html
+
+
+def test_preflight_warnings_summary_red_when_source_missing(qtbot: QtBot) -> None:
+    """Missing media produces a real warning and uses the warning styling."""
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    panel.set_question_text("Q?")
+    panel.refresh_preflight()
+    html = panel.lbl_preflight_warnings.text()
+    assert "#f48771" in html
+
+
+def test_video_qa_answer_uses_markdown_view(qtbot: QtBot) -> None:
+    """Answer surface accepts Markdown via QTextEdit."""
+    panel = VideoQAPanel()
+    qtbot.addWidget(panel)
+    panel.set_answer_text("# Heading\n\n**bold** text")
+    plain = panel.answer_edit.toPlainText()
+    assert "Heading" in plain
+    assert "bold" in plain

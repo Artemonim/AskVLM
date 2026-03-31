@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import math
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -62,6 +64,36 @@ if TYPE_CHECKING:
 
 # * OpenAI-compatible LM Studio HTTP API base (chat completions live under /chat/completions).
 DEFAULT_LM_STUDIO_OPENAI_BASE_URL: Final[str] = "http://127.0.0.1:1234/v1"
+
+# * Fraction of the 0..1 progress curve treated as pre-VLM (maps to 0-100 on a 0-200 bar).
+_VIDEO_QA_PRE_VLM_PROGRESS_FRAC: Final[float] = 0.45
+_VIDEO_QA_PRE_VLM_FRAC_EPS: Final[float] = 1e-9
+_SECONDS_PER_MINUTE: Final[int] = 60
+
+
+def _format_vlm_eta_seconds(seconds: float | None) -> str:
+    """Format a rough ETA string for chunk-level VLM work."""
+    if seconds is None or seconds < 0.0 or math.isnan(float(seconds)):
+        return "…"
+    s = round(float(seconds))
+    spm = _SECONDS_PER_MINUTE
+    if s < spm:
+        return f"~{s}s"
+    minutes, sec = divmod(s, spm)
+    if minutes < spm:
+        return f"~{minutes}m {sec}s"
+    hours, m2 = divmod(minutes, spm)
+    return f"~{hours}h {m2}m"
+
+
+def map_video_qa_progress_frac_to_200(frac: float) -> int:
+    """Map internal 0..1 progress to a 0..200 scale (first half = pre-VLM, second = VLM)."""
+    x = max(0.0, min(1.0, float(frac)))
+    pre = float(_VIDEO_QA_PRE_VLM_PROGRESS_FRAC)
+    if x <= pre:
+        return int(x / pre * 100) if pre > _VIDEO_QA_PRE_VLM_FRAC_EPS else 0
+    tail = (x - pre) / (1.0 - pre)
+    return 100 + int(max(0.0, min(1.0, tail)) * 100)
 
 
 class VideoQAPreflightBlockedError(ValueError):
@@ -159,6 +191,7 @@ class VideoQAWhisperTranscriptProvider:
         language: str | None = None,
         should_cancel: Callable[[], bool] | None = None,
         progress: Callable[[str, float], None] | None = None,
+        pipeline_log: Callable[[str], None] | None = None,
     ) -> None:
         self._whisper = whisper
         self._media_path = media_path
@@ -166,6 +199,7 @@ class VideoQAWhisperTranscriptProvider:
         self._language = language
         self._should_cancel = should_cancel
         self._progress = progress
+        self._pipeline_log = pipeline_log
 
     def prepare_transcript(
         self,
@@ -173,17 +207,23 @@ class VideoQAWhisperTranscriptProvider:
         _manifest: VideoQARunManifest,
     ) -> VideoQATranscriptArtifacts:
         """Transcribe prepared audio and return segment-aligned transcript text."""
-        return _whisper_transcribe_to_artifacts(
+        if self._pipeline_log:
+            self._pipeline_log("→ Stage: transcript_prepare (local Whisper ASR)")
+        artifacts = _whisper_transcribe_to_artifacts(
             self._whisper,
             self._media_path,
             self._work_dir,
             language=self._language,
             should_cancel=self._should_cancel,
             progress=self._progress,
+            pipeline_log=self._pipeline_log,
         )
+        if self._pipeline_log:
+            self._pipeline_log("✓ Stage: transcript_prepare complete")
+        return artifacts
 
 
-def _whisper_transcribe_to_artifacts(
+def _whisper_transcribe_to_artifacts(  # noqa: C901
     whisper: WhisperXWrapper,
     media_path: Path,
     work_dir: Path,
@@ -191,6 +231,7 @@ def _whisper_transcribe_to_artifacts(
     language: str | None,
     should_cancel: Callable[[], bool] | None,
     progress: Callable[[str, float], None] | None,
+    pipeline_log: Callable[[str], None] | None = None,
 ) -> VideoQATranscriptArtifacts:
     """Run faster-whisper transcription and normalize segment tuples."""
     if progress:
@@ -222,6 +263,9 @@ def _whisper_transcribe_to_artifacts(
         msg = "Canceled"
         raise CancelledError(msg)
 
+    if pipeline_log:
+        pipeline_log("→ Transcribing audio segments…")
+
     tx = whisper.transcribe(
         audio_path,
         language=language,
@@ -239,6 +283,8 @@ def _whisper_transcribe_to_artifacts(
         segments.append((t0, t1, text))
     body = str(tx.get("text", "")).strip()
     cleanup_intermediate_audio(media_path, work_dir)
+    if pipeline_log:
+        pipeline_log("✓ Transcription finished")
     return VideoQATranscriptArtifacts(
         transcript_text=body,
         subtitle_text="",
@@ -649,6 +695,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     lm_model_id: str,
     should_cancel: Callable[[], bool] | None,
     progress: Callable[[str, float], None] | None,
+    pipeline_log: Callable[[str], None] | None = None,
     frame_sample_fps: float | None = None,
     chunk_inferencer_override: VideoQAChunkInferencer | None = None,
     transcript_override: VideoQATranscriptProvider | None = None,
@@ -671,6 +718,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
             work_dir=staging_dir,
             should_cancel=should_cancel,
             progress=progress,
+            pipeline_log=pipeline_log,
         )
     frame_mat: VideoQAFrameMaterializer
     if frame_override is not None:
@@ -724,11 +772,14 @@ class _ProgressFrameMaterializer:
         progress: Callable[[str, float], None],
         total_chunks: int,
         chunk_state: dict[str, int],
+        pipeline_log: Callable[[str], None] | None = None,
     ) -> None:
         self._inner = inner
         self._progress = progress
         self._total_chunks = total_chunks
         self._chunk_state = chunk_state
+        self._pipeline_log = pipeline_log
+        self._vlm_section_logged = False
 
     def materialize_frames(
         self,
@@ -738,17 +789,32 @@ class _ProgressFrameMaterializer:
         manifest: VideoQARunManifest,
         transcript: VideoQATranscriptArtifacts,
     ) -> tuple[str, ...]:
+        if self._pipeline_log and not self._vlm_section_logged:
+            self._pipeline_log(
+                "→ VLM phase: per-chunk frame sampling and LM Studio requests "
+                "(server console may show prompt %; HTTP client does not)."
+            )
+            self._vlm_section_logged = True
         self._chunk_state["i"] += 1
         chunk_index = self._chunk_state["i"]
         per_chunk_span = 0.48 / self._total_chunks
-        base = 0.45 + (chunk_index - 1) * per_chunk_span
+        base = _VIDEO_QA_PRE_VLM_PROGRESS_FRAC + (chunk_index - 1) * per_chunk_span
         self._progress("Sampling", min(0.93, base))
-        return self._inner.materialize_frames(
+        if self._pipeline_log:
+            self._pipeline_log(
+                f"→ frame_select: {chunk.chunk_id} ({chunk_index}/{self._total_chunks})"
+            )
+        frames = self._inner.materialize_frames(
             chunk=chunk,
             representative_timestamp=representative_timestamp,
             manifest=manifest,
             transcript=transcript,
         )
+        if self._pipeline_log:
+            self._pipeline_log(
+                f"✓ Frames ready for {chunk.chunk_id} ({len(frames)} file(s))"
+            )
+        return frames
 
 
 class _ProgressInferencer:
@@ -761,11 +827,14 @@ class _ProgressInferencer:
         progress: Callable[[str, float], None],
         total_chunks: int,
         chunk_state: dict[str, int],
+        pipeline_log: Callable[[str], None] | None = None,
     ) -> None:
         self._inner = inner
         self._progress = progress
-        self._total_chunks = total_chunks
+        self._total_chunks = max(1, int(total_chunks))
         self._chunk_state = chunk_state
+        self._pipeline_log = pipeline_log
+        self._infer_durations: list[float] = []
 
     def infer_chunk(
         self,
@@ -777,14 +846,36 @@ class _ProgressInferencer:
     ) -> VideoQAChunkInferenceOutcome:
         chunk_index = max(1, self._chunk_state["i"])
         per_chunk_span = 0.48 / self._total_chunks
-        base = 0.45 + (chunk_index - 1) * per_chunk_span
-        self._progress("Processing", min(0.93, base + per_chunk_span * 0.5))
-        return self._inner.infer_chunk(
+        base = _VIDEO_QA_PRE_VLM_PROGRESS_FRAC + (chunk_index - 1) * per_chunk_span
+        done_before = len(self._infer_durations)
+        remaining = max(0, self._total_chunks - done_before)
+        avg = (
+            sum(self._infer_durations) / len(self._infer_durations)
+            if self._infer_durations
+            else None
+        )
+        eta_s = avg * remaining if avg is not None and remaining else None
+        detail = (
+            f"Processing · VLM chunks {done_before}/{self._total_chunks} · "
+            f"ETA {_format_vlm_eta_seconds(eta_s)}"
+        )
+        self._progress(detail, min(0.93, base + per_chunk_span * 0.5))
+        if self._pipeline_log:
+            self._pipeline_log(
+                f"→ llm_pass: {chunk.chunk_id} ({chunk_index}/{self._total_chunks})"
+            )
+        t0 = time.perf_counter()
+        outcome = self._inner.infer_chunk(
             chunk=chunk,
             frames=frames,
             transcript=transcript,
             manifest=manifest,
         )
+        self._infer_durations.append(time.perf_counter() - t0)
+        status = "ok" if outcome.ok else "failed"
+        if self._pipeline_log:
+            self._pipeline_log(f"✓ llm_pass finished for {chunk.chunk_id} ({status})")
+        return outcome
 
 
 class _ProgressAggregator:
@@ -795,9 +886,11 @@ class _ProgressAggregator:
         inner: VideoQAAnswerAggregator,
         *,
         progress: Callable[[str, float], None],
+        pipeline_log: Callable[[str], None] | None = None,
     ) -> None:
         self._inner = inner
         self._progress = progress
+        self._pipeline_log = pipeline_log
 
     def aggregate(
         self,
@@ -807,13 +900,18 @@ class _ProgressAggregator:
         transcript: VideoQATranscriptArtifacts,
         chunk_results: Sequence[VideoQAChunkExecutionResult],
     ) -> VideoQAAnswerBundle:
-        self._progress("Synthesizing", 0.95)
-        return self._inner.aggregate(
+        self._progress("Synthesizing final answer (LM Studio JSON)", 0.95)
+        if self._pipeline_log:
+            self._pipeline_log("→ Stage: answer_aggregate (final LM Studio JSON call)")
+        bundle = self._inner.aggregate(
             context=context,
             manifest=manifest,
             transcript=transcript,
             chunk_results=chunk_results,
         )
+        if self._pipeline_log:
+            self._pipeline_log("✓ Stage: answer_aggregate complete")
+        return bundle
 
 
 def _wrap_local_executor_deps_with_progress(
@@ -821,6 +919,7 @@ def _wrap_local_executor_deps_with_progress(
     *,
     progress: Callable[[str, float], None],
     total_chunks: int,
+    pipeline_log: Callable[[str], None] | None = None,
 ) -> VideoQAExecutorDeps:
     """Wrap executor dependencies with generic local-run progress reporting."""
     chunk_state = {"i": 0}
@@ -831,26 +930,30 @@ def _wrap_local_executor_deps_with_progress(
             progress=progress,
             total_chunks=total_chunks,
             chunk_state=chunk_state,
+            pipeline_log=pipeline_log,
         ),
         chunk_inferencer=_ProgressInferencer(
             deps.chunk_inferencer,
             progress=progress,
             total_chunks=total_chunks,
             chunk_state=chunk_state,
+            pipeline_log=pipeline_log,
         ),
         answer_aggregator=_ProgressAggregator(
             deps.answer_aggregator,
             progress=progress,
+            pipeline_log=pipeline_log,
         ),
     )
 
 
-def run_local_video_qa(
+def run_local_video_qa(  # noqa: PLR0913
     *,
     params: VideoQALocalRunParams,
     whisper: WhisperXWrapper,
     should_cancel: Callable[[], bool] | None = None,
     progress: Callable[[str, float], None] | None = None,
+    pipeline_log: Callable[[str], None] | None = None,
     chunk_inferencer_override: VideoQAChunkInferencer | None = None,
     transcript_override: VideoQATranscriptProvider | None = None,
     frame_override: VideoQAFrameMaterializer | None = None,
@@ -860,6 +963,20 @@ def run_local_video_qa(
 
     Re-runs preflight and blocks via :func:`ensure_local_video_qa_run_allowed`.
     Writes manifest and answer JSON under ``output_dir`` when the run completes.
+
+    Args:
+        params: Run inputs (context, LM URL/model, output dir, sampling fps, …).
+        whisper: Loaded Whisper backend for the transcript stage.
+        should_cancel: Optional cooperative cancel predicate.
+        progress: Optional ``(message, fraction)`` callback; ``fraction`` is 0..1
+            (first ~45% maps to pre-VLM work, the rest to VLM for a 0..200 UI bar).
+        pipeline_log: Optional line-by-line pipeline log (GUI); explains that LM
+            Studio's prompt-% logs are server-side only, not visible over HTTP.
+        chunk_inferencer_override: Test hook replacing per-chunk LM calls.
+        transcript_override: Test hook replacing ASR.
+        frame_override: Test hook replacing ffmpeg frame extraction.
+        aggregator_override: Test hook replacing final synthesis.
+
     """
     ctx = params.context
     if ctx.source is None:
@@ -874,10 +991,19 @@ def run_local_video_qa(
         frame_sample_fps=params.frame_sample_fps,
     )
     ensure_local_video_qa_run_allowed(report, chunk_plan)
+    if pipeline_log:
+        pipeline_log(f"✓ Preflight OK — {len(chunk_plan)} chunk(s) planned.")
 
     manifest = build_video_qa_preparation_manifest(ctx)
     staging_dir = params.output_dir / "_video_qa_work" / manifest.run_id
     staging_dir.mkdir(parents=True, exist_ok=True)
+
+    if pipeline_log:
+        pipeline_log("=== Video QA · progress log ===")
+        pipeline_log(
+            "LM Studio prints prompt/token progress in its server console; the "
+            "OpenAI-compatible HTTP API does not expose that stream to AskVLM."
+        )
 
     if progress:
         progress("Preparing", 0.05)
@@ -890,6 +1016,7 @@ def run_local_video_qa(
         lm_model_id=params.lm_model_id,
         should_cancel=should_cancel,
         progress=progress,
+        pipeline_log=pipeline_log,
         frame_sample_fps=params.frame_sample_fps,
         chunk_inferencer_override=chunk_inferencer_override,
         transcript_override=transcript_override,
@@ -897,11 +1024,13 @@ def run_local_video_qa(
         aggregator_override=aggregator_override,
     )
 
-    if progress is not None:
+    if progress is not None or pipeline_log is not None:
+        prog_cb = progress or (lambda _m, _f: None)
         deps = _wrap_local_executor_deps_with_progress(
             deps,
-            progress=progress,
+            progress=prog_cb,
             total_chunks=max(1, len(chunk_plan)),
+            pipeline_log=pipeline_log,
         )
 
     outcome = run_video_qa_executor(
@@ -921,5 +1050,7 @@ def run_local_video_qa(
 
     if progress:
         progress("Completed", 1.0)
+    if pipeline_log:
+        pipeline_log("✓ Pipeline completed (manifest + answer bundle saved)")
 
     return outcome
