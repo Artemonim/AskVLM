@@ -27,12 +27,13 @@ def _select_inputs(tmp_path: Path, fixtures_dir: Path, num_videos: int) -> list[
     return inputs
 
 
-def _create_window(
+def _create_subtitle_crash_window(
     qtbot: QtBot,
     out_dir: Path,
     inputs: list[Path],
     quality: str,
 ) -> MainWindow:
+    """Build a main window configured for the Text + Subtitles transcribe path."""
     window = MainWindow()
     window.show()
     qtbot.addWidget(window)
@@ -50,6 +51,46 @@ def _create_window(
         window.input_list.setItem(row, 1, QTableWidgetItem(str(media_path)))
 
     return window
+
+
+def _create_video_qa_crash_window(
+    qtbot: QtBot,
+    out_dir: Path,
+    media_path: Path,
+    quality: str,
+) -> MainWindow:
+    """Build MainWindow on Video QA tab with source and question (GUI-like)."""
+    window = MainWindow()
+    window.show()
+    qtbot.addWidget(window)
+
+    window.out_dir_edit.setText(str(out_dir))
+    window.chk_diar.setChecked(False)
+    window.chk_dialog.setChecked(False)
+    if quality == "fast":
+        qtbot.mouseClick(window.btn_quality, Qt.LeftButton)
+
+    window.shell_tabs.setCurrentIndex(1)
+    # * Large token budget so the short fixture passes preflight offline.
+    window.video_qa_panel.set_context_window_tokens(200_000)
+    window.video_qa_panel.set_source_path(media_path)
+    window.video_qa_panel.set_question_text(
+        "E2E crash probe: describe one visible detail in this clip.",
+    )
+    return window
+
+
+def _video_qa_thread_running_or_terminal_status(window: MainWindow) -> bool:
+    """Return True when Video QA is in-flight or has a terminal status message."""
+    thread = window._video_qa_thread  # noqa: SLF001
+    if thread is not None and thread.isRunning():
+        return True
+    msg = window.status.currentMessage()
+    return (
+        "Video QA error" in msg
+        or "Video QA completed" in msg
+        or "Video QA canceled" in msg
+    )
 
 
 def _make_dummy_thread(*, should_stop: bool) -> SimpleNamespace:
@@ -70,7 +111,7 @@ def _make_dummy_thread(*, should_stop: bool) -> SimpleNamespace:
     return thread
 
 
-# * E2E crash detection covers a small matrix of runtime scenarios.
+# * E2E crash detection covers subtitle and Video QA shutdown paths (manual / heavy).
 @pytest.mark.skipif(
     not os.getenv("SK_RUN_E2E_CRASH"),
     reason="Manual E2E test for crash detection (set SK_RUN_E2E_CRASH=1 to run)",
@@ -78,7 +119,7 @@ def _make_dummy_thread(*, should_stop: bool) -> SimpleNamespace:
 @pytest.mark.parametrize("quality", ["fast", "good"])
 @pytest.mark.parametrize("num_videos", [1, 2])
 @pytest.mark.parametrize("strategy", ["implicit_cancel", "explicit_cancel"])
-def test_e2e_crash_scenarios(
+def test_e2e_subtitles_crash_scenarios(
     qapp: QApplication,
     qtbot: QtBot,
     tmp_path: Path,
@@ -87,10 +128,10 @@ def test_e2e_crash_scenarios(
     num_videos: int,
     strategy: str,
 ) -> None:
-    """Parametric E2E test for crash and hang detection on exit.
+    """Parametric E2E for crash/hang detection on exit via the subtitle transcribe path.
 
     Covers Fast and Good modes, single and multi-file inputs, and implicit and
-    explicit cancellation.
+    explicit cancellation (main input table + Start Transcribe).
     """
     temp_settings_path = tmp_path / "test_settings.ini"
 
@@ -106,7 +147,7 @@ def test_e2e_crash_scenarios(
     out_dir = tmp_path / f"e2e_out_{quality}_{num_videos}_{strategy}"
     out_dir.mkdir()
 
-    window = _create_window(qtbot, out_dir, inputs, quality)
+    window = _create_subtitle_crash_window(qtbot, out_dir, inputs, quality)
 
     qtbot.mouseClick(window.btn_start, Qt.LeftButton)
     qtbot.waitUntil(
@@ -118,6 +159,60 @@ def test_e2e_crash_scenarios(
     if strategy == "explicit_cancel":
         qtbot.mouseClick(window.btn_cancel, Qt.LeftButton)
         time.sleep(0.5)
+
+    window.close()
+    assert window.await_worker_shutdown(timeout_ms=30000)
+
+
+@pytest.mark.skipif(
+    not os.getenv("SK_RUN_E2E_CRASH"),
+    reason="Manual E2E test for crash detection (set SK_RUN_E2E_CRASH=1 to run)",
+)
+@pytest.mark.parametrize("quality", ["fast", "good"])
+@pytest.mark.parametrize("strategy", ["implicit_cancel", "explicit_cancel"])
+def test_e2e_video_qa_crash_scenarios(
+    qapp: QApplication,
+    qtbot: QtBot,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    quality: str,
+    strategy: str,
+) -> None:
+    """E2E crash/hang check using the real Video QA panel run and cancel wiring.
+
+    Drives ``VideoQAPanel`` (source, question), clicks Run Video QA, waits until
+    the worker thread is running or a terminal Video QA status is shown, then
+    closes the window. Asserts shutdown without asserting on model output text.
+    """
+    temp_settings_path = tmp_path / "test_settings.ini"
+
+    class MockSettings(QSettings):
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            super().__init__(str(temp_settings_path), QSettings.Format.IniFormat)
+
+    monkeypatch.setattr("gui.main_window.QSettings", MockSettings)
+
+    fixtures_dir = Path(__file__).parent / "fixtures"
+    inputs = _select_inputs(tmp_path, fixtures_dir, 1)
+    media_path = inputs[0]
+
+    out_dir = tmp_path / f"e2e_vqa_out_{quality}_{strategy}"
+    out_dir.mkdir()
+
+    window = _create_video_qa_crash_window(qtbot, out_dir, media_path, quality)
+
+    qtbot.mouseClick(window.video_qa_panel.btn_run_qa, Qt.LeftButton)
+    qtbot.waitUntil(
+        lambda: _video_qa_thread_running_or_terminal_status(window),
+        timeout=120000,
+    )
+    time.sleep(2.0)
+
+    if strategy == "explicit_cancel":
+        vq_thread = window._video_qa_thread  # noqa: SLF001
+        if vq_thread is not None and vq_thread.isRunning():
+            qtbot.mouseClick(window.video_qa_panel.btn_cancel_qa, Qt.LeftButton)
+            time.sleep(0.5)
 
     window.close()
     assert window.await_worker_shutdown(timeout_ms=30000)

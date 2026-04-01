@@ -853,6 +853,7 @@ class MainWindow(QMainWindow):
         vq_log = get_logger(__name__)
         vq_log.info("Video QA: run requested (preflight path)")
         if self._thread is not None and self._thread.isRunning():
+            self.status.showMessage("Video QA error")
             QMessageBox.information(
                 self,
                 "Busy",
@@ -863,15 +864,18 @@ class MainWindow(QMainWindow):
             return
         ctx = self.video_qa_panel.context_bundle()
         if ctx.source is None:
+            self.status.showMessage("Video QA error")
             QMessageBox.warning(self, "Video QA", "Select a local media file first.")
             return
         if not str(ctx.question or "").strip():
+            self.status.showMessage("Video QA error")
             QMessageBox.warning(self, "Video QA", "Enter a question.")
             return
         out_dir = Path(self.out_dir_edit.text()).resolve()
         try:
             out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
+            self.status.showMessage("Video QA error")
             QMessageBox.critical(self, "Output error", f"Cannot use output dir: {exc}")
             return
         try:
@@ -888,6 +892,7 @@ class MainWindow(QMainWindow):
             ensure_local_video_qa_run_allowed(report, chunk_plan)
         except VideoQAPreflightBlockedError as exc:
             vq_log.info("Video QA: preflight blocked — %s", exc)
+            self.status.showMessage("Video QA error")
             QMessageBox.warning(self, "Video QA", str(exc))
             return
         vq_log.info(
@@ -939,6 +944,9 @@ class MainWindow(QMainWindow):
             worker.error.connect(self._on_video_qa_error)
             worker.canceled.connect(self._on_video_qa_canceled)
             worker.error.connect(worker.deleteLater)
+            # * Mirror finished/canceled: quit the thread when the worker errors so the
+            # * QThread does not rely only on a queued main-thread slot ordering.
+            worker.error.connect(thread.quit)
             worker.finished.connect(thread.quit)
             worker.finished.connect(worker.deleteLater)
             worker.canceled.connect(thread.quit)
