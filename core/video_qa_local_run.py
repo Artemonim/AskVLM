@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import math
@@ -244,9 +243,15 @@ class VideoQAWhisperTranscriptProvider:
         )
         if self._pipeline_log:
             self._pipeline_log("✓ Stage: transcript_prepare complete")
+            self._pipeline_log("→ Initiating Whisper VRAM unload (safe=False)")
         # * Drop faster-whisper weights from VRAM before chunk VLM / LM HTTP work.
-        with contextlib.suppress(Exception):
+        try:
             self._whisper.unload(safe=False)
+            if self._pipeline_log:
+                self._pipeline_log("✓ Whisper VRAM unload finished")
+        except Exception as exc:
+            if self._pipeline_log:
+                self._pipeline_log(f"⚠ Whisper unload threw an exception: {exc}")
         return artifacts
 
 
@@ -893,12 +898,17 @@ class _ProgressFrameMaterializer:
             self._pipeline_log(
                 f"→ frame_select: {chunk.chunk_id} ({chunk_index}/{self._total_chunks})"
             )
-        frames = self._inner.materialize_frames(
-            chunk=chunk,
-            representative_timestamp=representative_timestamp,
-            manifest=manifest,
-            transcript=transcript,
-        )
+        try:
+            frames = self._inner.materialize_frames(
+                chunk=chunk,
+                representative_timestamp=representative_timestamp,
+                manifest=manifest,
+                transcript=transcript,
+            )
+        except Exception as exc:
+            if self._pipeline_log:
+                self._pipeline_log(f"⚠ frame_select failed for {chunk.chunk_id}: {exc}")
+            raise
         if self._pipeline_log:
             self._pipeline_log(
                 f"✓ Frames ready for {chunk.chunk_id} ({len(frames)} file(s))"
@@ -949,6 +959,8 @@ class _ProgressInferencer:
             f"ETA {_format_vlm_eta_seconds(eta_s)}"
         )
         self._progress(detail, min(0.93, base + per_chunk_span * 0.5))
+        if self._pipeline_log and done_before == 0:
+            self._pipeline_log("→ Stage: VLM inference (post pre-VLM)")
         if self._pipeline_log:
             self._pipeline_log(
                 f"→ llm_pass: {chunk.chunk_id} ({chunk_index}/{self._total_chunks})"

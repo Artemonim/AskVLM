@@ -132,11 +132,14 @@ class WhisperXWrapper:
         and alignment backend and triggers Python/torch memory cleanup to reduce
         the chance of VRAM fragmentation or OOM across sequential jobs.
         """
+        logger = logging.getLogger(__name__)
+        logger.debug("WhisperXWrapper.unload(safe=%s) starting", safe)
         try:
             # Drop references to heavy objects
             if getattr(self, "_model", None) is not None:
                 # Some backends may expose a close()/__del__ cleanup implicitly
                 with contextlib.suppress(Exception):
+                    logger.debug("Deleting self._model")
                     del self._model
             self._model = None
             self._align_model = None
@@ -151,8 +154,10 @@ class WhisperXWrapper:
                         and getattr(torch_mod, "cuda", None) is not None
                         and hasattr(torch_mod.cuda, "synchronize")
                     ):
+                        logger.debug("Calling torch.cuda.synchronize()")
                         torch_mod.cuda.synchronize()
             with contextlib.suppress(Exception):
+                logger.debug("Calling gc.collect()")
                 _gc.collect()
             if not safe:
                 with contextlib.suppress(Exception):
@@ -161,7 +166,9 @@ class WhisperXWrapper:
                         and torch_mod is not None
                         and getattr(torch_mod, "cuda", None) is not None
                     ):
+                        logger.debug("Calling torch.cuda.empty_cache()")
                         torch_mod.cuda.empty_cache()
+            logger.debug("WhisperXWrapper.unload() finished")
 
     def transcribe(
         self,
