@@ -24,14 +24,14 @@ def test_queue_real_good_and_fast(tmp_path: Path) -> None:
     # Ensure Qt app exists
     QApplication.instance() or QApplication([])
 
-    # Prepare real inputs by copying existing fixture under new names
-    fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
-    if not fixture.exists():
-        pytest.skip("fixture video missing")
+    # Prepare real inputs by copying the short fixture under distinct names
+    fixture = Path("tests/fixtures/test_video_short.mp4").resolve()
+    if not fixture.is_file():
+        pytest.skip("short fixture video missing")
 
     def make_copy(name: str) -> Path:
         dst = tmp_path / name
-        shutil.copy(fixture, dst)
+        shutil.copy2(fixture, dst)
         return dst
 
     inputs_good = [make_copy("first.mp4"), make_copy("short.mp4")]

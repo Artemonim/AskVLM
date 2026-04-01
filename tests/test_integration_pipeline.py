@@ -96,9 +96,9 @@ def test_cancel_responsiveness(
     tmp_path: Path, trigger_stage: int, step_name: str
 ) -> None:
     """Exercise cancel per stage; pytest IDs clarify failing step."""
-    fixture = Path("tests/fixtures/test_video_first.mp4").resolve()
-    if not fixture.exists():
-        return
+    fixture = Path("tests/fixtures/test_video_short.mp4").resolve()
+    if not fixture.is_file():
+        pytest.skip("fixture video missing")
 
     # Stage indices: 0=prepare_audio, 1=transcribe, 2=rest
     stage = {"value": -1}

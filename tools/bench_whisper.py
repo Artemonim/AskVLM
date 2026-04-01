@@ -24,7 +24,7 @@ def detect_vram_gb() -> float | None:
 
 
 def main() -> None:
-    input_path = Path("tests/fixtures/test_video_first.mp4")
+    input_path = Path("tests/fixtures/test_video_short.mp4")
     models = ["small", "medium", "large-v3"]
     device = "cuda"
     profile = "grid"  # baseline|high|extreme|grid

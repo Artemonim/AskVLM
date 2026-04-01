@@ -1,3 +1,4 @@
+import shutil as _sh
 import threading as _th
 import time as _t
 from pathlib import Path
@@ -27,6 +28,21 @@ class _StubPipeline:
         return doc
 
 
+def _short_fixture_copies(base: Path, group: str, names: tuple[str, ...]) -> list[Path]:
+    """Copy ``test_video_short.mp4`` to unique paths while preserving requested stems."""
+    src = Path("tests/fixtures/test_video_short.mp4").resolve()
+    if not src.is_file():
+        pytest.skip(f"Short fixture missing: {src}")
+    out: list[Path] = []
+    for i, filename in enumerate(names):
+        parent = base / group / f"item_{i}"
+        parent.mkdir(parents=True, exist_ok=True)
+        dst = parent / filename
+        _sh.copy2(src, dst)
+        out.append(dst)
+    return out
+
+
 def _make_options(quality: str) -> dict[str, object]:
     return {
         "export_format": "txt",
@@ -47,18 +63,19 @@ def test_queue_processing_good_and_fast(
     # Ensure Qt app exists (safe for repeated calls)
     QApplication.instance() or QApplication([])
 
-    # Prepare inputs by name (files need not exist for this test)
-    inputs_good: list[Path] = [
-        Path("tests/fixtures/test_video_first.mp4").resolve(),
-        Path("tests/fixtures/test_video_short.mp4").resolve(),
-    ]
-
-    inputs_fast: list[Path] = [
-        Path("tests/fixtures/test_video_first.mp4").resolve(),
-        Path("tests/fixtures/test_video_short.mp4").resolve(),
-        Path("tests/fixtures/test_video_second.mp4").resolve(),
-        Path("tests/fixtures/test_video_third.mp4").resolve(),
-    ]
+    inputs_good = _short_fixture_copies(
+        tmp_path, "good", ("test_video_first.mp4", "test_video_short.mp4")
+    )
+    inputs_fast = _short_fixture_copies(
+        tmp_path,
+        "fast",
+        (
+            "test_video_first.mp4",
+            "test_video_short.mp4",
+            "test_video_second.mp4",
+            "test_video_third.mp4",
+        ),
+    )
 
     # Monkeypatch durations used by the scheduler to control CPU heuristic
     def _fake_duration(p: Path) -> float:
@@ -100,12 +117,15 @@ def test_cancel_stops_scheduling(
     """Cancel flag prevents scheduling of new jobs; running job aborts promptly."""
     QApplication.instance() or QApplication([])
 
-    # Prepare three inputs (names only)
-    files = [
-        Path("tests/fixtures/test_video_first.mp4").resolve(),
-        Path("tests/fixtures/test_video_second.mp4").resolve(),
-        Path("tests/fixtures/test_video_third.mp4").resolve(),
-    ]
+    files = _short_fixture_copies(
+        tmp_path,
+        "cancel",
+        (
+            "test_video_first.mp4",
+            "test_video_second.mp4",
+            "test_video_third.mp4",
+        ),
+    )
 
     # Slow stub to simulate long-running process with cancel checks
     class _SlowCancelPipeline:

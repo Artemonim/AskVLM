@@ -1072,6 +1072,14 @@ def run_local_video_qa(  # noqa: PLR0913
         msg = "Video QA needs a resolved local file source."
         raise VideoQAPreflightBlockedError(msg)
 
+    logger.info(
+        "run_local_video_qa: enter media=%s output_dir=%s",
+        ctx.source.path,
+        params.output_dir,
+    )
+    if pipeline_log:
+        pipeline_log("→ Stage: run_local_video_qa (preflight + executor)")
+
     duration_s = float(get_media_duration_seconds(ctx.source.path))
     report, chunk_plan = preflight_local_video_qa(
         ctx,
@@ -1080,12 +1088,22 @@ def run_local_video_qa(  # noqa: PLR0913
         frame_sample_fps=params.frame_sample_fps,
     )
     ensure_local_video_qa_run_allowed(report, chunk_plan)
+    logger.info(
+        "run_local_video_qa: preflight_ok chunks=%d duration_s=%.4f",
+        len(chunk_plan),
+        duration_s,
+    )
     if pipeline_log:
         pipeline_log(f"✓ Preflight OK — {len(chunk_plan)} chunk(s) planned.")
 
     manifest = build_video_qa_preparation_manifest(ctx)
     staging_dir = params.output_dir / "_video_qa_work" / manifest.run_id
     staging_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "run_local_video_qa: manifest run_id=%s staging_dir=%s",
+        manifest.run_id,
+        staging_dir,
+    )
 
     if pipeline_log:
         pipeline_log("=== Video QA · progress log ===")
@@ -1130,6 +1148,12 @@ def run_local_video_qa(  # noqa: PLR0913
             pipeline_log=pipeline_log,
         )
 
+    logger.info(
+        "run_local_video_qa: calling run_video_qa_executor run_id=%s", manifest.run_id
+    )
+    if pipeline_log:
+        pipeline_log("→ Stage: executor (transcript → chunks → synthesis)")
+
     outcome = run_video_qa_executor(
         context=ctx,
         manifest=manifest,
@@ -1145,6 +1169,11 @@ def run_local_video_qa(  # noqa: PLR0913
     answer_path = answer_bundle_path_for_manifest(manifest_path)
     save_answer_bundle_to_json(answer_path, outcome.answer_bundle)
 
+    logger.info(
+        "run_local_video_qa: completed run_id=%s manifest_status=%s",
+        final_manifest.run_id,
+        final_manifest.status,
+    )
     if progress:
         progress("Completed", 1.0)
     if pipeline_log:

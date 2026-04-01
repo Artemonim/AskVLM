@@ -165,6 +165,7 @@ bandit-report.json
 *.wav
 *.mp3
 *.mp4
+!tests/fixtures/test_video_short.mp4
 *.avi
 *.mkv
 *.flac

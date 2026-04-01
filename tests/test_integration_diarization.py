@@ -20,7 +20,7 @@ def test_diarization_real_file(
 ) -> None:
     """Test that diarization works on a real file using pyannote 3.0.
 
-    Uses short_audio_fixture (10s) and shared pipeline to speed up test.
+    Uses short_audio_fixture (committed short clip) and shared pipeline to speed up test.
     """
     # * HF_TOKEN is loaded by conftest.py from .env
 

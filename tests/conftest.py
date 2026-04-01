@@ -1,3 +1,4 @@
+import shutil
 import sys
 from pathlib import Path
 
@@ -16,33 +17,15 @@ load_env_file(project_root / ".env")
 
 @pytest.fixture(scope="session")
 def short_audio_fixture(tmp_path_factory: pytest.TempPathFactory) -> Path:
-    """Create a 10s audio clip from test_video_first.mp4 for faster tests.
+    """Session-scoped copy of the committed short mp4 for fast, deterministic tests."""
+    fixture_path = project_root / "tests/fixtures/test_video_short.mp4"
 
-    Returns path to the shortened video file.
-    """
-    fixture_path = project_root / "tests/fixtures/test_video_first.mp4"
-
-    if not fixture_path.exists():
+    if not fixture_path.is_file():
         pytest.skip(f"Fixture not found: {fixture_path}")
 
-    # Create a session-scoped temp dir
     out_dir = tmp_path_factory.mktemp("short_audio")
     output_path = out_dir / "short_test_video.mp4"
-
-    # Extract 10s clip using ffmpeg-python
-    # We import locally to avoid top-level side effects
-    import ffmpeg  # noqa: PLC0415
-
-    try:
-        (
-            ffmpeg.input(str(fixture_path), t=10)
-            .output(str(output_path), c="copy")
-            .overwrite_output()
-            .run(quiet=True)
-        )
-    except Exception as e:  # noqa: BLE001
-        pytest.skip(f"Failed to create short audio fixture: {e}")
-
+    shutil.copy2(fixture_path, output_path)
     return output_path
 
 

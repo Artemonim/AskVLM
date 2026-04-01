@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -9,6 +9,7 @@ import pytest
 from core.video_qa_answer_bundle import (
     ANSWER_BUNDLE_SCHEMA_VERSION,
     VideoQAAnswerBundle,
+    answer_bundle_path_for_manifest,
 )
 from core.video_qa_context import normalize_video_qa_context
 from core.video_qa_executor import (
@@ -36,8 +37,9 @@ from core.video_qa_manifest import VideoQAChunkRecord, VideoQARunManifest
 from core.video_qa_orchestration import VideoQAPlannedChunk, VideoQAPreflightReport
 from core.video_qa_sources import LocalFileProvider
 
-if TYPE_CHECKING:
-    from pathlib import Path
+_FIXTURE_SHORT_MP4 = (
+    Path(__file__).resolve().parent / "fixtures" / "test_video_short.mp4"
+)
 
 
 def test_ensure_local_run_blocked_when_budget_does_not_fit() -> None:
@@ -324,6 +326,118 @@ def test_run_local_video_qa_with_injected_stack(
     manifest_path = tmp_path / f"{outcome.manifest.run_id}.manifest.json"
     assert manifest_path.is_file()
     assert "seen" in outcome.answer_bundle.answer
+
+
+def test_run_local_video_qa_pipeline_smoke_short_fixture_media(
+    tmp_path: Path,
+) -> None:
+    """E2E smoke: committed short mp4 drives preflight; heavy steps are mocked."""
+    assert _FIXTURE_SHORT_MP4.is_file(), (
+        "tests/fixtures/test_video_short.mp4 must exist"
+    )
+    source = LocalFileProvider().resolve(_FIXTURE_SHORT_MP4)
+    ctx = normalize_video_qa_context(
+        source=source,
+        question="Smoke test question?",
+        attachments=(),
+    )
+
+    class _FixedTranscript(VideoQATranscriptProvider):
+        def prepare_transcript(
+            self, c: object, m: object
+        ) -> VideoQATranscriptArtifacts:
+            _ = (c, m)
+            return VideoQATranscriptArtifacts(
+                "fixture smoke transcript",
+                segments=((0.0, 2.0, "fixture smoke transcript"),),
+            )
+
+    class _FixedFrames(VideoQAFrameMaterializer):
+        def materialize_frames(
+            self,
+            *,
+            chunk: VideoQAChunkRecord,
+            representative_timestamp: float,
+            manifest: VideoQARunManifest,
+            transcript: VideoQATranscriptArtifacts,
+        ) -> tuple[str, ...]:
+            _ = (representative_timestamp, manifest, transcript)
+            p = tmp_path / f"{chunk.chunk_id}.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n")
+            return (str(p),)
+
+    class _FixedInferencer(VideoQAChunkInferencer):
+        def infer_chunk(
+            self,
+            *,
+            chunk: VideoQAChunkRecord,
+            frames: tuple[str, ...],
+            transcript: VideoQATranscriptArtifacts,
+            manifest: VideoQARunManifest,
+        ) -> VideoQAChunkInferenceOutcome:
+            _ = (chunk, frames, transcript, manifest)
+            pl = {
+                "chunk_summary": "fixture_chunk_ok",
+                "observations": [],
+                "confidence": "high",
+            }
+            return VideoQAChunkInferenceOutcome(
+                ok=True,
+                artifacts=(json.dumps(pl, sort_keys=True),),
+            )
+
+    class _FixedAggregator:
+        def aggregate(
+            self,
+            *,
+            context: object,
+            manifest: VideoQARunManifest,
+            transcript: VideoQATranscriptArtifacts,
+            chunk_results: object,
+        ) -> VideoQAAnswerBundle:
+            _ = (context, transcript, chunk_results)
+            return VideoQAAnswerBundle(
+                schema_version=ANSWER_BUNDLE_SCHEMA_VERSION,
+                run_id=f"{manifest.run_id}-answer",
+                created_at=manifest.created_at,
+                question="Smoke test question?",
+                answer="fixture smoke ok",
+                evidence=(),
+                is_uncertain=False,
+                manifest_run_id=manifest.run_id,
+                uncertainty_note=None,
+            )
+
+    whisper = MagicMock()
+    lm = VideoQALMHttpTarget("http://127.0.0.1:9/v1", "fake-model")
+    params = VideoQALocalRunParams(
+        context=ctx,
+        output_dir=tmp_path,
+        context_window_tokens=200_000,
+        chunk_lm=lm,
+        final_lm=lm,
+    )
+    outcome = run_local_video_qa(
+        params=params,
+        whisper=whisper,
+        transcript_override=_FixedTranscript(),
+        frame_override=_FixedFrames(),
+        chunk_inferencer_override=_FixedInferencer(),
+        aggregator_override=_FixedAggregator(),
+    )
+    assert outcome.manifest.status == "completed"
+    assert "transcript_prepare" in outcome.stage_sequence
+    assert "answer_aggregate" in outcome.stage_sequence
+    manifest_path = tmp_path / f"{outcome.manifest.run_id}.manifest.json"
+    assert manifest_path.is_file()
+    answer_path = answer_bundle_path_for_manifest(manifest_path)
+    assert answer_path.is_file()
+    manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest_obj.get("status") == "completed"
+    assert isinstance(manifest_obj.get("chunks"), list)
+    answer_obj = json.loads(answer_path.read_text(encoding="utf-8"))
+    assert isinstance(answer_obj.get("answer"), str)
+    assert answer_obj.get("schema_version") == ANSWER_BUNDLE_SCHEMA_VERSION
 
 
 def test_whisper_transcript_provider_unloads_after_transcribe(

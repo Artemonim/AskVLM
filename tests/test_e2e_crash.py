@@ -1,4 +1,5 @@
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -13,15 +14,17 @@ from pytestqt.qtbot import QtBot
 from gui.main_window import MainWindow
 
 
-def _select_inputs(fixtures_dir: Path, num_videos: int) -> list[Path]:
-    sources = [
-        fixtures_dir / "test_video_first.mp4",
-        fixtures_dir / "test_video_second.mp4",
-    ]
-    available = [path for path in sources if path.exists()]
-    if not available:
-        pytest.skip("Fixtures not found")
-    return [available[index % len(available)] for index in range(num_videos)]
+def _select_inputs(tmp_path: Path, fixtures_dir: Path, num_videos: int) -> list[Path]:
+    short = fixtures_dir / "test_video_short.mp4"
+    if not short.is_file():
+        pytest.skip("Short fixture not found")
+    inputs: list[Path] = []
+    for index in range(num_videos):
+        copy_path = tmp_path / "e2e_inputs" / f"input_{index}.mp4"
+        copy_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(short, copy_path)
+        inputs.append(copy_path)
+    return inputs
 
 
 def _create_window(
@@ -98,7 +101,7 @@ def test_e2e_crash_scenarios(
     monkeypatch.setattr("gui.main_window.QSettings", MockSettings)
 
     fixtures_dir = Path(__file__).parent / "fixtures"
-    inputs = _select_inputs(fixtures_dir, num_videos)
+    inputs = _select_inputs(tmp_path, fixtures_dir, num_videos)
 
     out_dir = tmp_path / f"e2e_out_{quality}_{num_videos}_{strategy}"
     out_dir.mkdir()

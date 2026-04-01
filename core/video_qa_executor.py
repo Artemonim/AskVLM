@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final, Literal, Protocol, runtime_checkable
 
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     )
 
 ChunkExecutionStatus = Literal["skipped_completed", "completed", "failed"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -193,7 +196,7 @@ def _raise_if_user_cancelled(should_cancel: Callable[[], bool] | None) -> None:
         raise CancelledError(msg)
 
 
-def run_video_qa_executor(
+def run_video_qa_executor(  # noqa: C901, PLR0915
     *,
     context: VideoQAContextBundle,
     manifest: VideoQARunManifest,
@@ -228,24 +231,35 @@ def run_video_qa_executor(
     """
     rep = representative_frame_policy or default_representative_frame_policy()
     stages: list[str] = []
+    run_id = manifest.run_id
+    logger.info(
+        "video_qa_executor: enter run_id=%s planned_chunks=%d",
+        run_id,
+        len(planned_chunks),
+    )
 
     working = replace(manifest, status="running", error=None)
 
     stages.append("source_resolve")
+    logger.info("video_qa_executor: stage source_resolve run_id=%s", run_id)
     if deps.source_resolver is not None:
         working = deps.source_resolver.resolve_source(context, working)
 
     # * Matches graph ``attachment_prepare``: bundle is already normalized before run.
     stages.append("attachment_prepare")
+    logger.info("video_qa_executor: stage attachment_prepare run_id=%s", run_id)
 
     stages.append("transcript_prepare")
+    logger.info("video_qa_executor: stage transcript_prepare run_id=%s", run_id)
     transcript = deps.transcript.prepare_transcript(context, working)
 
     stages.append("chunk_plan")
+    logger.info("video_qa_executor: stage chunk_plan run_id=%s", run_id)
     working = merge_planned_chunks_into_manifest(working, planned_chunks)
 
     chunk_results: list[VideoQAChunkExecutionResult] = []
     planned_ids = [chunk.chunk_id for chunk in planned_chunks]
+    first_active_chunk_logged = False
 
     for chunk_id in planned_ids:
         _raise_if_user_cancelled(should_cancel)
@@ -270,12 +284,26 @@ def run_video_qa_executor(
 
         rep_ts = rep.timestamp_for_span(record.t_start, record.t_end)
         stages.append(f"frame_select:{chunk_id}")
+        if not first_active_chunk_logged:
+            logger.info(
+                "video_qa_executor: first_frame_extraction chunk_id=%s run_id=%s",
+                chunk_id,
+                run_id,
+            )
         frames = deps.frame_materializer.materialize_frames(
             chunk=record,
             representative_timestamp=rep_ts,
             manifest=working,
             transcript=transcript,
         )
+        if not first_active_chunk_logged:
+            logger.info(
+                "video_qa_executor: first_frame_extraction_done chunk_id=%s "
+                "frame_count=%d run_id=%s",
+                chunk_id,
+                len(frames),
+                run_id,
+            )
 
         _raise_if_user_cancelled(should_cancel)
 
@@ -290,12 +318,27 @@ def run_video_qa_executor(
         stages.append(f"llm_pass:{chunk_id}")
         current = next(c for c in working.chunks if c.chunk_id == chunk_id)
         attempts = int(current.attempts) + 1
+        if not first_active_chunk_logged:
+            logger.info(
+                "video_qa_executor: first_chunk_inference chunk_id=%s run_id=%s",
+                chunk_id,
+                run_id,
+            )
         outcome = deps.chunk_inferencer.infer_chunk(
             chunk=current,
             frames=frames,
             transcript=transcript,
             manifest=working,
         )
+        if not first_active_chunk_logged:
+            logger.info(
+                "video_qa_executor: first_chunk_inference_done chunk_id=%s ok=%s "
+                "run_id=%s",
+                chunk_id,
+                outcome.ok,
+                run_id,
+            )
+            first_active_chunk_logged = True
 
         if outcome.ok:
             merged_artifacts = tuple(
@@ -357,6 +400,7 @@ def run_video_qa_executor(
         deps.before_answer_aggregate()
 
     stages.append("answer_aggregate")
+    logger.info("video_qa_executor: stage answer_aggregate run_id=%s", run_id)
     answer_bundle = deps.answer_aggregator.aggregate(
         context=context,
         manifest=working,
@@ -366,6 +410,11 @@ def run_video_qa_executor(
 
     run_status, run_error = _run_status_from_chunk_results(chunk_results)
     final_manifest = replace(working, status=run_status, error=run_error)
+    logger.info(
+        "video_qa_executor: exit run_id=%s manifest_status=%s",
+        run_id,
+        run_status,
+    )
     return VideoQAExecutorRunOutcome(
         transcript=transcript,
         answer_bundle=answer_bundle,

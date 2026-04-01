@@ -1,10 +1,12 @@
-"""Background QObject worker for local Video QA (ASR + ffmpeg + LM Studio + aggregate)."""
+"""QObject worker: local Video QA (ASR, ffmpeg frames, LM Studio, aggregate)."""
 
 from __future__ import annotations
 
+import logging
+import traceback
 from typing import TYPE_CHECKING
 
-from PySide6.QtCore import QObject, Signal
+from PySide6.QtCore import QObject, Signal, Slot
 
 from core.pipelines import CancelledError
 from core.video_qa_local_run import (
@@ -21,6 +23,8 @@ if TYPE_CHECKING:
         VideoQALMHttpTarget,
     )
     from core.whisperx_wrapper import WhisperXWrapper
+
+logger = logging.getLogger(__name__)
 
 
 class VideoQALocalRunWorker(QObject):
@@ -59,6 +63,7 @@ class VideoQALocalRunWorker(QObject):
         """Request cooperative cancellation (checked during ASR and between chunks)."""
         self._cancel = True
 
+    @Slot()
     def run(self) -> None:
         """Execute the Video QA pipeline and emit the outcome or an error signal."""
 
@@ -68,6 +73,8 @@ class VideoQALocalRunWorker(QObject):
         def _pipeline_log(line: str) -> None:
             self.pipeline_log_line.emit(line)
 
+        logger.info("Video QA worker thread run() started")
+        _pipeline_log("→ Stage: worker_thread (run_local_video_qa)")
         try:
             outcome = run_local_video_qa(
                 params=self._params,
@@ -85,6 +92,12 @@ class VideoQALocalRunWorker(QObject):
             if str(exc) == "Canceled":
                 self.canceled.emit()
             else:
+                tb = traceback.format_exc()
+                logger.exception("Video QA RuntimeError (non-cancel)")
+                _pipeline_log(tb)
                 self.error.emit(str(exc))
-        except Exception as exc:  # noqa: BLE001
-            self.error.emit(str(exc))
+        except Exception as exc:
+            tb = traceback.format_exc()
+            logger.exception("Video QA worker failed before normal completion")
+            _pipeline_log(tb)
+            self.error.emit(f"{exc!s}\n(see progress log above for traceback)")

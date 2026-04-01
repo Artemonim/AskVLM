@@ -65,10 +65,10 @@ def test_extract_frames_for_span_returns_multiple_files(
 
 
 def test_get_media_duration_real(short_audio_fixture: Path) -> None:
-    """get_media_duration_seconds returns approx 10s for the fixture."""
+    """get_media_duration_seconds returns approx 16s for the short fixture."""
     dur = ffm.get_media_duration_seconds(short_audio_fixture)
-    # The fixture is created with -t 10, so it should be close to 10s
-    assert 9.0 <= dur <= 11.0
+    # The committed short fixture is about 16 seconds long.
+    assert 15.0 <= dur <= 17.5
 
 
 def test_start_burn_process_returns_popen(

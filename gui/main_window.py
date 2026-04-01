@@ -850,6 +850,8 @@ class MainWindow(QMainWindow):
 
     def _on_video_qa_run_requested(self) -> None:
         """Validate preflight and start the Video QA background worker."""
+        vq_log = get_logger(__name__)
+        vq_log.info("Video QA: run requested (preflight path)")
         if self._thread is not None and self._thread.isRunning():
             QMessageBox.information(
                 self,
@@ -885,8 +887,13 @@ class MainWindow(QMainWindow):
         try:
             ensure_local_video_qa_run_allowed(report, chunk_plan)
         except VideoQAPreflightBlockedError as exc:
+            vq_log.info("Video QA: preflight blocked — %s", exc)
             QMessageBox.warning(self, "Video QA", str(exc))
             return
+        vq_log.info(
+            "Video QA: preflight passed (chunks=%d), starting worker",
+            len(chunk_plan),
+        )
         self._start_video_qa_worker(ctx, out_dir)
 
     def _on_video_qa_cancel_requested(self) -> None:
@@ -906,43 +913,65 @@ class MainWindow(QMainWindow):
         out_dir: Path,
     ) -> None:
         """Spin up :class:`VideoQALocalRunWorker` on a dedicated thread."""
-        self._apply_quality_to_pipeline(force_reload=False)
-        self._video_qa_thread = QThread(self)
-        lm = self.video_qa_panel.lm_runtime_settings_pair()
-        self._video_qa_worker = VideoQALocalRunWorker(
-            context=ctx,
-            output_dir=out_dir,
-            context_window_tokens=self.video_qa_panel.context_window_tokens(),
-            frame_sample_fps=self.video_qa_panel.frame_sample_fps(),
-            whisper=self.pipeline.whisperx,
-            chunk_lm=lm.chunk,
-            final_lm=lm.final_answer,
-        )
-        self._video_qa_worker.moveToThread(self._video_qa_thread)
-        self._video_qa_thread.started.connect(self._video_qa_worker.run)
-        self._video_qa_worker.progress.connect(self.on_progress)
-        self._video_qa_worker.pipeline_log_line.connect(
-            self.video_qa_panel.append_progress_log_line
-        )
-        self._video_qa_worker.finished.connect(self._on_video_qa_finished)
-        self._video_qa_worker.error.connect(self._on_video_qa_error)
-        self._video_qa_worker.canceled.connect(self._on_video_qa_canceled)
-        self._video_qa_worker.error.connect(self._video_qa_worker.deleteLater)
-        self._video_qa_worker.finished.connect(self._video_qa_thread.quit)
-        self._video_qa_worker.finished.connect(self._video_qa_worker.deleteLater)
-        self._video_qa_worker.canceled.connect(self._video_qa_thread.quit)
-        self._video_qa_worker.canceled.connect(self._video_qa_worker.deleteLater)
-        self._video_qa_thread.finished.connect(self._on_video_qa_worker_thread_finished)
-        self._video_qa_thread.finished.connect(self._video_qa_thread.deleteLater)
-        self.btn_start.setEnabled(False)
-        self.video_qa_panel.btn_run_qa.setEnabled(False)
-        self.btn_cancel.setEnabled(False)
-        self.video_qa_panel.btn_cancel_qa.setEnabled(True)
-        self.progress.setMaximum(200)
-        self.progress.setValue(0)
-        self.video_qa_panel.clear_progress_log()
-        self.status.showMessage("Video QA…")
-        self._video_qa_thread.start()
+        vq_log = get_logger(__name__)
+        thread: QThread | None = None
+        worker: VideoQALocalRunWorker | None = None
+        try:
+            self._apply_quality_to_pipeline(force_reload=False)
+            thread = QThread(self)
+            lm = self.video_qa_panel.lm_runtime_settings_pair()
+            worker = VideoQALocalRunWorker(
+                context=ctx,
+                output_dir=out_dir,
+                context_window_tokens=self.video_qa_panel.context_window_tokens(),
+                frame_sample_fps=self.video_qa_panel.frame_sample_fps(),
+                whisper=self.pipeline.whisperx,
+                chunk_lm=lm.chunk,
+                final_lm=lm.final_answer,
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            worker.progress.connect(self.on_progress)
+            worker.pipeline_log_line.connect(
+                self.video_qa_panel.append_progress_log_line
+            )
+            worker.finished.connect(self._on_video_qa_finished)
+            worker.error.connect(self._on_video_qa_error)
+            worker.canceled.connect(self._on_video_qa_canceled)
+            worker.error.connect(worker.deleteLater)
+            worker.finished.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            worker.canceled.connect(thread.quit)
+            worker.canceled.connect(worker.deleteLater)
+            thread.finished.connect(self._on_video_qa_worker_thread_finished)
+            thread.finished.connect(thread.deleteLater)
+            self._video_qa_thread = thread
+            self._video_qa_worker = worker
+            self.btn_start.setEnabled(False)
+            self.video_qa_panel.btn_run_qa.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+            self.video_qa_panel.btn_cancel_qa.setEnabled(True)
+            self.progress.setMaximum(200)
+            self.progress.setValue(0)
+            self.video_qa_panel.clear_progress_log()
+            self.status.showMessage("Video QA…")
+            vq_log.info("Video QA: worker thread starting (out_dir=%s)", out_dir)
+            thread.start()
+        except Exception as exc:  # noqa: BLE001
+            vq_log.exception("Video QA: failed to start worker thread")
+            self._video_qa_worker = None
+            self._video_qa_thread = None
+            if worker is not None:
+                worker.deleteLater()
+            if thread is not None:
+                thread.deleteLater()
+            if self._can_show_modal():
+                QMessageBox.critical(
+                    self,
+                    "Video QA",
+                    f"Could not start Video QA. See the log for details.\n\n{exc!s}",
+                )
+            self._re_enable_after_video_qa()
 
     def _on_video_qa_finished(self, outcome: object) -> None:
         """Populate answer/evidence from a successful Video QA run."""
@@ -1558,6 +1587,7 @@ class MainWindow(QMainWindow):
                     s.value("videoqa/lm_final_cloud_model_text", "")
                 ),
             )
+        get_logger(__name__).debug("Video QA: settings restore finished")
 
     # * Settings persistence
     def _load_settings(self) -> None:

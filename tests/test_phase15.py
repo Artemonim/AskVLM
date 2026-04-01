@@ -1,6 +1,7 @@
 from collections.abc import Callable
 from pathlib import Path
 
+import pytest
 from PySide6.QtWidgets import QApplication
 
 from core.diarization import DiarizationPipeline
@@ -36,10 +37,9 @@ def test_processing_fixture_twice_produces_two_tabs(tmp_path: Path) -> None:
 
     Heavy ML is not required: the pipeline is stubbed to return simple text.
     """
-    fixture = Path("tests/fixtures/test_video_first.mp4")
-    if not fixture.exists():
-        # Skip gracefully if fixture is not available in this environment
-        return
+    fixture = Path("tests/fixtures/test_video_short.mp4")
+    if not fixture.is_file():
+        pytest.skip("fixture video missing")
 
     # Minimal QApplication for widgets
     QApplication.instance() or QApplication([])
