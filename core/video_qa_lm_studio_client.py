@@ -80,6 +80,8 @@ def _build_payload(
     temperature: float = 0.0,
     *,
     should_cancel: Callable[[], bool] | None = None,
+    reasoning_effort: str | None = None,
+    reasoning: str | None = None,
 ) -> dict[str, Any]:
     """Build the request payload for the chat completion endpoint."""
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -105,6 +107,14 @@ def _build_payload(
                 "schema": json_schema,
             },
         }
+
+    if reasoning_effort is not None:
+        payload["reasoning_effort"] = reasoning_effort
+
+    # * LM Studio extension (see /api/v1/chat); OpenAI /v1/chat/completions may accept it too.
+    # * Qwen A3B reports only ``on``/``off`` — use ``reasoning="off"`` instead of ``reasoning_effort``.
+    if reasoning is not None:
+        payload["reasoning"] = reasoning
 
     return payload
 
@@ -293,6 +303,8 @@ def request_chat_completion(  # noqa: C901, PLR0913
     *,
     should_cancel: Callable[[], bool] | None = None,
     authorization_bearer: str | None = None,
+    reasoning_effort: str | None = None,
+    reasoning: str | None = None,
 ) -> LMStudioResponse:
     """Send a multimodal chat completion request to LM Studio.
 
@@ -304,6 +316,12 @@ def request_chat_completion(  # noqa: C901, PLR0913
 
     When ``should_cancel`` is set, the client polls it while the HTTP call runs and
     closes the socket to stop waiting on LM Studio prefill/inference.
+
+    When ``reasoning_effort`` is set (e.g. OpenAI o-series), it is sent as
+    ``reasoning_effort``. For LM Studio models that only support a boolean-style
+    toggle (e.g. Qwen 3.5 A3B: ``on``/``off``), set ``reasoning`` to ``"off"``
+    or ``"on"`` instead; ``reasoning_effort`` values like ``"minimal"`` may be
+    ignored or mapped incorrectly on those stacks.
     """
     normalized_image_paths = tuple(Path(path) for path in (image_paths or ()))
     url = f"{base_url.rstrip('/')}/chat/completions"
@@ -322,6 +340,8 @@ def request_chat_completion(  # noqa: C901, PLR0913
             model,
             temperature,
             should_cancel=should_cancel,
+            reasoning_effort=reasoning_effort,
+            reasoning=reasoning,
         )
         data = json.dumps(payload).encode("utf-8")
         if should_cancel and should_cancel():

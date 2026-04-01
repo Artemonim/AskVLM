@@ -52,6 +52,25 @@ def test_build_payload_json_schema() -> None:
     assert payload["response_format"]["json_schema"]["schema"] == schema
 
 
+def test_build_payload_reasoning_effort() -> None:
+    """OpenAI-style ``reasoning_effort`` is forwarded when set."""
+    payload = _build_payload("Hello", [], None, reasoning_effort="minimal")
+    assert payload["reasoning_effort"] == "minimal"
+
+
+def test_build_payload_omits_reasoning_effort_when_unset() -> None:
+    """Default payload does not include ``reasoning_effort``."""
+    payload = _build_payload("Hello", [], None)
+    assert "reasoning_effort" not in payload
+    assert "reasoning" not in payload
+
+
+def test_build_payload_lm_studio_reasoning() -> None:
+    """LM Studio-style ``reasoning`` (e.g. ``off`` / ``on``) is forwarded when set."""
+    payload = _build_payload("Hello", [], None, reasoning="off")
+    assert payload["reasoning"] == "off"
+
+
 @patch("core.video_qa_lm_studio_client.urllib.request.urlopen")
 def test_request_chat_completion_success(mock_urlopen: MagicMock) -> None:
     """Test a successful request without fallback."""

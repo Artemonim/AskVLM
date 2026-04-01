@@ -41,6 +41,9 @@ def linting_path() -> str:
 
 LINTING_PATH = linting_path()
 
+# * subprocess.run wall-clock cap (seconds) per tool step.
+# * On timeout: machine may be too slow, tests may need optimization, or raise this cap (see _run hint).
+_SUBPROCESS_TIMEOUT_DEFAULT_S = 600
 
 TOOLS: Dict[str, Dict[str, Any]] = {
     "ruff-format": {
@@ -209,7 +212,13 @@ class LocalCI:
             self._log(f"Build finished at {time.strftime('%Y-%m-%d %H:%M:%S')}")
             self.log_file.close()
 
-    def _run(self, cmd: List[str], heartbeat_label: Optional[str] = None) -> Tuple[int, str, str]:
+    def _run(
+        self,
+        cmd: List[str],
+        heartbeat_label: Optional[str] = None,
+        *,
+        timeout_s: int = _SUBPROCESS_TIMEOUT_DEFAULT_S,
+    ) -> Tuple[int, str, str]:
         # * Heartbeat prints keep the console "alive" during long quiet commands
         #   (e.g. pytest -q), while still capturing stdout/stderr for build.log.
         stop_event = threading.Event()
@@ -243,10 +252,15 @@ class LocalCI:
             if self.verbose and not self.json_output:
                 self._print(f"* Running: {' '.join(cmd)}")
             shell = os.name == "nt" and cmd[0] in {"npx", "npm"}
-            p = subprocess.run(cmd, capture_output=True, text=True, shell=shell, timeout=600)
+            p = subprocess.run(cmd, capture_output=True, text=True, shell=shell, timeout=timeout_s)
             return p.returncode, p.stdout, p.stderr
         except subprocess.TimeoutExpired:
-            return 124, "", "Command timed out"
+            hint = (
+                "Command timed out (subprocess wall-clock cap exceeded). "
+                "If this was pytest or another heavy step: hardware may be too slow, "
+                "tests may need optimization, or increase _SUBPROCESS_TIMEOUT_DEFAULT_S in build.py."
+            )
+            return 124, "", hint
         except FileNotFoundError:
             return 127, "", f"Command not found: {cmd[0]}"
         except Exception as e:

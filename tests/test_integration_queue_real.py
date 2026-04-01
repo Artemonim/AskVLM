@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import shutil
 from pathlib import Path
 
@@ -68,6 +69,13 @@ def test_queue_real_good_and_fast(tmp_path: Path) -> None:
     w_good.error.connect(lambda m: errs.append(str(m)))
     w_good.run()
     assert not errs, f"Errors in real GOOD queue: {errs}"
+
+    # * Fast mode runs two CUDA jobs with cloned small models; release large-v3 first to avoid OOM.
+    with contextlib.suppress(Exception):
+        wx_good = getattr(pipeline_good, "whisperx", None)
+        unload_good = getattr(wx_good, "unload", None)
+        if callable(unload_good):
+            unload_good(safe=True)
 
     # Fast mode on small model
     pipeline_fast = LocalPipeline(
