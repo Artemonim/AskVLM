@@ -99,6 +99,14 @@ FINAL_SYNTHESIS_INSTRUCTION: Final[str] = (
     "analysis steps, or chain-of-thought."
 )
 
+DIRECT_WHOLE_VIDEO_FINAL_INSTRUCTION: Final[str] = (
+    "Answer the user's question using the attached video frames (sampled across the "
+    "whole timeline) and the full transcript below. Ground every claim in visible "
+    "evidence and transcript quotes; set uncertainty when the evidence is weak or "
+    "incomplete. Return strictly JSON that matches the provided schema. Do not "
+    "expose internal chain-of-thought."
+)
+
 FINAL_SYNTHESIS_JSON_SCHEMA: Final[dict[str, object]] = {
     "type": "object",
     "additionalProperties": False,
@@ -172,14 +180,41 @@ def build_final_synthesis_prompt(
     return "\n\n".join(prompt_parts)
 
 
+def build_direct_whole_video_final_prompt(
+    context: VideoQAContextBundle,
+    *,
+    transcript_body: str,
+    chunk_id: str,
+    chunk_time_span: tuple[float, float],
+    frame_paths: Iterable[str],
+) -> str:
+    """Build the final solver prompt for one-shot whole-video multimodal QA."""
+    prompt_parts = [DIRECT_WHOLE_VIDEO_FINAL_INSTRUCTION]
+    normalized_frames = tuple(str(p).strip() for p in frame_paths if str(p).strip())
+    context_block = context.render_prompt_block(
+        chunk_id=chunk_id,
+        chunk_time_span=chunk_time_span,
+        transcript_summary=None,
+        frame_refs=normalized_frames,
+    )
+    if context_block:
+        prompt_parts.append(f"Context:\n{context_block}")
+    body = str(transcript_body or "").strip()
+    if body:
+        prompt_parts.append(f"Full transcript:\n{body}")
+    return "\n\n".join(prompt_parts)
+
+
 __all__ = [
     "CHUNK_ANALYSIS_INSTRUCTION",
     "CHUNK_ANALYSIS_JSON_SCHEMA",
+    "DIRECT_WHOLE_VIDEO_FINAL_INSTRUCTION",
     "FINAL_SYNTHESIS_INSTRUCTION",
     "FINAL_SYNTHESIS_JSON_SCHEMA",
     "TEXT_FORMATTING_INSTRUCTION",
     "VideoQAChunkSynthesisInput",
     "build_chunk_analysis_prompt",
+    "build_direct_whole_video_final_prompt",
     "build_final_synthesis_prompt",
     "build_text_formatting_prompt",
 ]

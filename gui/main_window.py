@@ -64,6 +64,8 @@ from core.ffmpeg import (
 from core.pipelines import CancelledError, LocalPipeline
 from core.video_qa_executor import VideoQAExecutorRunOutcome
 from core.video_qa_local_run import (
+    VIDEO_QA_RUN_MODE_VLM_ONLY,
+    VIDEO_QA_RUN_MODE_WHISPER_VLM,
     VideoQAPreflightBlockedError,
     ensure_local_video_qa_run_allowed,
     map_video_qa_progress_frac_to_200,
@@ -888,6 +890,7 @@ class MainWindow(QMainWindow):
             duration_seconds=duration_s,
             context_window_tokens=self.video_qa_panel.context_window_tokens(),
             frame_sample_fps=self.video_qa_panel.frame_sample_fps(),
+            video_chunking_enabled=self.video_qa_panel.video_chunking_enabled(),
         )
         try:
             ensure_local_video_qa_run_allowed(report, chunk_plan)
@@ -934,6 +937,8 @@ class MainWindow(QMainWindow):
                 whisper=self.pipeline.whisperx,
                 chunk_lm=lm.chunk,
                 final_lm=lm.final_answer,
+                video_qa_mode=self.video_qa_panel.video_qa_run_mode(),
+                video_chunking_enabled=self.video_qa_panel.video_chunking_enabled(),
             )
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
@@ -1523,6 +1528,22 @@ class MainWindow(QMainWindow):
         )
         return worker_stopped and burn_stopped and vq_stopped
 
+    def _restore_video_qa_run_mode_and_chunking(self, s: QSettings) -> None:
+        """Restore Video QA pipeline mode and chunking checkbox from settings."""
+        mode_raw = str(
+            s.value("videoqa/run_mode", VIDEO_QA_RUN_MODE_WHISPER_VLM)
+        ).strip()
+        if mode_raw == VIDEO_QA_RUN_MODE_VLM_ONLY:
+            self.video_qa_panel.set_video_qa_run_mode(VIDEO_QA_RUN_MODE_VLM_ONLY)
+        else:
+            self.video_qa_panel.set_video_qa_run_mode(VIDEO_QA_RUN_MODE_WHISPER_VLM)
+        chunking_val = s.value("videoqa/chunking_enabled", defaultValue=True, type=bool)
+        if isinstance(chunking_val, bool):
+            chunking_on = chunking_val
+        else:
+            chunking_on = str(chunking_val).strip().lower() in ("1", "true", "yes")
+        self.video_qa_panel.set_video_chunking_enabled(enabled=chunking_on)
+
     def _apply_video_qa_settings(self, s: QSettings) -> None:
         """Restore Video QA panel fields from settings."""
         self.video_qa_panel.set_source_path(str(s.value("videoqa/source_path", "")))
@@ -1535,6 +1556,7 @@ class MainWindow(QMainWindow):
         if fps_text:
             with contextlib.suppress(TypeError, ValueError):
                 self.video_qa_panel.set_frame_sample_fps(float(fps_text))
+        self._restore_video_qa_run_mode_and_chunking(s)
         raw_attach = s.value("videoqa/attachments_json", "")
         if isinstance(raw_attach, str) and raw_attach.strip():
             try:
@@ -1678,6 +1700,11 @@ class MainWindow(QMainWindow):
             "videoqa/context_window_tokens", self.video_qa_panel.context_window_tokens()
         )
         s.setValue("videoqa/frame_sample_fps", self.video_qa_panel.frame_sample_fps())
+        s.setValue("videoqa/run_mode", self.video_qa_panel.video_qa_run_mode())
+        s.setValue(
+            "videoqa/chunking_enabled",
+            self.video_qa_panel.video_chunking_enabled(),
+        )
         s.setValue(
             "videoqa/attachments_json",
             json.dumps(self.video_qa_panel.attachments_for_persistence()),

@@ -57,6 +57,15 @@ def test_chunk_plan_uniform_grid_fallback() -> None:
     assert plan[-1].t_end == 100.0
 
 
+def test_chunk_plan_single_full_span() -> None:
+    """Whole-timeline planning produces one chunk with planning_mode whole_video."""
+    plan = build_video_qa_chunk_plan(100.0, single_full_span_chunk=True)
+    assert len(plan) == 1
+    assert plan[0].planning_mode == "whole_video"
+    assert plan[0].t_start == 0.0
+    assert plan[0].t_end == 100.0
+
+
 def test_representative_frame_middle_timestamp() -> None:
     """Default policy picks the midpoint of the chunk span."""
     policy = VideoQARepresentativeFramePolicy(kind="middle_timestamp")

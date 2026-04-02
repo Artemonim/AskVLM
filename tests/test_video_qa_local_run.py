@@ -24,17 +24,21 @@ from core.video_qa_executor import (
 )
 from core.video_qa_lm_studio_client import LMStudioResponse
 from core.video_qa_local_run import (
+    VIDEO_QA_RUN_MODE_VLM_ONLY,
     VIDEO_QA_WHISPER_UNLOAD_MODE_ENV,
     VideoQAFFmpegFrameMaterializer,
     VideoQALMHttpTarget,
     VideoQALMStudioAnswerSynthesizer,
+    VideoQALMStudioDirectWholeVideoSolver,
     VideoQALocalRunParams,
     VideoQAPreflightBlockedError,
+    VideoQAVLMOnlyEmptyTranscriptProvider,
     VideoQAWhisperTranscriptProvider,
     _get_video_qa_whisper_unload_mode,
     _whisper_transcribe_to_artifacts,
     ensure_local_video_qa_run_allowed,
     map_video_qa_progress_frac_to_200,
+    preflight_local_video_qa,
     run_local_video_qa,
 )
 from core.video_qa_manifest import VideoQAChunkRecord, VideoQARunManifest
@@ -63,18 +67,415 @@ def _force_uniform_video_qa_chunk_plan(
         *,
         scene_spans: object = None,
         uniform_segment_seconds: float = 30.0,
+        single_full_span_chunk: bool = False,
     ) -> tuple[VideoQAPlannedChunk, ...]:
         _ = (scene_spans, uniform_segment_seconds)
         return original(
             duration_seconds,
             scene_spans=None,
             uniform_segment_seconds=segment_seconds,
+            single_full_span_chunk=single_full_span_chunk,
         )
 
     monkeypatch.setattr(
         "core.video_qa_orchestration.build_video_qa_chunk_plan",
         _forced_chunk_plan,
     )
+
+
+def test_preflight_local_video_qa_single_span_when_chunking_disabled(
+    tmp_path: Path,
+) -> None:
+    """Disabling video chunking plans one whole-timeline chunk."""
+    media = tmp_path / "c.mp4"
+    media.write_bytes(b"x")
+    ctx = normalize_video_qa_context(
+        source=LocalFileProvider().resolve(media),
+        question="Q?",
+        attachments=(),
+    )
+    _, plan = preflight_local_video_qa(
+        ctx,
+        duration_seconds=90.0,
+        context_window_tokens=100_000,
+        frame_sample_fps=1.0,
+        video_chunking_enabled=False,
+    )
+    assert len(plan) == 1
+    assert plan[0].planning_mode == "whole_video"
+    assert plan[0].t_end == 90.0
+
+
+def test_vlm_only_empty_transcript_provider_returns_empty(tmp_path: Path) -> None:
+    """VLM-only transcript provider yields empty text without invoking ASR."""
+    media = tmp_path / "c.mp4"
+    media.write_bytes(b"x")
+    ctx = normalize_video_qa_context(
+        source=LocalFileProvider().resolve(media),
+        question="Q?",
+        attachments=(),
+    )
+    manifest = VideoQARunManifest(
+        schema_version=1,
+        run_id="run-t",
+        created_at="2026-03-30T12:00:00Z",
+        source=None,
+        question="Q",
+        attachments=(),
+        graph=(),
+        chunks=(),
+        status="pending",
+    )
+    art = VideoQAVLMOnlyEmptyTranscriptProvider().prepare_transcript(ctx, manifest)
+    assert art.transcript_text == ""
+    assert art.segments == ()
+
+
+def test_run_local_video_qa_vlm_only_skips_whisper_without_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VLM-only runs do not invoke Whisper when no transcript override is supplied."""
+    clip = tmp_path / "c.mp4"
+    clip.write_bytes(b"not-a-real-mp4")
+    source = LocalFileProvider().resolve(clip)
+    ctx = normalize_video_qa_context(source=source, question="Test?", attachments=())
+    monkeypatch.setattr(
+        "core.video_qa_local_run.get_media_duration_seconds",
+        lambda _p: 30.0,
+    )
+
+    class _FixedFrames(VideoQAFrameMaterializer):
+        def materialize_frames(
+            self,
+            *,
+            chunk: VideoQAChunkRecord,
+            representative_timestamp: float,
+            manifest: VideoQARunManifest,
+            transcript: VideoQATranscriptArtifacts,
+        ) -> tuple[str, ...]:
+            _ = (representative_timestamp, manifest, transcript)
+            p = tmp_path / f"{chunk.chunk_id}.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n")
+            return (str(p),)
+
+    class _FixedInferencer(VideoQAChunkInferencer):
+        def infer_chunk(
+            self,
+            *,
+            chunk: VideoQAChunkRecord,
+            frames: tuple[str, ...],
+            transcript: VideoQATranscriptArtifacts,
+            manifest: VideoQARunManifest,
+        ) -> VideoQAChunkInferenceOutcome:
+            _ = (chunk, frames, transcript, manifest)
+            payload = {
+                "chunk_summary": "seen",
+                "observations": [],
+                "confidence": "high",
+            }
+            return VideoQAChunkInferenceOutcome(
+                ok=True,
+                artifacts=(json.dumps(payload, sort_keys=True),),
+            )
+
+    class _FixedAggregator:
+        def aggregate(
+            self,
+            *,
+            context: object,
+            manifest: VideoQARunManifest,
+            transcript: VideoQATranscriptArtifacts,
+            chunk_results: object,
+        ) -> VideoQAAnswerBundle:
+            _ = (context, transcript, chunk_results)
+            return VideoQAAnswerBundle(
+                schema_version=ANSWER_BUNDLE_SCHEMA_VERSION,
+                run_id=f"{manifest.run_id}-answer",
+                created_at=manifest.created_at,
+                question="Test?",
+                answer="seen",
+                evidence=(),
+                is_uncertain=False,
+                manifest_run_id=manifest.run_id,
+                uncertainty_note=None,
+            )
+
+    whisper = MagicMock()
+    lm = VideoQALMHttpTarget("http://127.0.0.1:9/v1", "fake-model")
+    params = VideoQALocalRunParams(
+        context=ctx,
+        output_dir=tmp_path,
+        context_window_tokens=200_000,
+        chunk_lm=lm,
+        final_lm=lm,
+        video_qa_mode=VIDEO_QA_RUN_MODE_VLM_ONLY,
+    )
+    outcome = run_local_video_qa(
+        params=params,
+        whisper=whisper,
+        frame_override=_FixedFrames(),
+        chunk_inferencer_override=_FixedInferencer(),
+        aggregator_override=_FixedAggregator(),
+    )
+    whisper.transcribe.assert_not_called()
+    whisper.unload.assert_not_called()
+    assert outcome.manifest.status == "completed"
+
+
+def test_run_local_video_qa_no_chunking_skips_inferencer_and_solver_gets_frames(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct whole-video path skips chunk inferencer; final call receives frame paths."""
+    clip = tmp_path / "c.mp4"
+    clip.write_bytes(b"not-a-real-mp4")
+    source = LocalFileProvider().resolve(clip)
+    ctx = normalize_video_qa_context(source=source, question="Test?", attachments=())
+    monkeypatch.setattr(
+        "core.video_qa_local_run.get_media_duration_seconds",
+        lambda _p: 30.0,
+    )
+    monkeypatch.setattr(
+        "core.video_qa_local_run.openai_chat_base_to_local_rest_root",
+        lambda _url: "http://127.0.0.1:1234",
+    )
+
+    def fail_lm_studio_load_model(*_args: object, **_kwargs: object) -> None:
+        msg = "direct whole-video mode must not call lm_studio_load_model"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        "core.video_qa_local_run.lm_studio_load_model",
+        fail_lm_studio_load_model,
+    )
+
+    class _FixedTranscript(VideoQATranscriptProvider):
+        def prepare_transcript(
+            self, c: object, m: object
+        ) -> VideoQATranscriptArtifacts:
+            _ = (c, m)
+            return VideoQATranscriptArtifacts(
+                "hello transcript",
+                segments=((0.0, 2.0, "hello transcript"),),
+            )
+
+    class _FixedFrames(VideoQAFrameMaterializer):
+        def materialize_frames(
+            self,
+            *,
+            chunk: VideoQAChunkRecord,
+            representative_timestamp: float,
+            manifest: VideoQARunManifest,
+            transcript: VideoQATranscriptArtifacts,
+        ) -> tuple[str, ...]:
+            _ = (representative_timestamp, manifest, transcript)
+            p = tmp_path / f"{chunk.chunk_id}.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n")
+            return (str(p),)
+
+    class _RaisingInferencer(VideoQAChunkInferencer):
+        def infer_chunk(
+            self,
+            *,
+            chunk: VideoQAChunkRecord,
+            frames: tuple[str, ...],
+            transcript: VideoQATranscriptArtifacts,
+            manifest: VideoQARunManifest,
+        ) -> VideoQAChunkInferenceOutcome:
+            _ = (chunk, frames, transcript, manifest)
+            msg = "chunk inferencer must not run when video_chunking_enabled is false"
+            raise AssertionError(msg)
+
+    captured: dict[str, object] = {}
+
+    def fake_request(
+        base_url: str,
+        prompt: str,
+        json_schema: object = None,
+        **kwargs: object,
+    ) -> LMStudioResponse:
+        captured["base_url"] = base_url
+        captured["prompt"] = prompt
+        captured["json_schema"] = json_schema
+        captured["kwargs"] = kwargs
+        final_payload = {
+            "answer": "Direct answer",
+            "evidence": [
+                {
+                    "transcript_quote": "hello",
+                    "t_start": 0.0,
+                    "t_end": 2.0,
+                    "frame_refs": [],
+                }
+            ],
+            "is_uncertain": False,
+            "uncertainty_note": None,
+        }
+        return LMStudioResponse(
+            content=json.dumps(final_payload),
+            parsed_json=final_payload,
+            used_fallback=False,
+            finish_reason="stop",
+            raw_response={},
+        )
+
+    solver = VideoQALMStudioDirectWholeVideoSolver(
+        base_url="http://127.0.0.1:9/v1",
+        model="final-model",
+        request_chat_fn=fake_request,
+    )
+
+    whisper = MagicMock()
+    lm = VideoQALMHttpTarget("http://127.0.0.1:9/v1", "fake-chunk-model")
+    final_lm = VideoQALMHttpTarget("http://127.0.0.1:9/v1", "final-model")
+    params = VideoQALocalRunParams(
+        context=ctx,
+        output_dir=tmp_path,
+        context_window_tokens=200_000,
+        chunk_lm=lm,
+        final_lm=final_lm,
+        video_chunking_enabled=False,
+    )
+    outcome = run_local_video_qa(
+        params=params,
+        whisper=whisper,
+        transcript_override=_FixedTranscript(),
+        frame_override=_FixedFrames(),
+        chunk_inferencer_override=_RaisingInferencer(),
+        direct_whole_video_solver=solver,
+    )
+
+    assert outcome.manifest.status == "completed"
+    assert outcome.answer_bundle.answer == "Direct answer"
+    assert len(outcome.chunk_results) == 1
+    assert outcome.chunk_results[0].inference_attempted is False
+    assert not any(s.startswith("llm_pass:") for s in outcome.stage_sequence), (
+        "chunk llm_pass must not be emitted"
+    )
+    assert "answer_aggregate" in outcome.stage_sequence
+    assert "transcript_prepare" in outcome.stage_sequence
+    assert captured["json_schema"] == FINAL_SYNTHESIS_JSON_SCHEMA
+    prompt_str = str(captured["prompt"])
+    assert "Full transcript:" in prompt_str
+    assert "hello transcript" in prompt_str
+    img_paths = (
+        captured["kwargs"].get("image_paths")
+        if isinstance(captured["kwargs"], dict)
+        else None
+    )
+    assert img_paths is not None
+    assert isinstance(img_paths, tuple)
+    assert len(img_paths) == 1
+    assert outcome.chunk_results[0].frames == tuple(str(p) for p in img_paths)
+    manifest_path = tmp_path / f"{outcome.manifest.run_id}.manifest.json"
+    assert manifest_path.is_file()
+    assert answer_bundle_path_for_manifest(manifest_path).is_file()
+
+
+def test_run_local_video_qa_no_chunking_vlm_only_skips_whisper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No-chunking + VLM-only: no Whisper, no chunk inferencer, direct solver still runs."""
+    clip = tmp_path / "c.mp4"
+    clip.write_bytes(b"not-a-real-mp4")
+    source = LocalFileProvider().resolve(clip)
+    ctx = normalize_video_qa_context(source=source, question="Test?", attachments=())
+    monkeypatch.setattr(
+        "core.video_qa_local_run.get_media_duration_seconds",
+        lambda _p: 30.0,
+    )
+    monkeypatch.setattr(
+        "core.video_qa_local_run.openai_chat_base_to_local_rest_root",
+        lambda _url: "http://127.0.0.1:1234",
+    )
+
+    def fail_lm_studio_load_model(*_args: object, **_kwargs: object) -> None:
+        msg = "direct whole-video mode must not call lm_studio_load_model"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        "core.video_qa_local_run.lm_studio_load_model",
+        fail_lm_studio_load_model,
+    )
+
+    class _FixedFrames(VideoQAFrameMaterializer):
+        def materialize_frames(
+            self,
+            *,
+            chunk: VideoQAChunkRecord,
+            representative_timestamp: float,
+            manifest: VideoQARunManifest,
+            transcript: VideoQATranscriptArtifacts,
+        ) -> tuple[str, ...]:
+            _ = (representative_timestamp, manifest, transcript)
+            p = tmp_path / f"{chunk.chunk_id}.png"
+            p.write_bytes(b"\x89PNG\r\n\x1a\n")
+            return (str(p),)
+
+    class _RaisingInferencer(VideoQAChunkInferencer):
+        def infer_chunk(
+            self,
+            *,
+            chunk: VideoQAChunkRecord,
+            frames: tuple[str, ...],
+            transcript: VideoQATranscriptArtifacts,
+            manifest: VideoQARunManifest,
+        ) -> VideoQAChunkInferenceOutcome:
+            _ = (chunk, frames, transcript, manifest)
+            msg = "chunk inferencer must not run"
+            raise AssertionError(msg)
+
+    def fake_request(
+        base_url: str,
+        prompt: str,
+        json_schema: object = None,
+        **kwargs: object,
+    ) -> LMStudioResponse:
+        _ = (base_url, prompt, json_schema, kwargs)
+        final_payload = {
+            "answer": "frames only",
+            "evidence": [],
+            "is_uncertain": True,
+            "uncertainty_note": "no transcript",
+        }
+        return LMStudioResponse(
+            content=json.dumps(final_payload),
+            parsed_json=final_payload,
+            used_fallback=False,
+            finish_reason="stop",
+            raw_response={},
+        )
+
+    solver = VideoQALMStudioDirectWholeVideoSolver(
+        base_url="http://127.0.0.1:9/v1",
+        model="final-model",
+        request_chat_fn=fake_request,
+    )
+
+    whisper = MagicMock()
+    lm = VideoQALMHttpTarget("http://127.0.0.1:9/v1", "fake-chunk-model")
+    params = VideoQALocalRunParams(
+        context=ctx,
+        output_dir=tmp_path,
+        context_window_tokens=200_000,
+        chunk_lm=lm,
+        final_lm=lm,
+        video_qa_mode=VIDEO_QA_RUN_MODE_VLM_ONLY,
+        video_chunking_enabled=False,
+    )
+    outcome = run_local_video_qa(
+        params=params,
+        whisper=whisper,
+        frame_override=_FixedFrames(),
+        chunk_inferencer_override=_RaisingInferencer(),
+        direct_whole_video_solver=solver,
+    )
+
+    whisper.transcribe.assert_not_called()
+    assert outcome.manifest.status == "completed"
+    assert outcome.answer_bundle.answer == "frames only"
 
 
 def test_ensure_local_run_blocked_when_budget_does_not_fit() -> None:

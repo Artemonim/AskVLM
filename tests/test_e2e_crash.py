@@ -85,12 +85,14 @@ def _force_uniform_video_qa_chunk_plan(
         *,
         scene_spans: object = None,
         uniform_segment_seconds: float = 30.0,
+        single_full_span_chunk: bool = False,
     ) -> object:
         _ = (scene_spans, uniform_segment_seconds)
         return original(
             duration_seconds,
             scene_spans=None,
             uniform_segment_seconds=segment_seconds,
+            single_full_span_chunk=single_full_span_chunk,
         )
 
     monkeypatch.setattr(

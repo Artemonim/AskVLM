@@ -24,7 +24,7 @@ if TYPE_CHECKING:
         VideoQARuntimePolicy,
     )
 
-PlanningMode = Literal["scene", "uniform_grid"]
+PlanningMode = Literal["scene", "uniform_grid", "whole_video"]
 
 RepresentativeFrameKind = Literal[
     "middle_timestamp", "first_timestamp", "last_timestamp"
@@ -284,6 +284,7 @@ def build_video_qa_chunk_plan(
     *,
     scene_spans: Sequence[tuple[float, float]] | None = None,
     uniform_segment_seconds: float = 30.0,
+    single_full_span_chunk: bool = False,
 ) -> tuple[VideoQAPlannedChunk, ...]:
     """Build a chunk plan from scene spans, or a uniform time grid if scenes are absent.
 
@@ -295,6 +296,7 @@ def build_video_qa_chunk_plan(
         duration_seconds: Total media length in seconds.
         scene_spans: Optional sequence of ``(t_start, t_end)`` scene boundaries in seconds.
         uniform_segment_seconds: Target segment length when falling back to a uniform grid.
+        single_full_span_chunk: When True, plan one chunk covering the full timeline.
 
     Returns:
         Planned chunks with deterministic ``chunk_id`` values.
@@ -302,6 +304,18 @@ def build_video_qa_chunk_plan(
     """
     if duration_seconds <= 0:
         return ()
+
+    if single_full_span_chunk:
+        dur = float(duration_seconds)
+        cid = deterministic_chunk_id(0, 0.0, dur)
+        return (
+            VideoQAPlannedChunk(
+                chunk_id=cid,
+                t_start=0.0,
+                t_end=dur,
+                planning_mode="whole_video",
+            ),
+        )
 
     normalized_scenes: list[tuple[float, float]] = []
     if scene_spans:
@@ -401,12 +415,13 @@ def merge_planned_chunks_into_manifest(
     return replace(manifest, chunks=tuple(merged))
 
 
-def build_video_qa_preflight_summary(
+def build_video_qa_preflight_summary(  # noqa: PLR0913
     context: VideoQAContextBundle,
     *,
     duration_seconds: float,
     scene_spans: Sequence[tuple[float, float]] | None = None,
     uniform_segment_seconds: float = 30.0,
+    single_full_span_chunk: bool = False,
     budget_policy: VideoQABudgetPolicy | None = None,
     runtime_policy: VideoQARuntimePolicy | None = None,
     overflow_policy: VideoQAOverflowPolicy | None = None,
@@ -426,6 +441,7 @@ def build_video_qa_preflight_summary(
         duration_seconds,
         scene_spans=scene_spans,
         uniform_segment_seconds=uniform_segment_seconds,
+        single_full_span_chunk=single_full_span_chunk,
     )
 
     if duration_seconds > 0 and not chunk_plan:

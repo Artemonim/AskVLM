@@ -21,6 +21,7 @@ from .ffmpeg import (
 from .llm_prompts import (
     FINAL_SYNTHESIS_JSON_SCHEMA,
     VideoQAChunkSynthesisInput,
+    build_direct_whole_video_final_prompt,
     build_final_synthesis_prompt,
 )
 from .lm_studio_rest import (
@@ -38,7 +39,9 @@ from .video_qa_answer_bundle import (
     save_answer_bundle_to_json,
 )
 from .video_qa_executor import (
+    VideoQAChunkExecutionResult,
     VideoQAExecutorDeps,
+    VideoQAExecutorRunOutcome,
     VideoQATranscriptArtifacts,
     run_video_qa_executor,
 )
@@ -51,6 +54,7 @@ from .video_qa_orchestration import (
     build_video_qa_preflight_report,
     build_video_qa_preflight_summary,
     default_representative_frame_policy,
+    merge_planned_chunks_into_manifest,
 )
 from .video_qa_preparation import build_video_qa_preparation_manifest
 from .video_qa_runtime import default_video_qa_budget_policy
@@ -61,10 +65,8 @@ if TYPE_CHECKING:
     from .video_qa_context import VideoQAContextBundle
     from .video_qa_executor import (
         VideoQAAnswerAggregator,
-        VideoQAChunkExecutionResult,
         VideoQAChunkInferenceOutcome,
         VideoQAChunkInferencer,
-        VideoQAExecutorRunOutcome,
         VideoQAFrameMaterializer,
         VideoQATranscriptProvider,
     )
@@ -72,6 +74,7 @@ if TYPE_CHECKING:
     from .video_qa_orchestration import (
         VideoQAPlannedChunk,
         VideoQAPreflightReport,
+        VideoQARepresentativeFramePolicy,
     )
     from .whisperx_wrapper import WhisperXWrapper
 
@@ -81,6 +84,9 @@ DEFAULT_LM_STUDIO_OPENAI_BASE_URL: Final[str] = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_OPENAI_BASE_URL: Final[str] = "https://openrouter.ai/api/v1"
 # * Environment variable read by the GUI when Video QA scope is Cloud (Bearer auth).
 OPENROUTER_API_KEY_ENV: Final[str] = "OPENROUTER_API_KEY"
+# * Run mode: Whisper ASR + per-chunk VLM (default) vs frames-only VLM (no ASR).
+VIDEO_QA_RUN_MODE_WHISPER_VLM: Final[str] = "whisper_vlm"
+VIDEO_QA_RUN_MODE_VLM_ONLY: Final[str] = "vlm_only"
 # * Video QA-only Whisper unload control for crash mitigation around teardown.
 # ! Native CUDA / faster-whisper model teardown can hard-crash the whole Python process
 # * when unloading mid-run inside a long-lived GUI; this is a toolchain limitation, not a
@@ -150,6 +156,7 @@ def preflight_local_video_qa(
     duration_seconds: float,
     context_window_tokens: int,
     frame_sample_fps: float | None = None,
+    video_chunking_enabled: bool = True,
 ) -> tuple[VideoQAPreflightReport, tuple[VideoQAPlannedChunk, ...]]:
     """Build preflight report and chunk plan without executing ASR or LM calls."""
     base_policy = default_video_qa_budget_policy()
@@ -167,6 +174,7 @@ def preflight_local_video_qa(
         context,
         duration_seconds=float(duration_seconds),
         budget_policy=budget_policy,
+        single_full_span_chunk=not bool(video_chunking_enabled),
     )
     report = build_video_qa_preflight_report(context, preflight)
     return report, preflight.chunk_plan
@@ -352,6 +360,23 @@ class VideoQAWhisperTranscriptProvider:
                 f"✓ Whisper VRAM unload finished (mode={unload_mode}, safe={unload_safe})"
             )
         return artifacts
+
+
+class VideoQAVLMOnlyEmptyTranscriptProvider:
+    """No-op transcript for VLM-only runs (Whisper ASR is skipped)."""
+
+    def prepare_transcript(
+        self,
+        _context: VideoQAContextBundle,
+        _manifest: VideoQARunManifest,
+    ) -> VideoQATranscriptArtifacts:
+        """Return empty transcript artifacts so chunk prompts are frames-only."""
+        _ = (_context, _manifest)
+        return VideoQATranscriptArtifacts(
+            transcript_text="",
+            subtitle_text="",
+            segments=(),
+        )
 
 
 def _whisper_transcribe_to_artifacts(  # noqa: C901
@@ -746,6 +771,265 @@ class VideoQALMStudioAnswerSynthesizer:
         )
 
 
+def _transcript_body_for_direct_whole_video_prompt(
+    transcript: VideoQATranscriptArtifacts,
+    *,
+    max_chars: int = 120_000,
+) -> str:
+    """Build bounded full-transcript text for the direct whole-video solver prompt."""
+    body = transcript.transcript_text.strip() or transcript.subtitle_text.strip()
+    if body:
+        return body if len(body) <= max_chars else body[: max_chars - 3] + "..."
+    if transcript.segments:
+        lines = [
+            f"[{t0:.2f}-{t1:.2f}] {text.strip()}"
+            for t0, t1, text in transcript.segments
+            if str(text).strip()
+        ]
+        joined = "\n".join(lines)
+        return joined if len(joined) <= max_chars else joined[: max_chars - 3] + "..."
+    return ""
+
+
+def _video_qa_map_manifest_chunk(
+    manifest: VideoQARunManifest,
+    chunk_id: str,
+    transform: Callable[[VideoQAChunkRecord], VideoQAChunkRecord],
+) -> VideoQARunManifest:
+    """Return a manifest whose ``chunk_id`` row is replaced by ``transform``."""
+    new_chunks: list[VideoQAChunkRecord] = []
+    for record in manifest.chunks:
+        if record.chunk_id == chunk_id:
+            new_chunks.append(transform(record))
+        else:
+            new_chunks.append(record)
+    return replace(manifest, chunks=tuple(new_chunks))
+
+
+class VideoQALMStudioDirectWholeVideoSolver:
+    """One-shot whole-video QA via the final model with ffmpeg frames (no chunk pass)."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        model: str,
+        temperature: float = 0.0,
+        timeout: float | None = None,
+        request_chat_fn: Callable[..., object] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        authorization_bearer: str | None = None,
+    ) -> None:
+        self._base_url = base_url
+        self._model = model
+        self._temperature = temperature
+        self._timeout = timeout
+        self._request_chat_fn = request_chat_fn or request_chat_completion
+        self._should_cancel = should_cancel
+        self._authorization_bearer = authorization_bearer
+
+    def solve(
+        self,
+        *,
+        context: VideoQAContextBundle,
+        manifest: VideoQARunManifest,
+        transcript: VideoQATranscriptArtifacts,
+        chunk: VideoQAChunkRecord,
+        frames: tuple[str, ...],
+    ) -> VideoQAAnswerBundle:
+        """Run one multimodal request with the final JSON schema and return the bundle."""
+        tx_body = _transcript_body_for_direct_whole_video_prompt(transcript)
+        prompt = build_direct_whole_video_final_prompt(
+            context,
+            transcript_body=tx_body,
+            chunk_id=chunk.chunk_id,
+            chunk_time_span=(chunk.t_start, chunk.t_end),
+            frame_paths=frames,
+        )
+        try:
+            response = self._request_chat_fn(
+                self._base_url,
+                prompt,
+                image_paths=frames,
+                json_schema=FINAL_SYNTHESIS_JSON_SCHEMA,
+                model=self._model,
+                temperature=self._temperature,
+                timeout=self._timeout,
+                should_cancel=self._should_cancel,
+                authorization_bearer=self._authorization_bearer,
+            )
+        except LMStudioClientError as exc:
+            msg = f"Direct whole-video Video QA failed: {exc}"
+            raise RuntimeError(msg) from exc
+        normalized = _validate_final_synthesis_payload(
+            getattr(response, "parsed_json", None)
+        )
+        if normalized is None:
+            msg = "Direct whole-video Video QA returned invalid structured output."
+            raise RuntimeError(msg)
+        answer, evidence_items, is_uncertain, uncertainty_note = normalized
+        final_uncertainty_note = uncertainty_note
+        if is_uncertain and not final_uncertainty_note:
+            final_uncertainty_note = "The synthesized answer is uncertain."
+        return VideoQAAnswerBundle(
+            schema_version=ANSWER_BUNDLE_SCHEMA_VERSION,
+            run_id=f"{manifest.run_id}-answer",
+            created_at=manifest.created_at,
+            question=context.question,
+            answer=answer,
+            evidence=tuple(evidence_items),
+            is_uncertain=is_uncertain,
+            manifest_run_id=manifest.run_id,
+            uncertainty_note=final_uncertainty_note,
+        )
+
+
+def _raise_if_user_cancelled(should_cancel: Callable[[], bool] | None) -> None:
+    """Raise :class:`CancelledError` when the injected cancel predicate is true."""
+    if should_cancel and should_cancel():
+        msg = "Canceled"
+        raise CancelledError(msg)
+
+
+def _run_local_video_qa_direct_whole_video(  # noqa: C901, PLR0913
+    *,
+    context: VideoQAContextBundle,
+    manifest: VideoQARunManifest,
+    planned_chunks: Sequence[VideoQAPlannedChunk],
+    deps: VideoQAExecutorDeps,
+    final_lm: VideoQALMHttpTarget,
+    representative_frame_policy: VideoQARepresentativeFramePolicy | None,
+    should_cancel: Callable[[], bool] | None,
+    progress: Callable[[str, float], None] | None,
+    pipeline_log: Callable[[str], None] | None,
+    before_final_solve: Callable[[], None] | None,
+    direct_solver: VideoQALMStudioDirectWholeVideoSolver | None,
+) -> VideoQAExecutorRunOutcome:
+    """Transcript + whole-span frames + one final multimodal call (no chunk inferencer)."""
+    rep = representative_frame_policy or default_representative_frame_policy()
+    stages: list[str] = []
+    run_id = manifest.run_id
+    logger.info(
+        "video_qa_direct_whole_video: enter run_id=%s planned_chunks=%d",
+        run_id,
+        len(planned_chunks),
+    )
+    working = replace(manifest, status="running", error=None)
+
+    stages.append("source_resolve")
+    stages.append("attachment_prepare")
+
+    stages.append("transcript_prepare")
+    transcript = deps.transcript.prepare_transcript(context, working)
+
+    stages.append("chunk_plan")
+    working = merge_planned_chunks_into_manifest(working, planned_chunks)
+
+    planned_ids = [chunk.chunk_id for chunk in planned_chunks]
+    chunk_results: list[VideoQAChunkExecutionResult] = []
+    answer_bundle: VideoQAAnswerBundle | None = None
+
+    for chunk_id in planned_ids:
+        _raise_if_user_cancelled(should_cancel)
+        record = next((c for c in working.chunks if c.chunk_id == chunk_id), None)
+        if record is None:
+            continue
+
+        rep_ts = rep.timestamp_for_span(record.t_start, record.t_end)
+        stages.append(f"frame_select:{chunk_id}")
+        if progress:
+            progress("Sampling", 0.55)
+        if pipeline_log:
+            pipeline_log(f"→ frame_select: {chunk_id} (direct whole-video)")
+
+        frames = deps.frame_materializer.materialize_frames(
+            chunk=record,
+            representative_timestamp=rep_ts,
+            manifest=working,
+            transcript=transcript,
+        )
+
+        _raise_if_user_cancelled(should_cancel)
+
+        def _patch_running(
+            r: VideoQAChunkRecord,
+            frames_: tuple[str, ...] = frames,
+        ) -> VideoQAChunkRecord:
+            return replace(r, frames=frames_, status="running", error=None)
+
+        working = _video_qa_map_manifest_chunk(working, chunk_id, _patch_running)
+        current = next(c for c in working.chunks if c.chunk_id == chunk_id)
+        attempts = int(current.attempts) + 1
+
+        if before_final_solve is not None:
+            before_final_solve()
+
+        _raise_if_user_cancelled(should_cancel)
+
+        stages.append("answer_aggregate")
+        if progress:
+            progress("Synthesizing final answer (direct whole-video JSON)", 0.95)
+        if pipeline_log:
+            pipeline_log("→ Stage: answer_aggregate (direct whole-video multimodal)")
+
+        solver = direct_solver or VideoQALMStudioDirectWholeVideoSolver(
+            base_url=final_lm.base_url,
+            model=final_lm.model_id,
+            should_cancel=should_cancel,
+            authorization_bearer=final_lm.authorization_bearer,
+        )
+        answer_bundle = solver.solve(
+            context=context,
+            manifest=working,
+            transcript=transcript,
+            chunk=current,
+            frames=frames,
+        )
+
+        def _patch_completed(
+            r: VideoQAChunkRecord,
+            frames_: tuple[str, ...] = frames,
+            att: int = attempts,
+        ) -> VideoQAChunkRecord:
+            return replace(
+                r,
+                frames=frames_,
+                status="completed",
+                attempts=att,
+                error=None,
+                artifacts=(),
+            )
+
+        working = _video_qa_map_manifest_chunk(working, chunk_id, _patch_completed)
+        chunk_results.append(
+            VideoQAChunkExecutionResult(
+                chunk_id=chunk_id,
+                status="completed",
+                frames=frames,
+                error=None,
+                inference_attempted=False,
+            )
+        )
+
+    if answer_bundle is None:
+        msg = "Direct whole-video run produced no answer bundle."
+        raise RuntimeError(msg)
+
+    final_manifest = replace(working, status="completed", error=None)
+    logger.info(
+        "video_qa_direct_whole_video: exit run_id=%s manifest_status=%s",
+        run_id,
+        final_manifest.status,
+    )
+    return VideoQAExecutorRunOutcome(
+        transcript=transcript,
+        answer_bundle=answer_bundle,
+        manifest=final_manifest,
+        chunk_results=tuple(chunk_results),
+        stage_sequence=tuple(stages),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class VideoQALocalRunParams:
     """Inputs for :func:`run_local_video_qa`."""
@@ -756,6 +1040,8 @@ class VideoQALocalRunParams:
     chunk_lm: VideoQALMHttpTarget
     final_lm: VideoQALMHttpTarget
     frame_sample_fps: float = field(default_factory=_default_frame_sample_fps)
+    video_qa_mode: str = VIDEO_QA_RUN_MODE_WHISPER_VLM
+    video_chunking_enabled: bool = True
 
 
 def _build_lm_studio_dual_local_swap_hook(
@@ -1085,7 +1371,19 @@ def _wrap_local_executor_deps_with_progress(
     )
 
 
-def run_local_video_qa(  # noqa: PLR0913
+def _effective_transcript_override_for_params(
+    params: VideoQALocalRunParams,
+    transcript_override: VideoQATranscriptProvider | None,
+) -> VideoQATranscriptProvider | None:
+    """Resolve transcript provider: explicit override, else VLM-only empty ASR."""
+    if transcript_override is not None:
+        return transcript_override
+    if params.video_qa_mode == VIDEO_QA_RUN_MODE_VLM_ONLY:
+        return VideoQAVLMOnlyEmptyTranscriptProvider()
+    return None
+
+
+def run_local_video_qa(  # noqa: C901, PLR0912, PLR0913, PLR0915
     *,
     params: VideoQALocalRunParams,
     whisper: WhisperXWrapper,
@@ -1096,6 +1394,7 @@ def run_local_video_qa(  # noqa: PLR0913
     transcript_override: VideoQATranscriptProvider | None = None,
     frame_override: VideoQAFrameMaterializer | None = None,
     aggregator_override: VideoQAAnswerAggregator | None = None,
+    direct_whole_video_solver: VideoQALMStudioDirectWholeVideoSolver | None = None,
 ) -> VideoQAExecutorRunOutcome:
     """Run the full Video QA pipeline for a local file and optional attachments.
 
@@ -1113,7 +1412,9 @@ def run_local_video_qa(  # noqa: PLR0913
         chunk_inferencer_override: Test hook replacing per-chunk LM calls.
         transcript_override: Test hook replacing ASR.
         frame_override: Test hook replacing ffmpeg frame extraction.
-        aggregator_override: Test hook replacing final synthesis.
+        aggregator_override: Test hook replacing final synthesis (chunked path only).
+        direct_whole_video_solver: Test hook replacing the direct whole-video solver
+            when ``video_chunking_enabled`` is false.
 
     """
     ctx = params.context
@@ -1135,6 +1436,7 @@ def run_local_video_qa(  # noqa: PLR0913
         duration_seconds=duration_s,
         context_window_tokens=params.context_window_tokens,
         frame_sample_fps=params.frame_sample_fps,
+        video_chunking_enabled=params.video_chunking_enabled,
     )
     ensure_local_video_qa_run_allowed(report, chunk_plan)
     logger.info(
@@ -1144,6 +1446,14 @@ def run_local_video_qa(  # noqa: PLR0913
     )
     if pipeline_log:
         pipeline_log(f"✓ Preflight OK — {len(chunk_plan)} chunk(s) planned.")
+    if pipeline_log and params.video_qa_mode == VIDEO_QA_RUN_MODE_VLM_ONLY:
+        pipeline_log(
+            "→ Mode: VLM-only (Whisper ASR skipped; ffmpeg frame extraction unchanged)"
+        )
+
+    effective_transcript_override = _effective_transcript_override_for_params(
+        params, transcript_override
+    )
 
     manifest = build_video_qa_preparation_manifest(ctx)
     staging_dir = params.output_dir / "_video_qa_work" / manifest.run_id
@@ -1164,53 +1474,104 @@ def run_local_video_qa(  # noqa: PLR0913
     if progress:
         progress("Preparing", 0.05)
 
-    swap_hook = _build_lm_studio_dual_local_swap_hook(
-        chunk_lm=params.chunk_lm,
-        final_lm=params.final_lm,
-        context_window_tokens=params.context_window_tokens,
-        pipeline_log=pipeline_log,
-        should_cancel=should_cancel,
-    )
-    deps = build_video_qa_local_executor_deps(
-        context=ctx,
-        whisper=whisper,
-        staging_dir=staging_dir,
-        chunk_lm=params.chunk_lm,
-        final_lm=params.final_lm,
-        should_cancel=should_cancel,
-        progress=progress,
-        pipeline_log=pipeline_log,
-        frame_sample_fps=params.frame_sample_fps,
-        chunk_inferencer_override=chunk_inferencer_override,
-        transcript_override=transcript_override,
-        frame_override=frame_override,
-        aggregator_override=aggregator_override,
-        before_answer_aggregate=swap_hook,
-    )
-
-    if progress is not None or pipeline_log is not None:
-        prog_cb = progress or (lambda _m, _f: None)
-        deps = _wrap_local_executor_deps_with_progress(
-            deps,
-            progress=prog_cb,
-            total_chunks=max(1, len(chunk_plan)),
+    if not params.video_chunking_enabled:
+        deps = build_video_qa_local_executor_deps(
+            context=ctx,
+            whisper=whisper,
+            staging_dir=staging_dir,
+            chunk_lm=params.chunk_lm,
+            final_lm=params.final_lm,
+            should_cancel=should_cancel,
+            progress=progress,
             pipeline_log=pipeline_log,
+            frame_sample_fps=params.frame_sample_fps,
+            chunk_inferencer_override=chunk_inferencer_override,
+            transcript_override=effective_transcript_override,
+            frame_override=frame_override,
+            aggregator_override=aggregator_override,
+            before_answer_aggregate=None,
+        )
+        if progress is not None or pipeline_log is not None:
+            prog_cb = progress or (lambda _m, _f: None)
+            deps = replace(
+                deps,
+                frame_materializer=_ProgressFrameMaterializer(
+                    deps.frame_materializer,
+                    progress=prog_cb,
+                    total_chunks=max(1, len(chunk_plan)),
+                    chunk_state={"i": 0},
+                    pipeline_log=pipeline_log,
+                ),
+            )
+        logger.info(
+            "run_local_video_qa: direct whole-video path run_id=%s", manifest.run_id
+        )
+        if pipeline_log:
+            pipeline_log(
+                "→ Stage: executor (transcript → whole-video frames → direct solver)"
+            )
+        outcome = _run_local_video_qa_direct_whole_video(
+            context=ctx,
+            manifest=manifest,
+            planned_chunks=chunk_plan,
+            deps=deps,
+            final_lm=params.final_lm,
+            representative_frame_policy=default_representative_frame_policy(),
+            should_cancel=should_cancel,
+            progress=progress,
+            pipeline_log=pipeline_log,
+            before_final_solve=None,
+            direct_solver=direct_whole_video_solver,
+        )
+    else:
+        swap_hook = _build_lm_studio_dual_local_swap_hook(
+            chunk_lm=params.chunk_lm,
+            final_lm=params.final_lm,
+            context_window_tokens=params.context_window_tokens,
+            pipeline_log=pipeline_log,
+            should_cancel=should_cancel,
+        )
+        deps = build_video_qa_local_executor_deps(
+            context=ctx,
+            whisper=whisper,
+            staging_dir=staging_dir,
+            chunk_lm=params.chunk_lm,
+            final_lm=params.final_lm,
+            should_cancel=should_cancel,
+            progress=progress,
+            pipeline_log=pipeline_log,
+            frame_sample_fps=params.frame_sample_fps,
+            chunk_inferencer_override=chunk_inferencer_override,
+            transcript_override=effective_transcript_override,
+            frame_override=frame_override,
+            aggregator_override=aggregator_override,
+            before_answer_aggregate=swap_hook,
         )
 
-    logger.info(
-        "run_local_video_qa: calling run_video_qa_executor run_id=%s", manifest.run_id
-    )
-    if pipeline_log:
-        pipeline_log("→ Stage: executor (transcript → chunks → synthesis)")
+        if progress is not None or pipeline_log is not None:
+            prog_cb = progress or (lambda _m, _f: None)
+            deps = _wrap_local_executor_deps_with_progress(
+                deps,
+                progress=prog_cb,
+                total_chunks=max(1, len(chunk_plan)),
+                pipeline_log=pipeline_log,
+            )
 
-    outcome = run_video_qa_executor(
-        context=ctx,
-        manifest=manifest,
-        planned_chunks=chunk_plan,
-        deps=deps,
-        representative_frame_policy=default_representative_frame_policy(),
-        should_cancel=should_cancel,
-    )
+        logger.info(
+            "run_local_video_qa: calling run_video_qa_executor run_id=%s",
+            manifest.run_id,
+        )
+        if pipeline_log:
+            pipeline_log("→ Stage: executor (transcript → chunks → synthesis)")
+
+        outcome = run_video_qa_executor(
+            context=ctx,
+            manifest=manifest,
+            planned_chunks=chunk_plan,
+            deps=deps,
+            representative_frame_policy=default_representative_frame_policy(),
+            should_cancel=should_cancel,
+        )
 
     final_manifest = outcome.manifest
     manifest_path = params.output_dir / f"{final_manifest.run_id}.manifest.json"
