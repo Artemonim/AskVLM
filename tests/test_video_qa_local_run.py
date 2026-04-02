@@ -24,12 +24,14 @@ from core.video_qa_executor import (
 )
 from core.video_qa_lm_studio_client import LMStudioResponse
 from core.video_qa_local_run import (
+    VIDEO_QA_WHISPER_UNLOAD_MODE_ENV,
     VideoQAFFmpegFrameMaterializer,
     VideoQALMHttpTarget,
     VideoQALMStudioAnswerSynthesizer,
     VideoQALocalRunParams,
     VideoQAPreflightBlockedError,
     VideoQAWhisperTranscriptProvider,
+    _get_video_qa_whisper_unload_mode,
     _whisper_transcribe_to_artifacts,
     ensure_local_video_qa_run_allowed,
     map_video_qa_progress_frac_to_200,
@@ -486,36 +488,177 @@ def test_whisper_transcript_provider_unloads_after_transcribe(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """ASR stage releases GPU weights before chunk LM work (best-effort unload)."""
+    """ASR stage releases GPU weights before chunk LM work in safe mode."""
     clip = tmp_path / "v.mp4"
     clip.write_bytes(b"x")
     work = tmp_path / "w"
     work.mkdir()
+    monkeypatch.setenv(VIDEO_QA_WHISPER_UNLOAD_MODE_ENV, "safe")
     artifacts = VideoQATranscriptArtifacts("hi", segments=((0.0, 1.0, "hi"),))
     monkeypatch.setattr(
         "core.video_qa_local_run._whisper_transcribe_to_artifacts",
         lambda *_a, **_k: artifacts,
     )
     whisper = MagicMock()
+    pipeline_messages: list[str] = []
     prov = VideoQAWhisperTranscriptProvider(
         whisper,
         media_path=clip,
         work_dir=work,
+        pipeline_log=pipeline_messages.append,
     )
     manifest = MagicMock()
     manifest.run_id = "run-a"
     with caplog.at_level(logging.INFO):
         prov.prepare_transcript(MagicMock(), manifest)
-    whisper.unload.assert_called_once_with(safe=False)
+    whisper.unload.assert_called_once_with(safe=True)
+    assert pipeline_messages == [
+        "→ Stage: transcript_prepare (local Whisper ASR)",
+        "✓ Stage: transcript_prepare complete",
+        "→ Whisper unload mode selected (mode=safe, env=ASKVLM_VIDEO_QA_WHISPER_UNLOAD_MODE)",
+        "→ Initiating Whisper VRAM unload (mode=safe, safe=True)",
+        "✓ Whisper VRAM unload finished (mode=safe, safe=True)",
+    ]
     messages = [record.getMessage() for record in caplog.records]
     assert any(
-        "stage=whisper_unload_start run_id=run-a segment_count=1 transcript_chars=2"
-        in message
+        "stage=whisper_unload_mode_selected run_id=run-a mode=safe "
+        "env_var=ASKVLM_VIDEO_QA_WHISPER_UNLOAD_MODE default_mode=skip "
+        "segment_count=1 transcript_chars=2" in message
         for message in messages
     )
     assert any(
-        "stage=whisper_unload_complete run_id=run-a segment_count=1 "
+        "stage=whisper_unload_start run_id=run-a mode=safe safe=True "
+        "segment_count=1 transcript_chars=2" in message
+        for message in messages
+    )
+    assert any(
+        "stage=whisper_unload_complete run_id=run-a mode=safe safe=True "
+        "segment_count=1 "
         "transcript_chars=2 elapsed_s=" in message
+        for message in messages
+    )
+
+
+def test_whisper_transcript_provider_skips_unload_in_default_mode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Video QA defaults to skip mode and defers Whisper teardown."""
+    clip = tmp_path / "v.mp4"
+    clip.write_bytes(b"x")
+    work = tmp_path / "w"
+    work.mkdir()
+    monkeypatch.delenv(VIDEO_QA_WHISPER_UNLOAD_MODE_ENV, raising=False)
+    artifacts = VideoQATranscriptArtifacts("hi", segments=((0.0, 1.0, "hi"),))
+    monkeypatch.setattr(
+        "core.video_qa_local_run._whisper_transcribe_to_artifacts",
+        lambda *_a, **_k: artifacts,
+    )
+    whisper = MagicMock()
+    pipeline_messages: list[str] = []
+    prov = VideoQAWhisperTranscriptProvider(
+        whisper,
+        media_path=clip,
+        work_dir=work,
+        pipeline_log=pipeline_messages.append,
+    )
+    manifest = MagicMock()
+    manifest.run_id = "run-a"
+    with caplog.at_level(logging.INFO):
+        prov.prepare_transcript(MagicMock(), manifest)
+    whisper.unload.assert_not_called()
+    assert pipeline_messages == [
+        "→ Stage: transcript_prepare (local Whisper ASR)",
+        "✓ Stage: transcript_prepare complete",
+        "→ Whisper unload mode selected (mode=skip, env=ASKVLM_VIDEO_QA_WHISPER_UNLOAD_MODE)",
+        "✓ Whisper VRAM unload skipped/deferred (mode=skip, teardown left for process/session end)",
+    ]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "stage=whisper_unload_mode_selected run_id=run-a mode=skip "
+        "env_var=ASKVLM_VIDEO_QA_WHISPER_UNLOAD_MODE default_mode=skip "
+        "segment_count=1 transcript_chars=2" in message
+        for message in messages
+    )
+    assert any(
+        "stage=whisper_unload_skipped run_id=run-a mode=skip action=deferred "
+        "segment_count=1 transcript_chars=2" in message
+        for message in messages
+    )
+    assert not any("stage=whisper_unload_start" in message for message in messages)
+
+
+@pytest.mark.parametrize(
+    ("mode", "safe_flag"),
+    [("aggressive", False)],
+)
+def test_whisper_transcript_provider_applies_nondefault_unload_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    mode: str,
+    *,
+    safe_flag: bool,
+) -> None:
+    """Configured non-default unload modes call Whisper with the expected flag."""
+    clip = tmp_path / "v.mp4"
+    clip.write_bytes(b"x")
+    work = tmp_path / "w"
+    work.mkdir()
+    monkeypatch.setenv(VIDEO_QA_WHISPER_UNLOAD_MODE_ENV, mode)
+    artifacts = VideoQATranscriptArtifacts("hi", segments=((0.0, 1.0, "hi"),))
+    monkeypatch.setattr(
+        "core.video_qa_local_run._whisper_transcribe_to_artifacts",
+        lambda *_a, **_k: artifacts,
+    )
+    whisper = MagicMock()
+    pipeline_messages: list[str] = []
+    prov = VideoQAWhisperTranscriptProvider(
+        whisper,
+        media_path=clip,
+        work_dir=work,
+        pipeline_log=pipeline_messages.append,
+    )
+    manifest = MagicMock()
+    manifest.run_id = "run-a"
+    with caplog.at_level(logging.INFO):
+        prov.prepare_transcript(MagicMock(), manifest)
+    whisper.unload.assert_called_once_with(safe=safe_flag)
+    assert pipeline_messages == [
+        "→ Stage: transcript_prepare (local Whisper ASR)",
+        "✓ Stage: transcript_prepare complete",
+        f"→ Whisper unload mode selected (mode={mode}, env=ASKVLM_VIDEO_QA_WHISPER_UNLOAD_MODE)",
+        f"→ Initiating Whisper VRAM unload (mode={mode}, safe={safe_flag})",
+        f"✓ Whisper VRAM unload finished (mode={mode}, safe={safe_flag})",
+    ]
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        f"stage=whisper_unload_start run_id=run-a mode={mode} safe={safe_flag} "
+        "segment_count=1 transcript_chars=2" in message
+        for message in messages
+    )
+    assert any(
+        f"stage=whisper_unload_complete run_id=run-a mode={mode} safe={safe_flag} "
+        "segment_count=1 transcript_chars=2 elapsed_s=" in message
+        for message in messages
+    )
+
+
+def test_video_qa_whisper_unload_mode_invalid_value_falls_back_to_skip(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Invalid unload mode values fall back to the skip mitigation."""
+    monkeypatch.setenv(VIDEO_QA_WHISPER_UNLOAD_MODE_ENV, "  invalid-mode  ")
+    with caplog.at_level(logging.WARNING):
+        mode = _get_video_qa_whisper_unload_mode()
+    assert mode == "skip"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "stage=whisper_unload_mode_invalid "
+        "env_var=ASKVLM_VIDEO_QA_WHISPER_UNLOAD_MODE raw_value='  invalid-mode  ' "
+        "fallback_mode=skip allowed_modes=aggressive,safe,skip" in message
         for message in messages
     )
 

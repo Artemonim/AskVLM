@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -80,6 +81,16 @@ DEFAULT_LM_STUDIO_OPENAI_BASE_URL: Final[str] = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_OPENAI_BASE_URL: Final[str] = "https://openrouter.ai/api/v1"
 # * Environment variable read by the GUI when Video QA scope is Cloud (Bearer auth).
 OPENROUTER_API_KEY_ENV: Final[str] = "OPENROUTER_API_KEY"
+# * Video QA-only Whisper unload control for crash mitigation around teardown.
+# ! Native CUDA / faster-whisper model teardown can hard-crash the whole Python process
+# * when unloading mid-run inside a long-lived GUI; this is a toolchain limitation, not a
+# * guarantee that our call pattern is "wrong". Default "skip" defers teardown to process
+# * exit; use "safe" / "aggressive" only when you accept that risk for VRAM headroom.
+VIDEO_QA_WHISPER_UNLOAD_MODE_ENV: Final[str] = "ASKVLM_VIDEO_QA_WHISPER_UNLOAD_MODE"
+_VIDEO_QA_WHISPER_UNLOAD_MODE_DEFAULT: Final[str] = "skip"
+_VIDEO_QA_WHISPER_UNLOAD_ALLOWED_MODES: Final[frozenset[str]] = frozenset(
+    {"skip", "safe", "aggressive"}
+)
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +218,25 @@ def _coerce_float(value: object, default: float = 0.0) -> float:
     return default
 
 
+def _get_video_qa_whisper_unload_mode() -> str:
+    """Return the normalized Video QA Whisper unload mode from the environment."""
+    raw_mode = os.getenv(VIDEO_QA_WHISPER_UNLOAD_MODE_ENV, "")
+    normalized = raw_mode.strip().lower()
+    if not normalized:
+        return _VIDEO_QA_WHISPER_UNLOAD_MODE_DEFAULT
+    if normalized in _VIDEO_QA_WHISPER_UNLOAD_ALLOWED_MODES:
+        return normalized
+    logger.warning(
+        "video_qa_local_run: stage=whisper_unload_mode_invalid env_var=%s "
+        "raw_value=%r fallback_mode=%s allowed_modes=%s",
+        VIDEO_QA_WHISPER_UNLOAD_MODE_ENV,
+        raw_mode,
+        _VIDEO_QA_WHISPER_UNLOAD_MODE_DEFAULT,
+        ",".join(sorted(_VIDEO_QA_WHISPER_UNLOAD_ALLOWED_MODES)),
+    )
+    return _VIDEO_QA_WHISPER_UNLOAD_MODE_DEFAULT
+
+
 class VideoQAWhisperTranscriptProvider:
     """ASR transcript via :class:`WhisperXWrapper` and ``prepare_audio`` (no diarization)."""
 
@@ -258,30 +288,69 @@ class VideoQAWhisperTranscriptProvider:
             len(artifacts.transcript_text),
             prepare_elapsed_s,
         )
+        unload_mode = _get_video_qa_whisper_unload_mode()
         if self._pipeline_log:
             self._pipeline_log("✓ Stage: transcript_prepare complete")
-            self._pipeline_log("→ Initiating Whisper VRAM unload (safe=False)")
-        unload_t0 = time.perf_counter()
+            self._pipeline_log(
+                "→ Whisper unload mode selected "
+                f"(mode={unload_mode}, env={VIDEO_QA_WHISPER_UNLOAD_MODE_ENV})"
+            )
         logger.info(
-            "video_qa_local_run: stage=whisper_unload_start run_id=%s "
-            "segment_count=%d transcript_chars=%d",
+            "video_qa_local_run: stage=whisper_unload_mode_selected run_id=%s "
+            "mode=%s env_var=%s default_mode=%s segment_count=%d transcript_chars=%d",
             run_id,
+            unload_mode,
+            VIDEO_QA_WHISPER_UNLOAD_MODE_ENV,
+            _VIDEO_QA_WHISPER_UNLOAD_MODE_DEFAULT,
             len(artifacts.segments),
             len(artifacts.transcript_text),
         )
-        # * Drop faster-whisper weights from VRAM before chunk VLM / LM HTTP work.
-        # * WhisperXWrapper.unload() is best-effort and suppresses internal failures.
-        self._whisper.unload(safe=False)
+        if unload_mode == "skip":
+            logger.info(
+                "video_qa_local_run: stage=whisper_unload_skipped run_id=%s "
+                "mode=%s action=deferred segment_count=%d transcript_chars=%d",
+                run_id,
+                unload_mode,
+                len(artifacts.segments),
+                len(artifacts.transcript_text),
+            )
+            if self._pipeline_log:
+                self._pipeline_log(
+                    "✓ Whisper VRAM unload skipped/deferred "
+                    "(mode=skip, teardown left for process/session end)"
+                )
+            return artifacts
+        unload_safe = unload_mode == "safe"
+        if self._pipeline_log:
+            self._pipeline_log(
+                f"→ Initiating Whisper VRAM unload (mode={unload_mode}, safe={unload_safe})"
+            )
+        unload_t0 = time.perf_counter()
+        logger.info(
+            "video_qa_local_run: stage=whisper_unload_start run_id=%s "
+            "mode=%s safe=%s segment_count=%d transcript_chars=%d",
+            run_id,
+            unload_mode,
+            unload_safe,
+            len(artifacts.segments),
+            len(artifacts.transcript_text),
+        )
+        # * Configurable unload: aggressive teardown has crashed this process in the field.
+        self._whisper.unload(safe=unload_safe)
         logger.info(
             "video_qa_local_run: stage=whisper_unload_complete run_id=%s "
-            "segment_count=%d transcript_chars=%d elapsed_s=%.4f",
+            "mode=%s safe=%s segment_count=%d transcript_chars=%d elapsed_s=%.4f",
             run_id,
+            unload_mode,
+            unload_safe,
             len(artifacts.segments),
             len(artifacts.transcript_text),
             time.perf_counter() - unload_t0,
         )
         if self._pipeline_log:
-            self._pipeline_log("✓ Whisper VRAM unload finished")
+            self._pipeline_log(
+                f"✓ Whisper VRAM unload finished (mode={unload_mode}, safe={unload_safe})"
+            )
         return artifacts
 
 
