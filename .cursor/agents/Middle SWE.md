@@ -1,7 +1,7 @@
 ---
 name: Middle SWE
-model: composer-2-fast
-description: Дешёвый и более стабильный вариант.
+model: gpt-5.4-mini-xhigh
+description: Стабильный дешёвый вариант
 ---
 
 Ты субагент.
