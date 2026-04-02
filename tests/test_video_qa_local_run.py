@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -29,17 +30,49 @@ from core.video_qa_local_run import (
     VideoQALocalRunParams,
     VideoQAPreflightBlockedError,
     VideoQAWhisperTranscriptProvider,
+    _whisper_transcribe_to_artifacts,
     ensure_local_video_qa_run_allowed,
     map_video_qa_progress_frac_to_200,
     run_local_video_qa,
 )
 from core.video_qa_manifest import VideoQAChunkRecord, VideoQARunManifest
-from core.video_qa_orchestration import VideoQAPlannedChunk, VideoQAPreflightReport
+from core.video_qa_orchestration import (
+    VideoQAPlannedChunk,
+    VideoQAPreflightReport,
+    build_video_qa_chunk_plan,
+)
 from core.video_qa_sources import LocalFileProvider
 
 _FIXTURE_SHORT_MP4 = (
     Path(__file__).resolve().parent / "fixtures" / "test_video_short.mp4"
 )
+
+
+def _force_uniform_video_qa_chunk_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    segment_seconds: float,
+) -> None:
+    """Force deterministic uniform chunking for short-fixture smoke coverage."""
+    original = build_video_qa_chunk_plan
+
+    def _forced_chunk_plan(
+        duration_seconds: float,
+        *,
+        scene_spans: object = None,
+        uniform_segment_seconds: float = 30.0,
+    ) -> tuple[VideoQAPlannedChunk, ...]:
+        _ = (scene_spans, uniform_segment_seconds)
+        return original(
+            duration_seconds,
+            scene_spans=None,
+            uniform_segment_seconds=segment_seconds,
+        )
+
+    monkeypatch.setattr(
+        "core.video_qa_orchestration.build_video_qa_chunk_plan",
+        _forced_chunk_plan,
+    )
 
 
 def test_ensure_local_run_blocked_when_budget_does_not_fit() -> None:
@@ -330,11 +363,17 @@ def test_run_local_video_qa_with_injected_stack(
 
 def test_run_local_video_qa_pipeline_smoke_short_fixture_media(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """E2E smoke: committed short mp4 drives preflight; heavy steps are mocked."""
+    """E2E smoke: short committed mp4 exercises a forced multi-chunk run with mocks."""
     assert _FIXTURE_SHORT_MP4.is_file(), (
         "tests/fixtures/test_video_short.mp4 must exist"
     )
+    monkeypatch.setattr(
+        "core.video_qa_local_run.get_media_duration_seconds",
+        lambda _path: 16.088,
+    )
+    _force_uniform_video_qa_chunk_plan(monkeypatch, segment_seconds=10.0)
     source = LocalFileProvider().resolve(_FIXTURE_SHORT_MP4)
     ctx = normalize_video_qa_context(
         source=source,
@@ -435,6 +474,8 @@ def test_run_local_video_qa_pipeline_smoke_short_fixture_media(
     manifest_obj = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert manifest_obj.get("status") == "completed"
     assert isinstance(manifest_obj.get("chunks"), list)
+    assert len(manifest_obj["chunks"]) == 2
+    assert all(chunk["status"] == "completed" for chunk in manifest_obj["chunks"])
     answer_obj = json.loads(answer_path.read_text(encoding="utf-8"))
     assert isinstance(answer_obj.get("answer"), str)
     assert answer_obj.get("schema_version") == ANSWER_BUNDLE_SCHEMA_VERSION
@@ -443,6 +484,7 @@ def test_run_local_video_qa_pipeline_smoke_short_fixture_media(
 def test_whisper_transcript_provider_unloads_after_transcribe(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """ASR stage releases GPU weights before chunk LM work (best-effort unload)."""
     clip = tmp_path / "v.mp4"
@@ -460,8 +502,76 @@ def test_whisper_transcript_provider_unloads_after_transcribe(
         media_path=clip,
         work_dir=work,
     )
-    prov.prepare_transcript(MagicMock(), MagicMock())
+    manifest = MagicMock()
+    manifest.run_id = "run-a"
+    with caplog.at_level(logging.INFO):
+        prov.prepare_transcript(MagicMock(), manifest)
     whisper.unload.assert_called_once_with(safe=False)
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "stage=whisper_unload_start run_id=run-a segment_count=1 transcript_chars=2"
+        in message
+        for message in messages
+    )
+    assert any(
+        "stage=whisper_unload_complete run_id=run-a segment_count=1 "
+        "transcript_chars=2 elapsed_s=" in message
+        for message in messages
+    )
+
+
+def test_whisper_transcribe_logs_post_asr_cleanup_boundaries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Transcribe diagnostics log the post-ASR and cleanup boundaries once."""
+    clip = tmp_path / "v.mp4"
+    clip.write_bytes(b"x")
+    work = tmp_path / "w"
+    work.mkdir()
+    audio = work / "prepared.wav"
+    audio.write_bytes(b"wav")
+    monkeypatch.setattr(
+        "core.video_qa_local_run.prepare_audio",
+        lambda *_args, **_kwargs: audio,
+    )
+    monkeypatch.setattr(
+        "core.video_qa_local_run.cleanup_intermediate_audio",
+        lambda *_args, **_kwargs: None,
+    )
+    whisper = MagicMock()
+    whisper.transcribe.return_value = {
+        "text": "hello",
+        "segments": [{"start": 0.0, "end": 1.0, "text": " hello "}],
+    }
+    with caplog.at_level(logging.INFO):
+        artifacts = _whisper_transcribe_to_artifacts(
+            whisper,
+            clip,
+            work,
+            language=None,
+            should_cancel=None,
+            progress=None,
+            run_id="run-a",
+        )
+    assert artifacts.transcript_text == "hello"
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "stage=whisper_transcribe_complete run_id=run-a raw_segment_count=1 "
+        "elapsed_s=" in message
+        for message in messages
+    )
+    assert any(
+        "stage=cleanup_intermediate_audio_start run_id=run-a segment_count=1 "
+        "transcript_chars=5" in message
+        for message in messages
+    )
+    assert any(
+        "stage=cleanup_intermediate_audio_complete run_id=run-a segment_count=1 "
+        "transcript_chars=5 elapsed_s=" in message
+        for message in messages
+    )
 
 
 def test_map_video_qa_progress_frac_to_200_splits_pre_vlm_and_vlm() -> None:

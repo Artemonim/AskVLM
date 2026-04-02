@@ -232,11 +232,13 @@ class VideoQAWhisperTranscriptProvider:
     def prepare_transcript(
         self,
         _context: VideoQAContextBundle,
-        _manifest: VideoQARunManifest,
+        manifest: VideoQARunManifest,
     ) -> VideoQATranscriptArtifacts:
         """Transcribe prepared audio and return segment-aligned transcript text."""
+        run_id = manifest.run_id
         if self._pipeline_log:
             self._pipeline_log("→ Stage: transcript_prepare (local Whisper ASR)")
+        prepare_t0 = time.perf_counter()
         artifacts = _whisper_transcribe_to_artifacts(
             self._whisper,
             self._media_path,
@@ -245,13 +247,39 @@ class VideoQAWhisperTranscriptProvider:
             should_cancel=self._should_cancel,
             progress=self._progress,
             pipeline_log=self._pipeline_log,
+            run_id=run_id,
+        )
+        prepare_elapsed_s = time.perf_counter() - prepare_t0
+        logger.info(
+            "video_qa_local_run: stage=transcript_prepare_complete run_id=%s "
+            "segment_count=%d transcript_chars=%d elapsed_s=%.4f",
+            run_id,
+            len(artifacts.segments),
+            len(artifacts.transcript_text),
+            prepare_elapsed_s,
         )
         if self._pipeline_log:
             self._pipeline_log("✓ Stage: transcript_prepare complete")
             self._pipeline_log("→ Initiating Whisper VRAM unload (safe=False)")
+        unload_t0 = time.perf_counter()
+        logger.info(
+            "video_qa_local_run: stage=whisper_unload_start run_id=%s "
+            "segment_count=%d transcript_chars=%d",
+            run_id,
+            len(artifacts.segments),
+            len(artifacts.transcript_text),
+        )
         # * Drop faster-whisper weights from VRAM before chunk VLM / LM HTTP work.
         # * WhisperXWrapper.unload() is best-effort and suppresses internal failures.
         self._whisper.unload(safe=False)
+        logger.info(
+            "video_qa_local_run: stage=whisper_unload_complete run_id=%s "
+            "segment_count=%d transcript_chars=%d elapsed_s=%.4f",
+            run_id,
+            len(artifacts.segments),
+            len(artifacts.transcript_text),
+            time.perf_counter() - unload_t0,
+        )
         if self._pipeline_log:
             self._pipeline_log("✓ Whisper VRAM unload finished")
         return artifacts
@@ -266,6 +294,7 @@ def _whisper_transcribe_to_artifacts(  # noqa: C901
     should_cancel: Callable[[], bool] | None,
     progress: Callable[[str, float], None] | None,
     pipeline_log: Callable[[str], None] | None = None,
+    run_id: str | None = None,
 ) -> VideoQATranscriptArtifacts:
     """Run faster-whisper transcription and normalize segment tuples."""
     if progress:
@@ -300,13 +329,22 @@ def _whisper_transcribe_to_artifacts(  # noqa: C901
     if pipeline_log:
         pipeline_log("→ Transcribing audio segments…")
 
+    transcribe_t0 = time.perf_counter()
     tx = whisper.transcribe(
         audio_path,
         language=language,
         on_segment=_on_segment,
         progress=None,
     )
+    transcribe_elapsed_s = time.perf_counter() - transcribe_t0
     segments_raw = tx.get("segments", []) or []
+    logger.info(
+        "video_qa_local_run: stage=whisper_transcribe_complete run_id=%s "
+        "raw_segment_count=%d elapsed_s=%.4f",
+        run_id,
+        len(segments_raw),
+        transcribe_elapsed_s,
+    )
     segments: list[tuple[float, float, str]] = []
     for raw in segments_raw:
         if not isinstance(raw, dict):
@@ -316,7 +354,23 @@ def _whisper_transcribe_to_artifacts(  # noqa: C901
         text = str(raw.get("text", "")).strip()
         segments.append((t0, t1, text))
     body = str(tx.get("text", "")).strip()
+    logger.info(
+        "video_qa_local_run: stage=cleanup_intermediate_audio_start run_id=%s "
+        "segment_count=%d transcript_chars=%d",
+        run_id,
+        len(segments),
+        len(body),
+    )
+    cleanup_t0 = time.perf_counter()
     cleanup_intermediate_audio(media_path, work_dir)
+    logger.info(
+        "video_qa_local_run: stage=cleanup_intermediate_audio_complete run_id=%s "
+        "segment_count=%d transcript_chars=%d elapsed_s=%.4f",
+        run_id,
+        len(segments),
+        len(body),
+        time.perf_counter() - cleanup_t0,
+    )
     if pipeline_log:
         pipeline_log("✓ Transcription finished")
     return VideoQATranscriptArtifacts(

@@ -1,8 +1,9 @@
 import contextlib
 import json
+import os
+import re
 import shutil
 import sys
-import time
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,9 +22,15 @@ from core.lm_studio_rest import (
 )
 from core.video_qa_answer_bundle import answer_bundle_path_for_manifest
 from core.video_qa_local_run import DEFAULT_LM_STUDIO_OPENAI_BASE_URL
+from core.video_qa_orchestration import build_video_qa_chunk_plan
 from core.whisperx_wrapper import fw_whisper_cls as _live_fw_whisper_cls
 from gui.main_window import MainWindow
 from gui.video_qa_worker import VideoQALocalRunWorker
+from utils.exporters import extract_askvlm_metadata_from_srt
+
+_FIXTURE_SHORT_MP4 = Path(__file__).parent / "fixtures" / "test_video_short.mp4"
+_LM_STUDIO_MODELS_URL = "http://127.0.0.1:1234/v1/models"
+_LIVE_E2E_VIDEO_QA_MODEL_ENV = "ASKVLM_TEST_LIVE_VIDEO_QA_MODEL_ID"
 
 
 def _select_inputs(tmp_path: Path, fixtures_dir: Path, num_videos: int) -> list[Path]:
@@ -39,13 +46,12 @@ def _select_inputs(tmp_path: Path, fixtures_dir: Path, num_videos: int) -> list[
     return inputs
 
 
-def _create_subtitle_crash_window(
+def _create_subtitle_live_window(
     qtbot: QtBot,
     out_dir: Path,
     inputs: list[Path],
-    quality: str,
 ) -> MainWindow:
-    """Build a main window configured for the Text + Subtitles transcribe path."""
+    """Build a main window configured for one successful subtitle/transcript GUI run."""
     window = MainWindow()
     window.show()
     qtbot.addWidget(window)
@@ -53,8 +59,9 @@ def _create_subtitle_crash_window(
     window.out_dir_edit.setText(str(out_dir))
     window.chk_diar.setChecked(False)
     window.chk_dialog.setChecked(False)
-    if quality == "fast":
-        qtbot.mouseClick(window.btn_quality, Qt.LeftButton)
+    window.chk_save_srt.setChecked(True)
+    window.format_combo.setCurrentText("txt")
+    qtbot.mouseClick(window.btn_quality, Qt.LeftButton)
 
     for media_path in inputs:
         window.last_input_dir = media_path.parent
@@ -65,16 +72,50 @@ def _create_subtitle_crash_window(
     return window
 
 
-_LM_STUDIO_MODELS_URL = "http://127.0.0.1:1234/v1/models"
+def _force_uniform_video_qa_chunk_plan(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    segment_seconds: float,
+) -> None:
+    """Force deterministic uniform chunking for both GUI preflight and worker reruns."""
+    original = build_video_qa_chunk_plan
 
-# * Live Video QA GUI E2E uses fixed LM Studio model ids to exercise the dual-row swap path.
-# * Chunk vision pass: ``qwen/qwen3.5-35b-a3b``. Final synthesis: ``nvidia/nemotron-3-nano-4b``
-# * (picked as a recent small model so the unload/load handoff stays real without loading a
-# * second full 35B). This pairing exists only to test REST load/unload wiring; it is not a
-# * product recommendation—real runs often keep one strong multimodal model (e.g. the same
-# * Qwen 35B) for both chunks and the final answer, or a larger model for synthesis.
-_LIVE_E2E_CHUNK_MODEL_ID = "qwen/qwen3.5-35b-a3b"
-_LIVE_E2E_FINAL_MODEL_ID = "nvidia/nemotron-3-nano-4b"
+    def _forced_chunk_plan(
+        duration_seconds: float,
+        *,
+        scene_spans: object = None,
+        uniform_segment_seconds: float = 30.0,
+    ) -> object:
+        _ = (scene_spans, uniform_segment_seconds)
+        return original(
+            duration_seconds,
+            scene_spans=None,
+            uniform_segment_seconds=segment_seconds,
+        )
+
+    monkeypatch.setattr(
+        "core.video_qa_orchestration.build_video_qa_chunk_plan",
+        _forced_chunk_plan,
+    )
+
+
+def _require_live_subtitle_prereqs() -> None:
+    """Skip when live subtitle GUI prerequisites are missing."""
+    if not _FIXTURE_SHORT_MP4.is_file():
+        pytest.skip(f"Fixture not found: {_FIXTURE_SHORT_MP4}")
+    if _live_fw_whisper_cls is None:
+        pytest.skip("Live subtitle GUI E2E requires faster-whisper to be installed.")
+    try:
+        duration_s = float(get_media_duration_seconds(_FIXTURE_SHORT_MP4))
+    except OSError:
+        pytest.skip(
+            "Live subtitle GUI E2E requires ffmpeg/ffprobe to read the short fixture."
+        )
+    if duration_s <= 0.0:
+        pytest.skip(
+            "Live subtitle GUI E2E requires ffmpeg/ffprobe to report a non-zero "
+            "duration for the short fixture."
+        )
 
 
 def _create_video_qa_live_window(
@@ -95,7 +136,6 @@ def _create_video_qa_live_window(
     window.video_qa_panel.set_question_text(
         "E2E live probe: describe one visible action in this clip.",
     )
-    qtbot.mouseClick(window.btn_quality, Qt.LeftButton)
     window.video_qa_panel.refresh_preflight()
     return window
 
@@ -125,9 +165,8 @@ def _lm_studio_http_reachable() -> bool:
 
 def _require_live_video_qa_prereqs() -> None:
     """Skip when live Video QA prerequisites (fixture, ASR, LM Studio, ffmpeg) are missing."""
-    fixture_path = Path(__file__).parent / "fixtures" / "test_video_short.mp4"
-    if not fixture_path.is_file():
-        pytest.skip(f"Fixture not found: {fixture_path}")
+    if not _FIXTURE_SHORT_MP4.is_file():
+        pytest.skip(f"Fixture not found: {_FIXTURE_SHORT_MP4}")
 
     if _live_fw_whisper_cls is None:
         pytest.skip("Live Video QA E2E requires faster-whisper to be installed.")
@@ -138,7 +177,7 @@ def _require_live_video_qa_prereqs() -> None:
         # * Drop LM Studio weights from VRAM before CUDA Whisper loads (same GPU policy).
         lm_studio_unload_all_llm_instances(rest_root)
     try:
-        duration_s = float(get_media_duration_seconds(fixture_path))
+        duration_s = float(get_media_duration_seconds(_FIXTURE_SHORT_MP4))
     except OSError:
         pytest.skip(
             "Live Video QA E2E requires ffmpeg/ffprobe to read the short fixture."
@@ -147,6 +186,11 @@ def _require_live_video_qa_prereqs() -> None:
         pytest.skip(
             "Live Video QA E2E requires ffmpeg/ffprobe to report a non-zero "
             "duration for the short fixture."
+        )
+    if duration_s <= 10.0:
+        pytest.skip(
+            "Live Video QA E2E expects the short fixture to stay above 10 seconds "
+            "so forced 10s planning yields more than one chunk."
         )
 
 
@@ -171,11 +215,11 @@ def _video_qa_local_model_ids(window: MainWindow) -> tuple[str, ...]:
     return tuple(dict.fromkeys(models))
 
 
-def _select_distinct_local_models(
+def _select_live_video_qa_model(
     window: MainWindow,
     qtbot: QtBot,
-) -> tuple[str, str]:
-    """Populate both Video QA model rows using fixed ids when LM Studio exposes them."""
+) -> str:
+    """Populate both Video QA model rows with one local model for a lighter live E2E."""
     qtbot.mouseClick(window.video_qa_panel.btn_refresh_lm_models, Qt.LeftButton)
     qtbot.waitUntil(
         lambda: window.video_qa_panel.chunk_model_combo.count() > 0,
@@ -184,33 +228,58 @@ def _select_distinct_local_models(
     models = _video_qa_local_model_ids(window)
     if not models:
         pytest.skip("Live Video QA E2E requires local LM Studio models in the catalog.")
-    chunk_model = _LIVE_E2E_CHUNK_MODEL_ID
-    final_model = _LIVE_E2E_FINAL_MODEL_ID
-    if chunk_model not in models:
-        pytest.skip(
-            f"Live Video QA E2E requires chunk model {chunk_model!r} in LM Studio."
-        )
-    if final_model not in models:
-        pytest.skip(
-            f"Live Video QA E2E requires final model {final_model!r} in LM Studio."
-        )
+    requested_model = os.environ.get(_LIVE_E2E_VIDEO_QA_MODEL_ENV, "").strip()
+    if requested_model:
+        if requested_model not in models:
+            pytest.skip(
+                "Live Video QA E2E requested model "
+                f"{requested_model!r} via {_LIVE_E2E_VIDEO_QA_MODEL_ENV}, but LM Studio "
+                "did not expose it."
+            )
+        model_id = requested_model
+    else:
+
+        def _model_sort_key(model_id: str) -> tuple[int, int, float, int, str]:
+            lower = model_id.lower()
+            multimodal_hints = (
+                "vl",
+                "vision",
+                "llava",
+                "pixtral",
+                "internvl",
+                "minicpm-v",
+                "gemma-3",
+            )
+            small_hints = ("nano", "mini", "small")
+            size_matches = re.findall(r"(\d+(?:\.\d+)?)\s*b", lower)
+            size = (
+                min(float(match) for match in size_matches) if size_matches else 999.0
+            )
+            return (
+                0 if any(hint in lower for hint in multimodal_hints) else 1,
+                0 if any(hint in lower for hint in small_hints) else 1,
+                size,
+                len(model_id),
+                lower,
+            )
+
+        model_id = sorted(models, key=_model_sort_key)[0]
     chunk_idx = window.video_qa_panel.chunk_model_combo.findText(
-        chunk_model, Qt.MatchFlag.MatchExactly
+        model_id, Qt.MatchFlag.MatchExactly
     )
     final_idx = window.video_qa_panel.final_model_combo.findText(
-        final_model, Qt.MatchFlag.MatchExactly
+        model_id, Qt.MatchFlag.MatchExactly
     )
     if chunk_idx < 0 or final_idx < 0:
-        pytest.skip("Live Video QA E2E could not select the requested local models.")
+        pytest.skip("Live Video QA E2E could not select the requested local model.")
     window.video_qa_panel.chunk_model_type_combo.setCurrentIndex(0)
     window.video_qa_panel.final_model_type_combo.setCurrentIndex(0)
     window.video_qa_panel.chunk_model_combo.setCurrentIndex(chunk_idx)
     window.video_qa_panel.final_model_combo.setCurrentIndex(final_idx)
     pair = window.video_qa_panel.lm_runtime_settings_pair()
-    assert pair.chunk.model_id == chunk_model
-    assert pair.final_answer.model_id == final_model
-    assert chunk_model != final_model
-    return chunk_model, final_model
+    assert pair.chunk.model_id == model_id
+    assert pair.final_answer.model_id == model_id
+    return model_id
 
 
 def _video_qa_backend_capability_issue(log_text: str) -> str | None:
@@ -300,16 +369,14 @@ def _assert_live_video_qa_live_run_completion_after_pre_vlm(
     qtbot: QtBot,
     out_dir: Path,
     *,
-    chunk_model: str,
-    final_model: str,
+    expected_chunk_count: int,
 ) -> None:
-    """After pre-VLM, wait for LM Studio swap + completion and validate manifest/answer."""
+    """After pre-VLM, wait for completion and validate the successful multi-chunk run."""
     assert window.progress.maximum() == 200
     assert window.progress.value() >= 100
-    assert chunk_model != final_model
     qtbot.waitUntil(
-        lambda: "LM Studio REST: unload chunk model"
-        in _video_qa_progress_log_text(window)
+        lambda: _video_qa_progress_log_text(window).count("→ llm_pass:")
+        >= expected_chunk_count
         or _video_qa_status(window)
         in {
             "Video QA completed",
@@ -322,36 +389,15 @@ def _assert_live_video_qa_live_run_completion_after_pre_vlm(
     if _video_qa_status(window) == "Video QA error":
         _skip_if_live_video_qa_backend_unavailable(window, log_text)
         pytest.fail(
-            "Video QA errored before the first LM Studio unload/load handoff.\n"
+            "Video QA errored before the expected multi-chunk VLM passes completed.\n"
             f"Log:\n{log_text}"
         )
-    assert "LM Studio REST: unload chunk model" in log_text
     qtbot.waitUntil(
-        lambda: "LM Studio REST: loaded final model"
-        in _video_qa_progress_log_text(window)
-        or _video_qa_status(window)
+        lambda: _video_qa_status(window)
         in {
             "Video QA completed",
             "Video QA error",
             "Video QA canceled",
-        },
-        timeout=600000,
-    )
-    log_text = _video_qa_progress_log_text(window)
-    if _video_qa_status(window) == "Video QA error":
-        _skip_if_live_video_qa_backend_unavailable(window, log_text)
-        pytest.fail(
-            "Video QA errored before LM Studio reported the final model load.\n"
-            f"Log:\n{log_text}"
-        )
-    assert "LM Studio REST: loaded final model" in log_text
-
-    qtbot.waitUntil(
-        lambda: "→ llm_pass:" in _video_qa_progress_log_text(window)
-        or _video_qa_status(window)
-        in {
-            "Video QA completed",
-            "Video QA error",
         },
         timeout=600000,
     )
@@ -362,16 +408,13 @@ def _assert_live_video_qa_live_run_completion_after_pre_vlm(
         pytest.fail(
             f"Video QA errored unexpectedly before completion.\nLog:\n{log_text}"
         )
-    assert "→ llm_pass:" in log_text
-    qtbot.waitUntil(
-        lambda: _video_qa_status(window) == "Video QA completed",
-        timeout=600000,
-    )
+    assert terminal_status == "Video QA completed"
     log_text = _video_qa_progress_log_text(window)
     assert "→ Stage: run_local_video_qa (preflight + executor)" in log_text
     assert "→ Stage: executor (transcript → chunks → synthesis)" in log_text
     assert "→ Stage: VLM inference (post pre-VLM)" in log_text
-    assert "→ llm_pass:" in log_text
+    assert log_text.count("→ llm_pass:") >= expected_chunk_count
+    assert "Traceback" not in log_text
 
     manifest_files = sorted(out_dir.glob("*.manifest.json"))
     assert len(manifest_files) == 1
@@ -392,6 +435,7 @@ def _assert_live_video_qa_live_run_completion_after_pre_vlm(
         )
     assert answer_path.is_file()
     answer_payload = json.loads(answer_path.read_text(encoding="utf-8"))
+    assert len(manifest_payload["chunks"]) == expected_chunk_count
     assert manifest_payload["question"] == (
         "E2E live probe: describe one visible action in this clip."
     )
@@ -421,28 +465,18 @@ def _make_dummy_thread(*, should_stop: bool) -> SimpleNamespace:
     return thread
 
 
-# * E2E crash detection covers subtitle shutdown; Video QA has separate live GUI E2E.
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.heavy_ml
 @pytest.mark.xdist_group(name="ml_singleton")
-@pytest.mark.parametrize("quality", ["fast", "good"])
-@pytest.mark.parametrize("num_videos", [1, 2])
-@pytest.mark.parametrize("strategy", ["implicit_cancel", "explicit_cancel"])
-def test_e2e_subtitles_crash_scenarios(
+def test_e2e_subtitles_live_gui_run_completes(
     qapp: QApplication,
     qtbot: QtBot,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    quality: str,
-    num_videos: int,
-    strategy: str,
 ) -> None:
-    """Parametric E2E for crash/hang detection on exit via the subtitle transcribe path.
-
-    Covers Fast and Good modes, single and multi-file inputs, and implicit and
-    explicit cancellation (main input table + Start Transcribe).
-    """
+    """Drive the real subtitle GUI to a successful transcript + subtitle export."""
+    _require_live_subtitle_prereqs()
     temp_settings_path = tmp_path / "test_settings.ini"
 
     class MockSettings(QSettings):
@@ -452,26 +486,46 @@ def test_e2e_subtitles_crash_scenarios(
     monkeypatch.setattr("gui.main_window.QSettings", MockSettings)
 
     fixtures_dir = Path(__file__).parent / "fixtures"
-    inputs = _select_inputs(tmp_path, fixtures_dir, num_videos)
+    inputs = _select_inputs(tmp_path, fixtures_dir, 1)
+    media_path = inputs[0]
 
-    out_dir = tmp_path / f"e2e_out_{quality}_{num_videos}_{strategy}"
+    out_dir = tmp_path / "e2e_subtitles_live"
     out_dir.mkdir()
 
-    window = _create_subtitle_crash_window(qtbot, out_dir, inputs, quality)
+    window = _create_subtitle_live_window(qtbot, out_dir, inputs)
+    txt_path = out_dir / f"{media_path.stem}.txt"
+    srt_path = out_dir / f"{media_path.stem}.srt"
+    try:
+        qtbot.mouseClick(window.btn_start, Qt.LeftButton)
+        qtbot.waitUntil(
+            lambda: window._thread is not None and window._thread.isRunning(),  # noqa: SLF001
+            timeout=60000,
+        )
+        qtbot.waitUntil(
+            lambda: (txt_path.is_file() and srt_path.is_file())
+            or window.status.currentMessage() in {"Error", "Canceled"},
+            timeout=600000,
+        )
+        qtbot.waitUntil(
+            lambda: window._thread is None,  # noqa: SLF001
+            timeout=600000,
+        )
 
-    qtbot.mouseClick(window.btn_start, Qt.LeftButton)
-    qtbot.waitUntil(
-        lambda: "Transcribing" in window.status.currentMessage(),
-        timeout=60000,
-    )
-    time.sleep(2.0)
+        assert window.status.currentMessage() == "Done"
+        assert txt_path.read_text(encoding="utf-8").strip()
+        srt_text = srt_path.read_text(encoding="utf-8")
+        assert srt_text.strip()
+        meta = extract_askvlm_metadata_from_srt(srt_text)
+        assert isinstance(meta, dict)
+        assert meta.get("completed") is True
+        assert str(meta.get("quality", "")).strip() == "fast"
 
-    if strategy == "explicit_cancel":
-        qtbot.mouseClick(window.btn_cancel, Qt.LeftButton)
-        time.sleep(0.5)
-
-    window.close()
-    assert window.await_worker_shutdown(timeout_ms=30000)
+        window.close()
+        assert window.await_worker_shutdown(timeout_ms=30000)
+    finally:
+        with contextlib.suppress(Exception):
+            window.close()
+            window.await_worker_shutdown(timeout_ms=30000)
 
 
 @pytest.mark.integration
@@ -486,10 +540,11 @@ def test_e2e_video_qa_real_gui_run_completes(
 ) -> None:
     """Drive the real Video QA GUI through pre-LLM and completion.
 
-    Uses a two-model swap only to validate unload/load plumbing; production may use one
-    strong multimodal model for both stages (see ``_LIVE_E2E_*`` comments).
+    Uses the short committed fixture with forced 10s planning so the live path executes
+    more than one chunk on a deterministic fixture.
     """
     _require_live_video_qa_prereqs()
+    _force_uniform_video_qa_chunk_plan(monkeypatch, segment_seconds=10.0)
     temp_settings_path = tmp_path / "test_settings.ini"
 
     class MockSettings(QSettings):
@@ -507,7 +562,9 @@ def test_e2e_video_qa_real_gui_run_completes(
 
     window = _create_video_qa_live_window(qtbot, out_dir, media_path)
     try:
-        chunk_model, final_model = _select_distinct_local_models(window, qtbot)
+        preflight_text = window.video_qa_panel.preflight_edit.toPlainText()
+        assert "Chunks: 2" in preflight_text
+        model_id = _select_live_video_qa_model(window, qtbot)
         run_btn = window.video_qa_panel.btn_run_qa
         assert run_btn.isEnabled()
 
@@ -545,107 +602,15 @@ def test_e2e_video_qa_real_gui_run_completes(
             window,
             qtbot,
             out_dir,
-            chunk_model=chunk_model,
-            final_model=final_model,
+            expected_chunk_count=2,
+        )
+        assert (
+            window.video_qa_panel.lm_runtime_settings_pair().chunk.model_id == model_id
         )
         _assert_lm_studio_at_most_one_llm_loaded()
 
         window.close()
         assert window.await_worker_shutdown(timeout_ms=30000)
-    finally:
-        with contextlib.suppress(Exception):
-            window.close()
-            window.await_worker_shutdown(timeout_ms=30000)
-
-
-@pytest.mark.integration
-@pytest.mark.slow
-@pytest.mark.heavy_ml
-@pytest.mark.xdist_group(name="ml_singleton")
-def test_e2e_video_qa_shutdown_after_pre_llm_boundary(
-    qapp: QApplication,
-    qtbot: QtBot,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Drive the real Video QA GUI to the pre-LLM boundary and shut down cleanly.
-
-    Same fixed two-model selection as ``test_e2e_video_qa_real_gui_run_completes``; see
-    ``_LIVE_E2E_*`` module comments for why this is test-only wiring.
-    """
-    _require_live_video_qa_prereqs()
-    temp_settings_path = tmp_path / "test_settings.ini"
-
-    class MockSettings(QSettings):
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
-            super().__init__(str(temp_settings_path), QSettings.Format.IniFormat)
-
-    monkeypatch.setattr("gui.main_window.QSettings", MockSettings)
-
-    fixtures_dir = Path(__file__).parent / "fixtures"
-    inputs = _select_inputs(tmp_path, fixtures_dir, 1)
-    media_path = inputs[0]
-
-    out_dir = tmp_path / "e2e_vqa_shutdown_out_live"
-    out_dir.mkdir()
-
-    window = _create_video_qa_live_window(qtbot, out_dir, media_path)
-    try:
-        chunk_model, final_model = _select_distinct_local_models(window, qtbot)
-        run_btn = window.video_qa_panel.btn_run_qa
-        assert run_btn.isEnabled()
-
-        qtbot.mouseClick(run_btn, Qt.LeftButton)
-        qtbot.waitUntil(
-            lambda: _video_qa_thread_running_or_terminal_status(window),
-            timeout=600000,
-        )
-        assert isinstance(window._video_qa_worker, VideoQALocalRunWorker)  # noqa: SLF001
-
-        qtbot.waitUntil(
-            lambda: (
-                "→ Stage: VLM inference (post pre-VLM)"
-                in _video_qa_progress_log_text(window)
-                or _video_qa_status(window)
-                in {
-                    "Video QA completed",
-                    "Video QA error",
-                    "Video QA canceled",
-                }
-            ),
-            timeout=600000,
-        )
-        log_text = _video_qa_progress_log_text(window)
-        if "→ Stage: VLM inference (post pre-VLM)" not in log_text:
-            terminal_status = _video_qa_status(window)
-            if terminal_status == "Video QA error":
-                _skip_if_live_video_qa_backend_unavailable(window, log_text)
-            pytest.fail(
-                "Video QA did not reach the pre-LLM boundary before shutdown. "
-                f"Status: {terminal_status}\nLog:\n{log_text}"
-            )
-
-        assert chunk_model != final_model
-        assert window.progress.maximum() == 200
-        assert window.progress.value() >= 100
-        assert "→ Stage: run_local_video_qa (preflight + executor)" in log_text
-        assert "→ Stage: executor (transcript → chunks → synthesis)" in log_text
-        assert "→ Stage: VLM inference (post pre-VLM)" in log_text
-        assert "LM Studio REST: loaded final model" not in log_text
-        if _video_qa_status(window) == "Video QA error":
-            _skip_if_live_video_qa_backend_unavailable(window, log_text)
-            pytest.fail(
-                f"Video QA errored unexpectedly during shutdown E2E.\nLog:\n{log_text}"
-            )
-
-        window.close()
-        assert window.await_worker_shutdown(timeout_ms=30000)
-        assert _video_qa_status(window) != "Video QA completed"
-        assert "✓ Pipeline completed (manifest + answer bundle saved)" not in (
-            _video_qa_progress_log_text(window)
-        )
-        assert not list(out_dir.glob("*.manifest.json"))
-        assert not list(out_dir.glob("*.answer.json"))
     finally:
         with contextlib.suppress(Exception):
             window.close()

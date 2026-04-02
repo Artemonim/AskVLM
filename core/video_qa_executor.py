@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Final, Literal, Protocol, runtime_checkable
 
@@ -231,6 +232,7 @@ def run_video_qa_executor(  # noqa: C901, PLR0915
     """
     rep = representative_frame_policy or default_representative_frame_policy()
     stages: list[str] = []
+    executor_t0 = time.perf_counter()
     run_id = manifest.run_id
     logger.info(
         "video_qa_executor: enter run_id=%s planned_chunks=%d",
@@ -251,7 +253,17 @@ def run_video_qa_executor(  # noqa: C901, PLR0915
 
     stages.append("transcript_prepare")
     logger.info("video_qa_executor: stage transcript_prepare run_id=%s", run_id)
+    transcript_t0 = time.perf_counter()
     transcript = deps.transcript.prepare_transcript(context, working)
+    logger.info(
+        "video_qa_executor: stage=transcript_prepare_complete run_id=%s "
+        "segment_count=%d transcript_chars=%d planned_chunks=%d elapsed_s=%.4f",
+        run_id,
+        len(transcript.segments),
+        len(transcript.transcript_text),
+        len(planned_chunks),
+        time.perf_counter() - transcript_t0,
+    )
 
     stages.append("chunk_plan")
     logger.info("video_qa_executor: stage chunk_plan run_id=%s", run_id)
@@ -285,6 +297,20 @@ def run_video_qa_executor(  # noqa: C901, PLR0915
         rep_ts = rep.timestamp_for_span(record.t_start, record.t_end)
         stages.append(f"frame_select:{chunk_id}")
         if not first_active_chunk_logged:
+            pending_chunks = sum(
+                1 for chunk in working.chunks if chunk.status != "completed"
+            )
+            logger.info(
+                "video_qa_executor: stage=chunk_work_entry run_id=%s "
+                "first_chunk_id=%s pending_chunks=%d total_chunks=%d "
+                "transcript_segments=%d elapsed_s=%.4f",
+                run_id,
+                chunk_id,
+                pending_chunks,
+                len(working.chunks),
+                len(transcript.segments),
+                time.perf_counter() - executor_t0,
+            )
             logger.info(
                 "video_qa_executor: first_frame_extraction chunk_id=%s run_id=%s",
                 chunk_id,

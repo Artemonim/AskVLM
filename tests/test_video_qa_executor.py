@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -311,6 +312,47 @@ def test_stage_order_matches_pipeline(tmp_path: Path) -> None:
     assert seq.index("frame_select:a") < seq.index("llm_pass:a")
     assert seq.index("llm_pass:a") < seq.index("frame_select:b")
     assert seq.index("frame_select:b") < seq.index("llm_pass:b")
+
+
+def test_executor_logs_post_transcript_and_chunk_entry(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Executor logs the post-ASR boundary before chunk planning and work."""
+    bundle = _minimal_bundle(tmp_path)
+    plan = (
+        VideoQAPlannedChunk(
+            chunk_id="a", t_start=0.0, t_end=5.0, planning_mode="uniform_grid"
+        ),
+    )
+    manifest = merge_planned_chunks_into_manifest(
+        _manifest_with_chunks(bundle, ()),
+        plan,
+    )
+    deps = VideoQAExecutorDeps(
+        transcript=_RecordingTranscript("t"),
+        frame_materializer=_RecordingFrames(),
+        chunk_inferencer=_GateInferencer(fail_ids=frozenset()),
+        answer_aggregator=_Aggregator("run-logs"),
+    )
+    with caplog.at_level(logging.INFO):
+        run_video_qa_executor(
+            context=bundle,
+            manifest=manifest,
+            planned_chunks=plan,
+            deps=deps,
+        )
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "stage=transcript_prepare_complete run_id=run-exec segment_count=0 "
+        "transcript_chars=1 planned_chunks=1 elapsed_s=" in message
+        for message in messages
+    )
+    assert any(
+        "stage=chunk_work_entry run_id=run-exec first_chunk_id=a "
+        "pending_chunks=1 total_chunks=1 transcript_segments=0 elapsed_s=" in message
+        for message in messages
+    )
 
 
 def test_completed_chunks_skipped_on_resume(tmp_path: Path) -> None:
