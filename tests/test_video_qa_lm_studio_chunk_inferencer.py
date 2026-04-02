@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from core.llm_prompts import CHUNK_ANALYSIS_JSON_SCHEMA
 from core.video_qa_context import normalize_video_qa_context
 from core.video_qa_executor import VideoQATranscriptArtifacts
 from core.video_qa_lm_studio_chunk_inferencer import (
-    CHUNK_ANALYSIS_JSON_SCHEMA,
     VideoQALMStudioChunkInferencer,
 )
 from core.video_qa_lm_studio_client import LMStudioClientError, LMStudioResponse

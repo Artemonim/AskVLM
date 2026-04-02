@@ -3,6 +3,8 @@ import logging
 import os
 from typing import TYPE_CHECKING, Any
 
+from .llm_prompts import build_text_formatting_prompt
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -64,11 +66,7 @@ class LLMFormatter:
         if llm is None:
             return text
         try:
-            prompt = (
-                "You are a text formatter. Add punctuation, fix casing, and split into paragraphs.\n"
-                "Keep the language and do not invent content.\n"
-                f"Text:\n{text}\n\nFormatted:"
-            )
+            prompt = build_text_formatting_prompt(text)
             out = llm(
                 prompt,
                 max_tokens=min(2048, max(256, len(text) // 2)),

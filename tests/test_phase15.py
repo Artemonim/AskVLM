@@ -1,11 +1,13 @@
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from PySide6.QtWidgets import QApplication
 
 from core.diarization import DiarizationPipeline
 from core.llm_formatter import LLMFormatter
+from core.llm_prompts import build_text_formatting_prompt
 from core.whisperx_wrapper import WhisperXWrapper
 from editing.text_model import Document, TextSegment
 from gui.main_window import MainWindow, PipelineWorker
@@ -23,6 +25,42 @@ def test_llm_formatter_identity_when_no_model() -> None:
     fmt = LLMFormatter(model_path=None)
     text = "hello world"
     assert isinstance(fmt.format_text(text), str)
+
+
+def test_llm_formatter_uses_shared_text_prompt_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """LLMFormatter should build its prompt through the shared prompt module."""
+    captured: dict[str, object] = {}
+
+    class FakeLlama:
+        def __init__(self, **kwargs: object) -> None:
+            captured["llama_init_kwargs"] = kwargs
+
+        def __call__(self, prompt: str, **kwargs: object) -> dict[str, object]:
+            captured["prompt"] = prompt
+            captured["call_kwargs"] = kwargs
+            return {"choices": [{"text": "formatted output"}]}
+
+    def fake_import_module(name: str) -> object:
+        if name == "llama_cpp":
+            return SimpleNamespace(Llama=FakeLlama)
+        if name == "torch":
+            raise ModuleNotFoundError(name)
+        msg = f"Unexpected import: {name}"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(
+        "core.llm_formatter.importlib.import_module", fake_import_module
+    )
+    fmt = LLMFormatter(model_path="fake.gguf")
+    assert fmt.format_text("hello world") == "formatted output"
+    assert captured["llama_init_kwargs"] == {
+        "model_path": "fake.gguf",
+        "n_ctx": 2048,
+        "n_gpu_layers": 0,
+    }
+    assert captured["prompt"] == build_text_formatting_prompt("hello world")
 
 
 def test_whisperx_align_fallback_without_whisperx() -> None:

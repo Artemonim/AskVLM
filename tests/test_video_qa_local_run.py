@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from core.llm_prompts import FINAL_SYNTHESIS_JSON_SCHEMA
 from core.video_qa_answer_bundle import (
     ANSWER_BUNDLE_SCHEMA_VERSION,
     VideoQAAnswerBundle,
@@ -22,7 +23,6 @@ from core.video_qa_executor import (
 )
 from core.video_qa_lm_studio_client import LMStudioResponse
 from core.video_qa_local_run import (
-    FINAL_SYNTHESIS_JSON_SCHEMA,
     VideoQAFFmpegFrameMaterializer,
     VideoQALMHttpTarget,
     VideoQALMStudioAnswerSynthesizer,

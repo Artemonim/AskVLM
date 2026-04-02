@@ -17,6 +17,11 @@ from .ffmpeg import (
     extract_frames_for_span,
     get_media_duration_seconds,
 )
+from .llm_prompts import (
+    FINAL_SYNTHESIS_JSON_SCHEMA,
+    VideoQAChunkSynthesisInput,
+    build_final_synthesis_prompt,
+)
 from .lm_studio_rest import (
     LMStudioRestError,
     lm_studio_load_model,
@@ -366,62 +371,6 @@ class VideoQAFFmpegFrameMaterializer:
         return (str(fallback_output.resolve()),)
 
 
-FINAL_SYNTHESIS_INSTRUCTION: Final[str] = (
-    "Synthesize one final user-facing answer from the internal chunk analysis records. "
-    "Return strictly JSON that matches the provided schema. Do not expose chunk ids, "
-    "hidden analysis steps, or chain-of-thought."
-)
-
-FINAL_SYNTHESIS_JSON_SCHEMA: Final[dict[str, object]] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "answer": {
-            "type": "string",
-            "description": "One final answer to the user's question.",
-        },
-        "evidence": {
-            "type": "array",
-            "description": "Grounded evidence items supporting the final answer.",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "transcript_quote": {"type": "string"},
-                    "t_start": {"type": "number"},
-                    "t_end": {"type": "number"},
-                    "frame_refs": {
-                        "type": "array",
-                        "items": {"type": "string"},
-                    },
-                },
-                "required": [
-                    "transcript_quote",
-                    "t_start",
-                    "t_end",
-                    "frame_refs",
-                ],
-            },
-        },
-        "is_uncertain": {"type": "boolean"},
-        "uncertainty_note": {"type": ["string", "null"]},
-    },
-    "required": ["answer", "evidence", "is_uncertain", "uncertainty_note"],
-}
-
-
-@dataclass(frozen=True, slots=True)
-class _VideoQAChunkSynthesisInput:
-    chunk_id: str
-    t_start: float
-    t_end: float
-    transcript_excerpt: str
-    chunk_summary: str
-    observations: tuple[str, ...]
-    confidence: str
-    frame_refs: tuple[str, ...]
-
-
 @dataclass(frozen=True, slots=True)
 class _ParsedChunkAnalysisArtifact:
     chunk_summary: str
@@ -482,10 +431,10 @@ def _collect_chunk_synthesis_inputs(
     manifest: VideoQARunManifest,
     transcript: VideoQATranscriptArtifacts,
     chunk_results: Sequence[VideoQAChunkExecutionResult],
-) -> tuple[tuple[_VideoQAChunkSynthesisInput, ...], bool]:
+) -> tuple[tuple[VideoQAChunkSynthesisInput, ...], bool]:
     """Collect normalized chunk analysis records for the final synthesis pass."""
     manifest_by_id = {chunk.chunk_id: chunk for chunk in manifest.chunks}
-    records: list[_VideoQAChunkSynthesisInput] = []
+    records: list[VideoQAChunkSynthesisInput] = []
     has_low_confidence = False
     for result in chunk_results:
         if result.status not in ("completed", "skipped_completed"):
@@ -506,8 +455,7 @@ def _collect_chunk_synthesis_inputs(
         confidence = parsed.confidence
         has_low_confidence = has_low_confidence or confidence == "low"
         records.append(
-            _VideoQAChunkSynthesisInput(
-                chunk_id=chunk.chunk_id,
+            VideoQAChunkSynthesisInput(
                 t_start=chunk.t_start,
                 t_end=chunk.t_end,
                 transcript_excerpt=_transcript_excerpt_for_chunk(transcript, chunk),
@@ -518,37 +466,6 @@ def _collect_chunk_synthesis_inputs(
             )
         )
     return tuple(records), has_low_confidence
-
-
-def _build_final_synthesis_prompt(
-    context: VideoQAContextBundle,
-    chunk_inputs: Sequence[_VideoQAChunkSynthesisInput],
-) -> str:
-    """Render the final synthesis prompt from context and chunk analysis records."""
-    prompt_parts = [FINAL_SYNTHESIS_INSTRUCTION]
-    context_block = context.render_prompt_block()
-    if context_block:
-        prompt_parts.append(f"Context:\n{context_block}")
-    prompt_parts.append(
-        "Internal chunk analysis records:\n"
-        + json.dumps(
-            [
-                {
-                    "t_start": record.t_start,
-                    "t_end": record.t_end,
-                    "transcript_excerpt": record.transcript_excerpt,
-                    "chunk_summary": record.chunk_summary,
-                    "observations": list(record.observations),
-                    "confidence": record.confidence,
-                    "frame_refs": list(record.frame_refs),
-                }
-                for record in chunk_inputs
-            ],
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return "\n\n".join(prompt_parts)
 
 
 def _validate_final_synthesis_payload(
@@ -663,7 +580,7 @@ class VideoQALMStudioAnswerSynthesizer:
                 manifest_run_id=manifest.run_id,
                 uncertainty_note="The synthesis pass had no completed chunk analysis inputs.",
             )
-        prompt = _build_final_synthesis_prompt(context, chunk_inputs)
+        prompt = build_final_synthesis_prompt(context, chunk_inputs)
         try:
             response = self._request_chat_fn(
                 self._base_url,

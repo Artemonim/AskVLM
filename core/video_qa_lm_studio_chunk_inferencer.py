@@ -5,8 +5,13 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any
 
+from .llm_prompts import (
+    CHUNK_ANALYSIS_INSTRUCTION,
+    CHUNK_ANALYSIS_JSON_SCHEMA,
+    build_chunk_analysis_prompt,
+)
 from .video_qa_executor import (
     VideoQAChunkInferenceOutcome,
 )
@@ -29,33 +34,6 @@ if TYPE_CHECKING:
     from .video_qa_manifest import VideoQAChunkRecord, VideoQARunManifest
 
 logger = logging.getLogger(__name__)
-
-CHUNK_ANALYSIS_INSTRUCTION: Final[str] = (
-    "Analyze the video chunk using the representative frames and transcript context "
-    "below. Respond strictly with JSON that matches the provided schema."
-)
-
-CHUNK_ANALYSIS_JSON_SCHEMA: Final[dict[str, Any]] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "chunk_summary": {
-            "type": "string",
-            "description": "Concise summary of this chunk.",
-        },
-        "observations": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Short observations grounded in frames and transcript.",
-        },
-        "confidence": {
-            "type": "string",
-            "enum": ["low", "medium", "high"],
-            "description": "Confidence in this chunk-level analysis.",
-        },
-    },
-    "required": ["chunk_summary", "observations", "confidence"],
-}
 
 
 def _transcript_summary_for_chunk(
@@ -159,13 +137,13 @@ class VideoQALMStudioChunkInferencer:
         """Run one LM Studio request for the chunk and return normalized artifacts."""
         _ = manifest
         summary = _transcript_summary_for_chunk(transcript, chunk)
-        block = self._context.render_prompt_block(
+        prompt = build_chunk_analysis_prompt(
+            self._context,
             chunk_id=chunk.chunk_id,
             chunk_time_span=(chunk.t_start, chunk.t_end),
             transcript_summary=summary if summary else None,
             frame_refs=frames,
         )
-        prompt = f"{CHUNK_ANALYSIS_INSTRUCTION}\n\n{block}"
         try:
             response = self._request_fn(
                 self._base_url,
