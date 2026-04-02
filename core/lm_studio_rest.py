@@ -7,7 +7,7 @@ import logging
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Any, Final
+from typing import Any, Final, cast
 
 logger = logging.getLogger(__name__)
 
@@ -110,11 +110,149 @@ def lm_studio_load_model(
     return iid.strip()
 
 
+def _rest_entry_is_llm(model_entry: dict[str, Any]) -> bool:
+    """Return True when a ``/api/v1/models`` row is not clearly an embedding model."""
+    raw_type = model_entry.get("type")
+    if raw_type is None:
+        return True
+    lowered = str(raw_type).lower()
+    return "embed" not in lowered
+
+
+def _lm_studio_models_catalog_rows(decoded: object) -> list[object]:
+    """Normalize LM Studio ``GET /api/v1/models`` JSON to a list of catalog rows."""
+    if isinstance(decoded, dict):
+        for key in ("data", "models"):
+            candidate = decoded.get(key)
+            if isinstance(candidate, list):
+                return list(candidate)
+        return []
+    if isinstance(decoded, list):
+        return list(decoded)
+    return []
+
+
+def _lm_studio_fetch_models_catalog_json(
+    rest_root: str,
+    *,
+    bearer: str | None = None,
+    timeout_s: float = 5.0,
+) -> object | None:
+    """Return decoded JSON from ``GET .../api/v1/models``, or None if unreachable."""
+    root = rest_root.rstrip("/")
+    url = f"{root}/api/v1/models"
+    headers: dict[str, str] = {}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    req = urllib.request.Request(url, headers=headers, method="GET")  # noqa: S310
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as response:  # noqa: S310
+            raw = response.read()
+    except OSError:
+        return None
+    try:
+        return cast("object", json.loads(raw.decode("utf-8")))
+    except json.JSONDecodeError:
+        return None
+
+
+def _unique_llm_loaded_instance_ids(decoded: object) -> list[str]:
+    """Return distinct non-empty ``id`` strings from LLM ``loaded_instances`` rows."""
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for row in _lm_studio_models_catalog_rows(decoded):
+        if not isinstance(row, dict) or not _rest_entry_is_llm(row):
+            continue
+        loaded = row.get("loaded_instances")
+        if not isinstance(loaded, list):
+            continue
+        for inst in loaded:
+            if not isinstance(inst, dict):
+                continue
+            iid = inst.get("id")
+            if not isinstance(iid, str) or not iid.strip():
+                continue
+            sid = iid.strip()
+            if sid in seen:
+                continue
+            seen.add(sid)
+            ordered.append(sid)
+    return ordered
+
+
+def lm_studio_unload_all_llm_instances(
+    rest_root: str,
+    *,
+    bearer: str | None = None,
+    list_timeout_s: float = 5.0,
+    unload_timeout_s: float = DEFAULT_LM_STUDIO_UNLOAD_TIMEOUT_S,
+) -> int:
+    """Unload every loaded LLM instance id from the catalog (best effort).
+
+    Uses ``GET /api/v1/models`` then ``POST /api/v1/models/unload`` per instance. Failures are
+    logged and ignored so callers can free VRAM before loading another stack on the same GPU.
+    """
+    decoded = _lm_studio_fetch_models_catalog_json(
+        rest_root, bearer=bearer, timeout_s=list_timeout_s
+    )
+    if decoded is None:
+        return 0
+    n_ok = 0
+    for sid in _unique_llm_loaded_instance_ids(decoded):
+        try:
+            lm_studio_unload_model(
+                rest_root, sid, timeout_s=unload_timeout_s, bearer=bearer
+            )
+        except LMStudioRestError as exc:
+            logger.warning("LM Studio unload failed for instance_id=%s: %s", sid, exc)
+        else:
+            n_ok += 1
+    return n_ok
+
+
+def lm_studio_llm_loaded_instance_count(
+    rest_root: str,
+    *,
+    bearer: str | None = None,
+    timeout_s: float = 5.0,
+) -> int | None:
+    """Return how many LLM instances are loaded (``GET /api/v1/models``), or None if unreachable.
+
+    LM Studio returns catalog rows with ``loaded_instances`` per model; rows that look like
+    embedding models are skipped. When instances expose ``id``, counts are deduplicated so the
+    same loaded slot is not double-counted across multiple catalog rows.
+    """
+    decoded = _lm_studio_fetch_models_catalog_json(
+        rest_root, bearer=bearer, timeout_s=timeout_s
+    )
+    if decoded is None:
+        return None
+    # * Prefer unique instance ids: the same loaded slot may appear under multiple catalog rows.
+    instance_ids: set[str] = set()
+    unkeyed = 0
+    for row in _lm_studio_models_catalog_rows(decoded):
+        if not isinstance(row, dict) or not _rest_entry_is_llm(row):
+            continue
+        loaded = row.get("loaded_instances")
+        if not isinstance(loaded, list):
+            continue
+        for inst in loaded:
+            if isinstance(inst, dict):
+                iid = inst.get("id")
+                if isinstance(iid, str) and iid.strip():
+                    instance_ids.add(iid.strip())
+                    continue
+            unkeyed += 1
+    return len(instance_ids) + unkeyed
+
+
 __all__ = [
     "DEFAULT_LM_STUDIO_LOAD_TIMEOUT_S",
     "DEFAULT_LM_STUDIO_UNLOAD_TIMEOUT_S",
     "LMStudioRestError",
+    "lm_studio_llm_loaded_instance_count",
     "lm_studio_load_model",
+    "lm_studio_unload_all_llm_instances",
     "lm_studio_unload_model",
     "openai_chat_base_to_local_rest_root",
 ]

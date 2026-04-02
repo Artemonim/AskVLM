@@ -1,9 +1,8 @@
-"""Opt-in live integration test against a real LM Studio server."""
+"""Live integration test against a real LM Studio server (skipped by ``-Fast`` via markers)."""
 
 from __future__ import annotations
 
 import base64
-import os
 from typing import TYPE_CHECKING
 
 import pytest
@@ -20,10 +19,7 @@ if TYPE_CHECKING:
 
 @pytest.mark.integration
 @pytest.mark.heavy_ml
-@pytest.mark.skipif(
-    not os.getenv("ASKVLM_RUN_LIVE_LM_STUDIO"),
-    reason="Live LM Studio test (set ASKVLM_RUN_LIVE_LM_STUDIO=1 to run)",
-)
+@pytest.mark.xdist_group(name="ml_singleton")
 def test_live_lm_studio_multimodal_request(tmp_path: Path) -> None:
     """Test a live multimodal structured output request to LM Studio."""
     png_bytes = base64.b64decode(

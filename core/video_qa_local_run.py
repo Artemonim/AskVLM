@@ -245,13 +245,10 @@ class VideoQAWhisperTranscriptProvider:
             self._pipeline_log("✓ Stage: transcript_prepare complete")
             self._pipeline_log("→ Initiating Whisper VRAM unload (safe=False)")
         # * Drop faster-whisper weights from VRAM before chunk VLM / LM HTTP work.
-        try:
-            self._whisper.unload(safe=False)
-            if self._pipeline_log:
-                self._pipeline_log("✓ Whisper VRAM unload finished")
-        except Exception as exc:
-            if self._pipeline_log:
-                self._pipeline_log(f"⚠ Whisper unload threw an exception: {exc}")
+        # * WhisperXWrapper.unload() is best-effort and suppresses internal failures.
+        self._whisper.unload(safe=False)
+        if self._pipeline_log:
+            self._pipeline_log("✓ Whisper VRAM unload finished")
         return artifacts
 
 

@@ -1,3 +1,13 @@
+"""Pytest configuration and shared fixtures.
+
+Heavy ML / LM Studio / GPU integration tests declare
+``@pytest.mark.xdist_group(name="ml_singleton")`` so that with
+``addopts = -n auto --dist=loadgroup`` (see ``pyproject.toml``) pytest-xdist
+assigns them to one worker and runs them sequentially. That keeps at most one
+neural-network-heavy process path active at a time across the suite (policy:
+one active NN stack).
+"""
+
 import shutil
 import sys
 from pathlib import Path

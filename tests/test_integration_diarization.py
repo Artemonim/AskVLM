@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 @pytest.mark.gpu
 @pytest.mark.slow
 @pytest.mark.heavy_ml
-@pytest.mark.xdist_group(name="gpu")
+@pytest.mark.xdist_group(name="ml_singleton")
 def test_diarization_real_file(
     tmp_path: Path, short_audio_fixture: Path, shared_diarization_pipeline: object
 ) -> None:

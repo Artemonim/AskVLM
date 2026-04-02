@@ -15,6 +15,7 @@ from gui.main_window import PipelineWorker
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.heavy_ml
+@pytest.mark.xdist_group(name="ml_singleton")
 def test_queue_real_good_and_fast(tmp_path: Path) -> None:
     """Run real LocalPipeline over multi-file queues in good and fast modes.
 

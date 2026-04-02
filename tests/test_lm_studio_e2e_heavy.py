@@ -10,6 +10,10 @@ from typing import Any
 
 import pytest
 
+from core.lm_studio_rest import (
+    lm_studio_llm_loaded_instance_count,
+    openai_chat_base_to_local_rest_root,
+)
 from core.video_qa_lm_studio_client import LMStudioClientError, request_chat_completion
 from utils.askvlm_defaults import get_default_video_qa_canonical_model_id
 
@@ -46,6 +50,7 @@ def _lm_studio_http_reachable() -> bool:
 @pytest.mark.heavy_ml
 @pytest.mark.slow
 @pytest.mark.integration
+@pytest.mark.xdist_group(name="ml_singleton")
 def test_heavy_lm_studio_multimodal_structured_doc_image() -> None:
     """Structured multimodal request; transport success only (no content checks)."""
     if not _lm_studio_http_reachable():
@@ -98,3 +103,11 @@ def test_heavy_lm_studio_multimodal_structured_doc_image() -> None:
         )
     assert isinstance(response.raw_response, dict)
     assert isinstance(response.finish_reason, str)
+    rest = openai_chat_base_to_local_rest_root("http://127.0.0.1:1234/v1")
+    if rest is not None:
+        n = lm_studio_llm_loaded_instance_count(rest)
+        if n is not None:
+            assert n <= 1, (
+                "Expected at most one loaded LLM instance in LM Studio after the probe; "
+                f"reported {n}."
+            )
