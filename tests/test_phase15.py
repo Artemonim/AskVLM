@@ -1,3 +1,4 @@
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
@@ -68,6 +69,67 @@ def test_whisperx_align_fallback_without_whisperx() -> None:
     wx = WhisperXWrapper(model_name="tiny", device="cuda", compute_type="auto")
     aligned = wx.align(Path("missing.wav"), {"segments": []}, language=None)
     assert isinstance(aligned, list)
+
+
+def test_whisperx_unload_emits_boundary_info_logs(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whisper unload logs each cleanup boundary once for crash diagnosis."""
+    wx = WhisperXWrapper(model_name="tiny", device="cuda", compute_type="auto")
+    wx._model = object()  # noqa: SLF001
+    wx._align_model = object()  # noqa: SLF001
+
+    sync_calls = {"count": 0}
+    empty_calls = {"count": 0}
+    collect_calls = {"count": 0}
+
+    def _collect() -> None:
+        collect_calls["count"] += 1
+
+    def _synchronize() -> None:
+        sync_calls["count"] += 1
+
+    def _empty_cache() -> None:
+        empty_calls["count"] += 1
+
+    monkeypatch.setattr("core.whisperx_wrapper._gc.collect", _collect)
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(
+            synchronize=_synchronize,
+            empty_cache=_empty_cache,
+        )
+    )
+    monkeypatch.setattr(
+        "core.whisperx_wrapper.torch_mod",
+        fake_torch,
+    )
+
+    with caplog.at_level(logging.INFO, logger="core.whisperx_wrapper"):
+        wx.unload(safe=False)
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "core.whisperx_wrapper"
+    ]
+    assert messages == [
+        "WhisperXWrapper.unload: entering (safe=False, device=cuda)",
+        "WhisperXWrapper.unload: before deleting self._model",
+        "WhisperXWrapper.unload: after clearing model refs",
+        "WhisperXWrapper.unload: before torch.cuda.synchronize()",
+        "WhisperXWrapper.unload: after torch.cuda.synchronize()",
+        "WhisperXWrapper.unload: before gc.collect()",
+        "WhisperXWrapper.unload: after gc.collect()",
+        "WhisperXWrapper.unload: before torch.cuda.empty_cache()",
+        "WhisperXWrapper.unload: after torch.cuda.empty_cache()",
+        "WhisperXWrapper.unload: finished",
+    ]
+    assert sync_calls["count"] == 1
+    assert empty_calls["count"] == 1
+    assert collect_calls["count"] == 1
+    assert wx._model is None  # noqa: SLF001
+    assert wx._align_model is None  # noqa: SLF001
 
 
 def test_processing_fixture_twice_produces_two_tabs(tmp_path: Path) -> None:

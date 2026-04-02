@@ -133,32 +133,39 @@ class WhisperXWrapper:
         the chance of VRAM fragmentation or OOM across sequential jobs.
         """
         logger = logging.getLogger(__name__)
-        logger.debug("WhisperXWrapper.unload(safe=%s) starting", safe)
+        logger.info(
+            "WhisperXWrapper.unload: entering (safe=%s, device=%s)",
+            safe,
+            self.device,
+        )
         try:
-            # Drop references to heavy objects
             if getattr(self, "_model", None) is not None:
-                # Some backends may expose a close()/__del__ cleanup implicitly
+                logger.info("WhisperXWrapper.unload: before deleting self._model")
                 with contextlib.suppress(Exception):
-                    logger.debug("Deleting self._model")
                     del self._model
             self._model = None
             self._align_model = None
+            logger.info("WhisperXWrapper.unload: after clearing model refs")
         finally:
-            # Encourage memory reclamation
             if not safe:
                 with contextlib.suppress(Exception):
-                    # Synchronize device to ensure no in-flight kernels access freed memory
                     if (
                         self.device == "cuda"
                         and torch_mod is not None
                         and getattr(torch_mod, "cuda", None) is not None
                         and hasattr(torch_mod.cuda, "synchronize")
                     ):
-                        logger.debug("Calling torch.cuda.synchronize()")
+                        logger.info(
+                            "WhisperXWrapper.unload: before torch.cuda.synchronize()"
+                        )
                         torch_mod.cuda.synchronize()
+                        logger.info(
+                            "WhisperXWrapper.unload: after torch.cuda.synchronize()"
+                        )
+            logger.info("WhisperXWrapper.unload: before gc.collect()")
             with contextlib.suppress(Exception):
-                logger.debug("Calling gc.collect()")
                 _gc.collect()
+            logger.info("WhisperXWrapper.unload: after gc.collect()")
             if not safe:
                 with contextlib.suppress(Exception):
                     if (
@@ -166,9 +173,14 @@ class WhisperXWrapper:
                         and torch_mod is not None
                         and getattr(torch_mod, "cuda", None) is not None
                     ):
-                        logger.debug("Calling torch.cuda.empty_cache()")
+                        logger.info(
+                            "WhisperXWrapper.unload: before torch.cuda.empty_cache()"
+                        )
                         torch_mod.cuda.empty_cache()
-            logger.debug("WhisperXWrapper.unload() finished")
+                        logger.info(
+                            "WhisperXWrapper.unload: after torch.cuda.empty_cache()"
+                        )
+            logger.info("WhisperXWrapper.unload: finished")
 
     def transcribe(
         self,

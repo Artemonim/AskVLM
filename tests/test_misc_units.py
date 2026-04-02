@@ -9,12 +9,39 @@ from utils import logging as logutils
 
 
 def test_setup_logging_and_get_logger() -> None:
-    """setup_logging adds a StreamHandler and sets level; get_logger returns a logger."""
+    """setup_logging adds console + repo log file handlers; get_logger returns a logger."""
     logutils.setup_logging()
     root = logutils.logging.getLogger()
-    assert any(isinstance(h, logutils.logging.StreamHandler) for h in root.handlers)
+    assert any(
+        isinstance(h, logutils.logging.StreamHandler)
+        and not isinstance(h, logutils.logging.FileHandler)
+        for h in root.handlers
+    )
+    repo_root = Path(logutils.__file__).resolve().parent.parent
+    log_path = repo_root / "log.log"
+    assert any(
+        isinstance(h, logutils.logging.FileHandler)
+        and Path(h.baseFilename).resolve() == log_path.resolve()
+        for h in root.handlers
+    )
     lg = logutils.get_logger("x")
     assert lg.name == "x"
+
+
+def test_setup_logging_idempotent_no_duplicate_file_handler() -> None:
+    """Repeated setup_logging does not attach duplicate file handlers for log.log."""
+    logutils.setup_logging()
+    logutils.setup_logging()
+    root = logutils.logging.getLogger()
+    repo_root = Path(logutils.__file__).resolve().parent.parent
+    log_path = repo_root / "log.log"
+    matches = [
+        h
+        for h in root.handlers
+        if isinstance(h, logutils.logging.FileHandler)
+        and Path(h.baseFilename).resolve() == log_path.resolve()
+    ]
+    assert len(matches) == 1
 
 
 def test_ffmpeg_get_media_duration_seconds_success(

@@ -215,6 +215,29 @@ def _video_qa_local_model_ids(window: MainWindow) -> tuple[str, ...]:
     return tuple(dict.fromkeys(models))
 
 
+def _video_qa_model_sort_key(model_id: str) -> tuple[int, int, float, int, str]:
+    """Rank local Video QA models by multimodal fit, then by size and name."""
+    lower = model_id.lower()
+    multimodal_hints = (
+        "vl",
+        "vision",
+        "llava",
+        "pixtral",
+        "internvl",
+        "minicpm-v",
+    )
+    small_hints = ("nano", "mini", "small")
+    size_matches = re.findall(r"(\d+(?:\.\d+)?)\s*b", lower)
+    size = min(float(match) for match in size_matches) if size_matches else 999.0
+    return (
+        0 if any(hint in lower for hint in multimodal_hints) else 1,
+        0 if any(hint in lower for hint in small_hints) else 1,
+        size,
+        len(model_id),
+        lower,
+    )
+
+
 def _select_live_video_qa_model(
     window: MainWindow,
     qtbot: QtBot,
@@ -238,32 +261,7 @@ def _select_live_video_qa_model(
             )
         model_id = requested_model
     else:
-
-        def _model_sort_key(model_id: str) -> tuple[int, int, float, int, str]:
-            lower = model_id.lower()
-            multimodal_hints = (
-                "vl",
-                "vision",
-                "llava",
-                "pixtral",
-                "internvl",
-                "minicpm-v",
-                "gemma-3",
-            )
-            small_hints = ("nano", "mini", "small")
-            size_matches = re.findall(r"(\d+(?:\.\d+)?)\s*b", lower)
-            size = (
-                min(float(match) for match in size_matches) if size_matches else 999.0
-            )
-            return (
-                0 if any(hint in lower for hint in multimodal_hints) else 1,
-                0 if any(hint in lower for hint in small_hints) else 1,
-                size,
-                len(model_id),
-                lower,
-            )
-
-        model_id = sorted(models, key=_model_sort_key)[0]
+        model_id = sorted(models, key=_video_qa_model_sort_key)[0]
     chunk_idx = window.video_qa_panel.chunk_model_combo.findText(
         model_id, Qt.MatchFlag.MatchExactly
     )
@@ -280,6 +278,15 @@ def _select_live_video_qa_model(
     assert pair.chunk.model_id == model_id
     assert pair.final_answer.model_id == model_id
     return model_id
+
+
+def test_live_video_qa_model_selection_does_not_prefer_gemma() -> None:
+    """Video QA model ordering prefers Qwen over Gemma for similar candidates."""
+    models = [
+        "Gemma-3-4B-Instruct",
+        "Qwen3.5-VL-4B-Instruct",
+    ]
+    assert sorted(models, key=_video_qa_model_sort_key)[0] == "Qwen3.5-VL-4B-Instruct"
 
 
 def _video_qa_backend_capability_issue(log_text: str) -> str | None:
