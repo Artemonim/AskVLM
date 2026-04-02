@@ -361,13 +361,13 @@ class VideoQAPanel(QWidget):
         root.addWidget(pre_box)
 
     def _make_lm_model_row_widgets(self) -> tuple[QComboBox, QComboBox, QLineEdit]:
-        """Build one Local/Cloud row: type combo, LM model combo, cloud model field."""
+        """Build one Local/OpenRouter row: type combo, LM model combo, OpenRouter model field."""
         type_combo = QComboBox()
-        type_combo.addItems(["Local (LM Studio)", "Cloud"])
+        type_combo.addItems(["Local (LM Studio)", "OpenRouter"])
         local_combo = QComboBox()
         local_combo.setEditable(False)
         cloud_edit = QLineEdit()
-        cloud_edit.setPlaceholderText("Enter cloud model name")
+        cloud_edit.setPlaceholderText("OpenRouter model id")
         cloud_edit.setVisible(False)
         return type_combo, local_combo, cloud_edit
 
@@ -469,13 +469,13 @@ class VideoQAPanel(QWidget):
         self.preflight_summary_form.addRow(QLabel("Info:"), self.lbl_preflight_info)
 
     def _on_chunk_model_scope_changed(self, idx: int) -> None:
-        """Show LM Studio model picker for chunk row local scope; text field for cloud."""
+        """Show LM Studio model picker for chunk row local scope; OpenRouter model field."""
         is_local = idx == 0
         self.chunk_model_combo.setVisible(is_local)
         self.chunk_model_cloud_edit.setVisible(not is_local)
 
     def _on_final_model_scope_changed(self, idx: int) -> None:
-        """Show LM Studio model picker for final-answer row local scope; cloud field."""
+        """Show LM Studio model picker for final-answer row local scope; OpenRouter model field."""
         is_local = idx == 0
         self.final_model_combo.setVisible(is_local)
         self.final_model_cloud_edit.setVisible(not is_local)
@@ -695,7 +695,7 @@ class VideoQAPanel(QWidget):
         local_combo: QComboBox,
         cloud_edit: QLineEdit,
     ) -> VideoQALMHttpTarget:
-        """Map one Local/Cloud row to a :class:`VideoQALMHttpTarget`."""
+        """Map one Local/OpenRouter row to a :class:`VideoQALMHttpTarget`."""
         default_id = get_default_video_qa_canonical_model_id()
         if type_combo.currentIndex() == 0:
             base = DEFAULT_LM_STUDIO_OPENAI_BASE_URL

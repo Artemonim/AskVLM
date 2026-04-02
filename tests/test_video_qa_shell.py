@@ -182,7 +182,7 @@ def test_video_qa_lm_runtime_cloud_openrouter_and_env_key(
     qtbot: QtBot,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cloud scope targets OpenRouter and attaches ``OPENROUTER_API_KEY`` when set."""
+    """OpenRouter scope targets OpenRouter API and attaches ``OPENROUTER_API_KEY`` when set."""
     monkeypatch.setenv(OPENROUTER_API_KEY_ENV, "rk_test")
     panel = VideoQAPanel()
     qtbot.addWidget(panel)
