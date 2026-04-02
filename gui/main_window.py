@@ -76,6 +76,7 @@ from gui.subtitle_preview import SubtitlePreview
 from gui.video_qa import VideoQAPanel
 from gui.video_qa_worker import VideoQALocalRunWorker
 from gui.wysiwyg_editor import TableRow, WysiwygEditor
+from utils.env import load_env_file
 from utils.exporters import (
     SubtitleRules,
     append_askvlm_metadata_to_srt,
@@ -2676,6 +2677,8 @@ class PipelineWorker(QObject):
 
 def main() -> int:
     """Start the Qt application and show the main window."""
+    # * Load project-local environment variables before any env-backed GUI settings.
+    load_env_file(Path(__file__).resolve().parents[1] / ".env")
     get_logger(__name__).info("Application starting")
     app = QApplication(sys.argv)
     w = MainWindow()
