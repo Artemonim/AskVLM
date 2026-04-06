@@ -10,6 +10,7 @@ from core.video_qa_context import normalize_video_qa_context
 from core.video_qa_executor import VideoQATranscriptArtifacts
 from core.video_qa_lm_studio_chunk_inferencer import (
     VideoQALMStudioChunkInferencer,
+    VideoQALMStudioChunkRequestConfig,
 )
 from core.video_qa_lm_studio_client import LMStudioClientError, LMStudioResponse
 from core.video_qa_manifest import VideoQAChunkRecord
@@ -23,14 +24,20 @@ if TYPE_CHECKING:
 def test_inferencer_prompt_includes_chunk_sections_and_passes_frame_paths(
     tmp_path: Path,
 ) -> None:
-    """Prompt uses render_prompt_block; client receives frame paths as images."""
+    """Prompt uses render_prompt_block; client receives frames and image attachments."""
     clip = tmp_path / "v.mp4"
     clip.write_bytes(b"x")
     notes = tmp_path / "notes.md"
     notes.write_text("one two three", encoding="utf-8")
+    snippet = tmp_path / "snippet.py"
+    snippet.write_text("def ping():\n    return 'pong'\n", encoding="utf-8")
+    reference = tmp_path / "reference.png"
+    reference.write_bytes(b"\x89PNG\r\n\x1a\n")
     source = LocalFileProvider().resolve(clip)
     bundle = normalize_video_qa_context(
-        source=source, question="What happens?", attachments=(notes,)
+        source=source,
+        question="What happens?",
+        attachments=(notes, snippet, reference),
     )
     manifest = build_video_qa_preparation_manifest(
         bundle, run_id="test-run", created_at="2026-03-30T12:00:00Z"
@@ -45,10 +52,11 @@ def test_inferencer_prompt_includes_chunk_sections_and_passes_frame_paths(
         json_schema: object = None,
         **kwargs: object,
     ) -> LMStudioResponse:
-        _ = (base_url, kwargs)
+        _ = base_url
         captured["prompt"] = prompt
         captured["image_paths"] = tuple(image_paths) if image_paths else ()
         captured["json_schema"] = json_schema
+        captured["kwargs"] = kwargs
         payload = {
             "chunk_summary": "s",
             "observations": ["a"],
@@ -77,7 +85,10 @@ def test_inferencer_prompt_includes_chunk_sections_and_passes_frame_paths(
     inf = VideoQALMStudioChunkInferencer(
         bundle,
         base_url="http://127.0.0.1:1234/v1",
-        request_chat_fn=fake_request,
+        request_config=VideoQALMStudioChunkRequestConfig(
+            request_chat_fn=fake_request,
+            reasoning="on",
+        ),
     )
     out = inf.infer_chunk(
         chunk=chunk,
@@ -92,14 +103,18 @@ def test_inferencer_prompt_includes_chunk_sections_and_passes_frame_paths(
     assert "- span: 1.00s to 3.50s" in prompt
     assert "Attachments:" in prompt
     assert "notes.md" in prompt
+    assert "snippet.py" in prompt
     assert "Transcript summary:" in prompt
     assert "line one" in prompt
     assert "Representative frames:" in prompt
     assert str(tmp_path / "f1.png") in prompt
     assert str(tmp_path / "f2.png") in prompt
+    assert "one two three" in prompt
+    assert "def ping()" in prompt
 
-    assert captured["image_paths"] == frames
+    assert captured["image_paths"] == (*frames, reference.resolve())
     assert captured["json_schema"] == CHUNK_ANALYSIS_JSON_SCHEMA
+    assert captured["kwargs"]["reasoning"] == "on"
     assert out.ok is True
 
 
@@ -138,7 +153,9 @@ def test_inferencer_success_normalizes_outcome(tmp_path: Path) -> None:
     inf = VideoQALMStudioChunkInferencer(
         bundle,
         base_url="http://localhost/v1",
-        request_chat_fn=fake_request,
+        request_config=VideoQALMStudioChunkRequestConfig(
+            request_chat_fn=fake_request,
+        ),
     )
     out = inf.infer_chunk(
         chunk=VideoQAChunkRecord(chunk_id="x", t_start=0.0, t_end=1.0),
@@ -176,7 +193,9 @@ def test_inferencer_surfaces_client_errors(tmp_path: Path) -> None:
     inf = VideoQALMStudioChunkInferencer(
         bundle,
         base_url="http://localhost/v1",
-        request_chat_fn=fake_request,
+        request_config=VideoQALMStudioChunkRequestConfig(
+            request_chat_fn=fake_request,
+        ),
     )
     out = inf.infer_chunk(
         chunk=VideoQAChunkRecord(chunk_id="e", t_start=0.0, t_end=1.0),
@@ -216,7 +235,9 @@ def test_inferencer_unparseable_response_fails(tmp_path: Path) -> None:
     inf = VideoQALMStudioChunkInferencer(
         bundle,
         base_url="http://localhost/v1",
-        request_chat_fn=fake_request,
+        request_config=VideoQALMStudioChunkRequestConfig(
+            request_chat_fn=fake_request,
+        ),
     )
     out = inf.infer_chunk(
         chunk=VideoQAChunkRecord(chunk_id="u", t_start=0.0, t_end=1.0),

@@ -10,9 +10,10 @@ from core.video_qa_local_run import (
     DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
     DEFAULT_OPENROUTER_OPENAI_BASE_URL,
     OPENROUTER_API_KEY_ENV,
-    VIDEO_QA_RUN_MODE_VLM_ONLY,
-    VIDEO_QA_RUN_MODE_WHISPER_VLM,
+    VideoQAFinalRequestOptions,
     VideoQALMHttpTarget,
+    VideoQALocalRunOptions,
+    default_video_qa_local_run_options,
 )
 from gui.main_window import MainWindow
 from gui.video_qa import VIDEO_QA_PREFLIGHT_FPS_CHOICES, VideoQAPanel
@@ -51,8 +52,12 @@ def test_video_qa_shell_restores_screen_and_source(
     window.video_qa_panel.set_question_text("What is shown?")
     window.video_qa_panel.set_context_window_tokens(123456)
     window.video_qa_panel.set_frame_sample_fps(0.1)
-    window.video_qa_panel.set_video_qa_run_mode(VIDEO_QA_RUN_MODE_VLM_ONLY)
-    window.video_qa_panel.set_video_chunking_enabled(enabled=False)
+    window.video_qa_panel.set_video_qa_run_toggles(
+        chunking_enabled=False,
+        final_include_transcript=True,
+        final_include_start_frame_per_chunk=True,
+        reasoning_enabled=True,
+    )
     main_splitter_state = window.video_qa_panel.main_splitter_state()
     left_splitter_state = window.video_qa_panel.left_splitter_state()
     ans_prog_splitter_state = window.video_qa_panel.answer_progress_splitter_state()
@@ -67,8 +72,11 @@ def test_video_qa_shell_restores_screen_and_source(
     assert restored.video_qa_panel.question_text() == "What is shown?"
     assert restored.video_qa_panel.context_window_tokens() == 123456
     assert restored.video_qa_panel.frame_sample_fps() == 0.1
-    assert restored.video_qa_panel.video_qa_run_mode() == VIDEO_QA_RUN_MODE_VLM_ONLY
     assert not restored.video_qa_panel.video_chunking_enabled()
+    ro = restored.video_qa_panel.video_qa_local_run_options()
+    assert ro.final_request.include_transcript
+    assert ro.final_request.include_start_frame_per_chunk
+    assert ro.reasoning_enabled
     assert restored.video_qa_panel.main_splitter_state() == main_splitter_state
     assert restored.video_qa_panel.left_splitter_state() == left_splitter_state
     assert (
@@ -237,17 +245,24 @@ def test_video_qa_worker_params_carry_chunk_and_final_lm(
     assert p.chunk_lm.model_id == "chunk-m"
     assert p.final_lm.model_id == "vendor/big"
     assert p.final_lm.authorization_bearer == "tok"
-    assert p.video_qa_mode == VIDEO_QA_RUN_MODE_WHISPER_VLM
     assert p.video_chunking_enabled is True
+    assert p.run_options == default_video_qa_local_run_options()
 
 
-def test_video_qa_worker_params_carry_vlm_mode_and_chunking(
+def test_video_qa_worker_params_carry_run_options_and_chunking(
     tmp_path: Path,
 ) -> None:
-    """Worker forwards VLM-only mode and chunking flag into run params."""
+    """Worker forwards :class:`VideoQALocalRunOptions` and chunking into run params."""
     ctx = MagicMock()
     chunk = VideoQALMHttpTarget("http://127.0.0.1:1234/v1", "chunk-m", None)
     final = VideoQALMHttpTarget("https://openrouter.ai/api/v1", "vendor/big", "tok")
+    opts = VideoQALocalRunOptions(
+        final_request=VideoQAFinalRequestOptions(
+            include_transcript=True,
+            include_start_frame_per_chunk=True,
+        ),
+        reasoning_enabled=True,
+    )
     worker = VideoQALocalRunWorker(
         context=ctx,
         output_dir=tmp_path,
@@ -256,12 +271,12 @@ def test_video_qa_worker_params_carry_vlm_mode_and_chunking(
         whisper=MagicMock(),
         chunk_lm=chunk,
         final_lm=final,
-        video_qa_mode=VIDEO_QA_RUN_MODE_VLM_ONLY,
         video_chunking_enabled=False,
+        run_options=opts,
     )
     p = worker._params  # noqa: SLF001
-    assert p.video_qa_mode == VIDEO_QA_RUN_MODE_VLM_ONLY
     assert p.video_chunking_enabled is False
+    assert p.run_options == opts
 
 
 def test_video_qa_run_button_enabled_and_emits_request(qtbot: QtBot) -> None:
@@ -492,7 +507,7 @@ def test_preflight_refresh_renders_report(
     assert panel.lbl_preflight_budget.text() != "-"
     assert "100000" in panel.lbl_preflight_budget.text()
     assert "frames" in panel.lbl_preflight_budget.text()
-    assert "Whisper + VLM" in panel.lbl_preflight_pipeline.text()
+    assert "ASR + per-chunk VLM + final answer" in panel.lbl_preflight_pipeline.text()
     assert "chunking on" in panel.lbl_preflight_pipeline.text()
 
 

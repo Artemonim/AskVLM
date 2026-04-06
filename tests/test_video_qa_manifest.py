@@ -77,4 +77,39 @@ def test_video_qa_manifest_round_trip_preserves_schema_objects(
 
     assert payload["schema_version"] == SCHEMA_VERSION
     assert payload["chunks"][0]["chunk_id"] == "chunk-001"
+    assert payload["attachments"][0]["path"] == str(notes.resolve())
     assert restored == manifest
+
+
+def test_video_qa_manifest_accepts_legacy_attachment_without_path(
+    tmp_path: Path,
+) -> None:
+    """Legacy manifest payloads without attachment paths still deserialize."""
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"video")
+    source = LocalFileProvider().resolve(media)
+    notes = tmp_path / "notes.md"
+    notes.write_text("speaker enters the room", encoding="utf-8")
+    bundle = normalize_video_qa_context(
+        source=source,
+        question="What happens in the clip?",
+        attachments=[notes],
+    )
+    manifest = VideoQARunManifest(
+        schema_version=SCHEMA_VERSION,
+        run_id="run-legacy",
+        created_at="2026-03-29T12:00:00Z",
+        source=VideoQASourceSnapshot.from_source(source),
+        question=bundle.question,
+        attachments=bundle.attachments,
+        graph=(),
+        chunks=(),
+    )
+    payload = manifest.to_dict()
+    assert isinstance(payload["attachments"], list)
+    payload["attachments"][0].pop("path")
+
+    restored = VideoQARunManifest.from_dict(payload)
+
+    assert restored.attachments[0].path is None
+    assert restored.attachments[0].name == "notes.md"

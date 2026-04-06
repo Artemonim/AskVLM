@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .llm_prompts import (
@@ -23,6 +24,7 @@ from .video_qa_lm_studio_client import (
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+    from pathlib import Path
 
     from .video_qa_context import VideoQAContextBundle
     from .video_qa_executor import (
@@ -34,6 +36,18 @@ if TYPE_CHECKING:
     from .video_qa_manifest import VideoQAChunkRecord, VideoQARunManifest
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class VideoQALMStudioChunkRequestConfig:
+    """Optional transport settings for one LM Studio chunk inferencer."""
+
+    temperature: float = 0.0
+    timeout: float | None = None
+    request_chat_fn: Callable[..., LMStudioResponse] | None = None
+    should_cancel: Callable[[], bool] | None = None
+    authorization_bearer: str | None = None
+    reasoning: str | Mapping[str, Any] | None = None
 
 
 def _transcript_summary_for_chunk(
@@ -111,20 +125,20 @@ class VideoQALMStudioChunkInferencer:
         *,
         base_url: str,
         model: str = "local-model",
-        temperature: float = 0.0,
-        timeout: float | None = None,
-        request_chat_fn: Callable[..., LMStudioResponse] | None = None,
-        should_cancel: Callable[[], bool] | None = None,
-        authorization_bearer: str | None = None,
+        request_config: VideoQALMStudioChunkRequestConfig | None = None,
     ) -> None:
+        resolved_request_config = request_config or VideoQALMStudioChunkRequestConfig()
         self._context = context
         self._base_url = base_url
         self._model = model
-        self._temperature = temperature
-        self._timeout = timeout
-        self._request_fn = request_chat_fn or request_chat_completion
-        self._should_cancel = should_cancel
-        self._authorization_bearer = authorization_bearer
+        self._temperature = resolved_request_config.temperature
+        self._timeout = resolved_request_config.timeout
+        self._request_fn = (
+            resolved_request_config.request_chat_fn or request_chat_completion
+        )
+        self._should_cancel = resolved_request_config.should_cancel
+        self._authorization_bearer = resolved_request_config.authorization_bearer
+        self._reasoning = resolved_request_config.reasoning
 
     def infer_chunk(
         self,
@@ -144,17 +158,22 @@ class VideoQALMStudioChunkInferencer:
             transcript_summary=summary if summary else None,
             frame_refs=frames,
         )
+        request_image_paths: tuple[Path | str, ...] = (
+            *frames,
+            *self._context.enabled_image_attachment_paths,
+        )
         try:
             response = self._request_fn(
                 self._base_url,
                 prompt,
-                image_paths=frames,
+                image_paths=request_image_paths,
                 json_schema=CHUNK_ANALYSIS_JSON_SCHEMA,
                 model=self._model,
                 temperature=self._temperature,
                 timeout=self._timeout,
                 should_cancel=self._should_cancel,
                 authorization_bearer=self._authorization_bearer,
+                reasoning=self._reasoning,
             )
         except LMStudioClientError as exc:
             return VideoQAChunkInferenceOutcome(ok=False, error=str(exc))
@@ -183,4 +202,5 @@ __all__ = [
     "CHUNK_ANALYSIS_INSTRUCTION",
     "CHUNK_ANALYSIS_JSON_SCHEMA",
     "VideoQALMStudioChunkInferencer",
+    "VideoQALMStudioChunkRequestConfig",
 ]

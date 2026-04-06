@@ -12,6 +12,7 @@ import pytest
 from core.pipelines import CancelledError
 from core.video_qa_lm_studio_client import (
     _build_payload,
+    build_provider_reasoning_option,
     request_chat_completion,
 )
 
@@ -69,6 +70,36 @@ def test_build_payload_lm_studio_reasoning() -> None:
     """LM Studio-style ``reasoning`` (e.g. ``off`` / ``on``) is forwarded when set."""
     payload = _build_payload("Hello", [], None, reasoning="off")
     assert payload["reasoning"] == "off"
+
+
+def test_build_payload_openrouter_reasoning_object() -> None:
+    """OpenRouter-style reasoning objects are forwarded without reshaping."""
+    payload = _build_payload("Hello", [], None, reasoning={"effort": "low"})
+    assert payload["reasoning"] == {"effort": "low"}
+
+
+def test_build_provider_reasoning_option_uses_local_toggle_for_lm_studio() -> None:
+    """Local OpenAI-compatible targets use LM Studio's on/off reasoning contract."""
+    assert (
+        build_provider_reasoning_option("http://127.0.0.1:1234/v1", enabled=False)
+        == "off"
+    )
+    assert (
+        build_provider_reasoning_option("http://127.0.0.1:1234/v1", enabled=True)
+        == "on"
+    )
+
+
+def test_build_provider_reasoning_option_uses_object_for_openrouter() -> None:
+    """OpenRouter targets use the documented object-based reasoning contract."""
+    assert build_provider_reasoning_option(
+        "https://openrouter.ai/api/v1",
+        enabled=False,
+    ) == {"effort": "none"}
+    assert build_provider_reasoning_option(
+        "https://openrouter.ai/api/v1",
+        enabled=True,
+    ) == {"effort": "low"}
 
 
 @patch("core.video_qa_lm_studio_client.urllib.request.urlopen")

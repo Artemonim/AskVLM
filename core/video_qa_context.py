@@ -74,6 +74,9 @@ _IMAGE_SUFFIXES = {
     ".webp",
 }
 
+_TEXT_ATTACHMENT_INLINE_BYTE_LIMIT = 8 * 1024
+_CODE_ATTACHMENT_INLINE_BYTE_LIMIT = 12 * 1024
+
 
 @dataclass(frozen=True, slots=True)
 class VideoQAAttachmentRequest:
@@ -88,6 +91,7 @@ class VideoQAAttachmentRequest:
 class VideoQAAttachment:
     """Normalized attachment metadata for prompt preparation."""
 
+    path: Path | None
     name: str
     type: AttachmentType
     size: int
@@ -102,14 +106,16 @@ class VideoQAAttachment:
 
     @property
     def budget_tokens(self) -> int:
-        """Return a conservative offline budget estimate for the attachment."""
+        """Return a conservative offline budget estimate for the inline preview."""
         if not self.enabled:
             return 0
         if self.type == "image":
             return _estimate_image_budget_tokens(self.size)
         if self.type == "code":
-            return _estimate_code_budget_tokens(self.size)
-        return _estimate_text_budget_tokens(self.size)
+            budget_size = min(self.size, _CODE_ATTACHMENT_INLINE_BYTE_LIMIT)
+            return _estimate_code_budget_tokens(budget_size)
+        budget_size = min(self.size, _TEXT_ATTACHMENT_INLINE_BYTE_LIMIT)
+        return _estimate_text_budget_tokens(budget_size)
 
     @property
     def summary(self) -> str:
@@ -124,12 +130,21 @@ class VideoQAAttachment:
 
 
 @dataclass(frozen=True, slots=True)
+class _NormalizedAttachmentRecord:
+    """Normalized attachment metadata paired with an inline prompt preview."""
+
+    attachment: VideoQAAttachment
+    prompt_text: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class VideoQAContextBundle:
     """Normalized prompt context for a Video QA run."""
 
     source: LocalFileSource | None
     question: str
     attachments: tuple[VideoQAAttachment, ...]
+    attachment_text_previews: tuple[str | None, ...] = ()
 
     @property
     def enabled_attachments(self) -> tuple[VideoQAAttachment, ...]:
@@ -140,6 +155,24 @@ class VideoQAContextBundle:
     def disabled_attachments(self) -> tuple[VideoQAAttachment, ...]:
         """Return only the attachments that are disabled."""
         return tuple(item for item in self.attachments if not item.enabled)
+
+    @property
+    def enabled_image_attachments(self) -> tuple[VideoQAAttachment, ...]:
+        """Return enabled image attachments that can be sent as multimodal inputs."""
+        return tuple(
+            item
+            for item in self.enabled_attachments
+            if item.type == "image" and item.path is not None
+        )
+
+    @property
+    def enabled_image_attachment_paths(self) -> tuple[Path, ...]:
+        """Return resolved paths for enabled image attachments."""
+        return tuple(
+            item.path
+            for item in self.enabled_image_attachments
+            if item.path is not None
+        )
 
     @property
     def attachment_budget_tokens(self) -> int:
@@ -158,43 +191,16 @@ class VideoQAContextBundle:
 
         The block keeps user-provided context first and appends chunk-specific data
         when available, so a future chunk inferencer can reuse the same contract.
+        Text and code attachments include bounded inline previews.
         """
         lines: list[str] = []
-        if self.source is not None:
-            lines.append(f"Source: {self.source.path}")
-            lines.append(f"Source size: {self.source.size_bytes:,} bytes")
+        lines.extend(_render_source_prompt_lines(self.source))
         if self.question:
             lines.append(f"Question: {self.question}")
-        if self.enabled_attachments:
-            lines.append("Attachments:")
-            for attachment in self.enabled_attachments:
-                language = (
-                    f", language={attachment.language}" if attachment.language else ""
-                )
-                suffix = attachment.suffix or "no extension"
-                lines.append(
-                    "- "
-                    f"{attachment.name} [{attachment.type}] "
-                    f"{attachment.size:,} bytes, suffix={suffix}"
-                    f"{language}, budget≈{attachment.budget_tokens}"
-                )
-        if chunk_id is not None or chunk_time_span is not None:
-            lines.append("Chunk:")
-            if chunk_id is not None:
-                lines.append(f"- id: {chunk_id}")
-            if chunk_time_span is not None:
-                start, end = chunk_time_span
-                lines.append(f"- span: {start:.2f}s to {end:.2f}s")
-        normalized_summary = str(transcript_summary or "").strip()
-        if normalized_summary:
-            lines.append("Transcript summary:")
-            lines.extend(f"- {line}" for line in normalized_summary.splitlines())
-        normalized_frames = tuple(
-            str(ref).strip() for ref in frame_refs if str(ref).strip()
-        )
-        if normalized_frames:
-            lines.append("Representative frames:")
-            lines.extend(f"- {frame_ref}" for frame_ref in normalized_frames)
+        lines.extend(_render_attachment_prompt_lines(self))
+        lines.extend(_render_chunk_prompt_lines(chunk_id, chunk_time_span))
+        lines.extend(_render_transcript_summary_prompt_lines(transcript_summary))
+        lines.extend(_render_frame_prompt_lines(frame_refs))
         return "\n".join(lines)
 
 
@@ -202,7 +208,10 @@ def normalize_video_qa_attachments(
     attachments: Iterable[AttachmentInput | VideoQAAttachmentRequest],
 ) -> tuple[VideoQAAttachment, ...]:
     """Normalize raw attachment inputs into immutable metadata records."""
-    return tuple(_normalize_single_attachment(raw) for raw in attachments)
+    return tuple(
+        _normalize_single_attachment_record(raw, include_preview=False).attachment
+        for raw in attachments
+    )
 
 
 def normalize_video_qa_context(
@@ -213,18 +222,26 @@ def normalize_video_qa_context(
 ) -> VideoQAContextBundle:
     """Normalize the current Video QA source, question, and attachments."""
     normalized_question = str(question or "").strip()
-    normalized_attachments = normalize_video_qa_attachments(attachments)
+    normalized_records = tuple(
+        _normalize_single_attachment_record(raw, include_preview=True)
+        for raw in attachments
+    )
     return VideoQAContextBundle(
         source=source,
         question=normalized_question,
-        attachments=normalized_attachments,
+        attachments=tuple(record.attachment for record in normalized_records),
+        attachment_text_previews=tuple(
+            record.prompt_text for record in normalized_records
+        ),
     )
 
 
-def _normalize_single_attachment(
+def _normalize_single_attachment_record(
     raw: AttachmentInput | VideoQAAttachmentRequest,
-) -> VideoQAAttachment:
-    """Normalize one attachment input into a typed metadata record."""
+    *,
+    include_preview: bool,
+) -> _NormalizedAttachmentRecord:
+    """Normalize one attachment input into metadata and optional inline text."""
     path_input: AttachmentInput
     enabled = True
     language_hint: str | None = None
@@ -258,15 +275,26 @@ def _normalize_single_attachment(
 
     resolved = path.resolve()
     attachment_type, language = _classify_attachment(resolved.suffix.lower())
-    language = language_hint or language if attachment_type == "code" else None
+    language = (language_hint or language) if attachment_type == "code" else None
 
-    return VideoQAAttachment(
-        name=resolved.name,
-        type=attachment_type,
-        size=int(stat.st_size),
-        suffix=resolved.suffix.lower(),
-        language=language,
-        enabled=enabled,
+    prompt_text: str | None = None
+    if include_preview and enabled and attachment_type in {"text", "code"}:
+        prompt_text = _read_attachment_preview_text(
+            resolved,
+            _attachment_inline_byte_limit(attachment_type),
+        )
+
+    return _NormalizedAttachmentRecord(
+        attachment=VideoQAAttachment(
+            path=resolved,
+            name=resolved.name,
+            type=attachment_type,
+            size=int(stat.st_size),
+            suffix=resolved.suffix.lower(),
+            language=language,
+            enabled=enabled,
+        ),
+        prompt_text=prompt_text,
     )
 
 
@@ -295,3 +323,121 @@ def _estimate_image_budget_tokens(size_bytes: int) -> int:
     """Estimate a conservative token budget for an image attachment."""
     kib = max(1, math.ceil(max(size_bytes, 1) / 1024))
     return max(1024, math.ceil(kib * 32 * 1.5))
+
+
+def _attachment_inline_byte_limit(attachment_type: AttachmentType) -> int:
+    """Return the byte cap used for an inline attachment preview."""
+    if attachment_type == "code":
+        return _CODE_ATTACHMENT_INLINE_BYTE_LIMIT
+    if attachment_type == "text":
+        return _TEXT_ATTACHMENT_INLINE_BYTE_LIMIT
+    return 0
+
+
+def _read_attachment_preview_text(path: Path, limit_bytes: int) -> str:
+    """Read a bounded text preview for prompt inlining."""
+    if limit_bytes <= 0:
+        return ""
+    try:
+        with path.open("rb") as handle:
+            preview_bytes = handle.read(limit_bytes)
+    except OSError as exc:
+        msg = f"Unable to read attachment content: {path}"
+        raise OSError(msg) from exc
+    preview_text = preview_bytes.decode("utf-8", errors="replace")
+    return preview_text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _format_attachment_prompt_preview(
+    attachment: VideoQAAttachment,
+    preview_text: str | None,
+) -> list[str]:
+    """Return prompt lines for one attachment preview when content is available."""
+    if preview_text is None or attachment.type not in {"text", "code"}:
+        return []
+    limit_bytes = min(attachment.size, _attachment_inline_byte_limit(attachment.type))
+    header = (
+        f"  Content preview (first {limit_bytes:,} of {attachment.size:,} bytes):"
+        if attachment.size > limit_bytes
+        else "  Content:"
+    )
+    content_lines = preview_text.splitlines()
+    if not content_lines:
+        content_lines = ["(empty)"]
+    return [header, *(f"  {line}" for line in content_lines)]
+
+
+def _render_source_prompt_lines(
+    source: LocalFileSource | None,
+) -> list[str]:
+    """Return prompt lines for the resolved source file."""
+    if source is None:
+        return []
+    return [f"Source: {source.path}", f"Source size: {source.size_bytes:,} bytes"]
+
+
+def _render_attachment_prompt_lines(
+    bundle: VideoQAContextBundle,
+) -> list[str]:
+    """Return prompt lines for enabled attachments and bounded previews."""
+    if not any(item.enabled for item in bundle.attachments):
+        return []
+    lines: list[str] = ["Attachments:"]
+    for index, attachment in enumerate(bundle.attachments):
+        if not attachment.enabled:
+            continue
+        language = f", language={attachment.language}" if attachment.language else ""
+        suffix = attachment.suffix or "no extension"
+        lines.append(
+            "- "
+            f"{attachment.name} [{attachment.type}] "
+            f"{attachment.size:,} bytes, suffix={suffix}"
+            f"{language}, budget≈{attachment.budget_tokens}"
+        )
+        preview_text = (
+            bundle.attachment_text_previews[index]
+            if index < len(bundle.attachment_text_previews)
+            else None
+        )
+        lines.extend(_format_attachment_prompt_preview(attachment, preview_text))
+    return lines
+
+
+def _render_chunk_prompt_lines(
+    chunk_id: str | None,
+    chunk_time_span: tuple[float, float] | None,
+) -> list[str]:
+    """Return prompt lines for chunk metadata when available."""
+    if chunk_id is None and chunk_time_span is None:
+        return []
+    lines: list[str] = ["Chunk:"]
+    if chunk_id is not None:
+        lines.append(f"- id: {chunk_id}")
+    if chunk_time_span is not None:
+        start, end = chunk_time_span
+        lines.append(f"- span: {start:.2f}s to {end:.2f}s")
+    return lines
+
+
+def _render_transcript_summary_prompt_lines(
+    transcript_summary: str | None,
+) -> list[str]:
+    """Return prompt lines for the transcript summary when available."""
+    normalized_summary = str(transcript_summary or "").strip()
+    if not normalized_summary:
+        return []
+    lines = ["Transcript summary:"]
+    lines.extend(f"- {line}" for line in normalized_summary.splitlines())
+    return lines
+
+
+def _render_frame_prompt_lines(frame_refs: Iterable[str]) -> list[str]:
+    """Return prompt lines for representative frame references when available."""
+    normalized_frames = tuple(
+        str(ref).strip() for ref in frame_refs if str(ref).strip()
+    )
+    if not normalized_frames:
+        return []
+    lines = ["Representative frames:"]
+    lines.extend(f"- {frame_ref}" for frame_ref in normalized_frames)
+    return lines

@@ -64,8 +64,6 @@ from core.ffmpeg import (
 from core.pipelines import CancelledError, LocalPipeline
 from core.video_qa_executor import VideoQAExecutorRunOutcome
 from core.video_qa_local_run import (
-    VIDEO_QA_RUN_MODE_VLM_ONLY,
-    VIDEO_QA_RUN_MODE_WHISPER_VLM,
     VideoQAPreflightBlockedError,
     ensure_local_video_qa_run_allowed,
     map_video_qa_progress_frac_to_200,
@@ -937,8 +935,8 @@ class MainWindow(QMainWindow):
                 whisper=self.pipeline.whisperx,
                 chunk_lm=lm.chunk,
                 final_lm=lm.final_answer,
-                video_qa_mode=self.video_qa_panel.video_qa_run_mode(),
                 video_chunking_enabled=self.video_qa_panel.video_chunking_enabled(),
+                run_options=self.video_qa_panel.video_qa_local_run_options(),
             )
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
@@ -1528,21 +1526,32 @@ class MainWindow(QMainWindow):
         )
         return worker_stopped and burn_stopped and vq_stopped
 
-    def _restore_video_qa_run_mode_and_chunking(self, s: QSettings) -> None:
-        """Restore Video QA pipeline mode and chunking checkbox from settings."""
-        mode_raw = str(
-            s.value("videoqa/run_mode", VIDEO_QA_RUN_MODE_WHISPER_VLM)
-        ).strip()
-        if mode_raw == VIDEO_QA_RUN_MODE_VLM_ONLY:
-            self.video_qa_panel.set_video_qa_run_mode(VIDEO_QA_RUN_MODE_VLM_ONLY)
-        else:
-            self.video_qa_panel.set_video_qa_run_mode(VIDEO_QA_RUN_MODE_WHISPER_VLM)
+    def _restore_video_qa_run_toggles(self, s: QSettings) -> None:
+        """Restore Video QA chunking and backend run-option flags from settings."""
         chunking_val = s.value("videoqa/chunking_enabled", defaultValue=True, type=bool)
         if isinstance(chunking_val, bool):
             chunking_on = chunking_val
         else:
             chunking_on = str(chunking_val).strip().lower() in ("1", "true", "yes")
-        self.video_qa_panel.set_video_chunking_enabled(enabled=chunking_on)
+
+        def _bool_key(key: str, *, default: bool) -> bool:
+            v = s.value(key, defaultValue=default, type=bool)
+            if isinstance(v, bool):
+                return v
+            return str(v).strip().lower() in ("1", "true", "yes")
+
+        self.video_qa_panel.set_video_qa_run_toggles(
+            chunking_enabled=chunking_on,
+            final_include_transcript=_bool_key(
+                "videoqa/final_include_transcript",
+                default=False,
+            ),
+            final_include_start_frame_per_chunk=_bool_key(
+                "videoqa/final_include_start_frame_per_chunk",
+                default=False,
+            ),
+            reasoning_enabled=_bool_key("videoqa/reasoning_enabled", default=False),
+        )
 
     def _apply_video_qa_settings(self, s: QSettings) -> None:
         """Restore Video QA panel fields from settings."""
@@ -1556,7 +1565,7 @@ class MainWindow(QMainWindow):
         if fps_text:
             with contextlib.suppress(TypeError, ValueError):
                 self.video_qa_panel.set_frame_sample_fps(float(fps_text))
-        self._restore_video_qa_run_mode_and_chunking(s)
+        self._restore_video_qa_run_toggles(s)
         raw_attach = s.value("videoqa/attachments_json", "")
         if isinstance(raw_attach, str) and raw_attach.strip():
             try:
@@ -1700,11 +1709,20 @@ class MainWindow(QMainWindow):
             "videoqa/context_window_tokens", self.video_qa_panel.context_window_tokens()
         )
         s.setValue("videoqa/frame_sample_fps", self.video_qa_panel.frame_sample_fps())
-        s.setValue("videoqa/run_mode", self.video_qa_panel.video_qa_run_mode())
         s.setValue(
             "videoqa/chunking_enabled",
             self.video_qa_panel.video_chunking_enabled(),
         )
+        opts = self.video_qa_panel.video_qa_local_run_options()
+        s.setValue(
+            "videoqa/final_include_transcript",
+            opts.final_request.include_transcript,
+        )
+        s.setValue(
+            "videoqa/final_include_start_frame_per_chunk",
+            opts.final_request.include_start_frame_per_chunk,
+        )
+        s.setValue("videoqa/reasoning_enabled", opts.reasoning_enabled)
         s.setValue(
             "videoqa/attachments_json",
             json.dumps(self.video_qa_panel.attachments_for_persistence()),

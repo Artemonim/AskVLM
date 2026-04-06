@@ -13,6 +13,7 @@ import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
 from pathlib import Path
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
 logger = logging.getLogger(__name__)
+_OPENROUTER_HOST = "openrouter.ai"
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,6 +74,18 @@ def _read_image_part(path: Path) -> dict[str, Any]:
     }
 
 
+def build_provider_reasoning_option(
+    base_url: str,
+    *,
+    enabled: bool,
+) -> str | dict[str, str]:
+    """Return the provider-specific reasoning payload for the target base URL."""
+    host = (urllib.parse.urlsplit(base_url).hostname or "").strip().lower()
+    if host.endswith(_OPENROUTER_HOST):
+        return {"effort": "low" if enabled else "none"}
+    return "on" if enabled else "off"
+
+
 def _build_payload(
     prompt: str,
     image_paths: Sequence[Path],
@@ -81,7 +95,7 @@ def _build_payload(
     *,
     should_cancel: Callable[[], bool] | None = None,
     reasoning_effort: str | None = None,
-    reasoning: str | None = None,
+    reasoning: str | Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the request payload for the chat completion endpoint."""
     content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
@@ -114,7 +128,9 @@ def _build_payload(
     # * LM Studio extension (see /api/v1/chat); OpenAI /v1/chat/completions may accept it too.
     # * Qwen A3B reports only ``on``/``off`` — use ``reasoning="off"`` instead of ``reasoning_effort``.
     if reasoning is not None:
-        payload["reasoning"] = reasoning
+        payload["reasoning"] = (
+            dict(reasoning) if isinstance(reasoning, Mapping) else reasoning
+        )
 
     return payload
 
@@ -304,7 +320,7 @@ def request_chat_completion(  # noqa: C901, PLR0913
     should_cancel: Callable[[], bool] | None = None,
     authorization_bearer: str | None = None,
     reasoning_effort: str | None = None,
-    reasoning: str | None = None,
+    reasoning: str | Mapping[str, Any] | None = None,
 ) -> LMStudioResponse:
     """Send a multimodal chat completion request to LM Studio.
 
@@ -320,8 +336,8 @@ def request_chat_completion(  # noqa: C901, PLR0913
     When ``reasoning_effort`` is set (e.g. OpenAI o-series), it is sent as
     ``reasoning_effort``. For LM Studio models that only support a boolean-style
     toggle (e.g. Qwen 3.5 A3B: ``on``/``off``), set ``reasoning`` to ``"off"``
-    or ``"on"`` instead; ``reasoning_effort`` values like ``"minimal"`` may be
-    ignored or mapped incorrectly on those stacks.
+    or ``"on"``. For OpenRouter, pass the provider-native object such as
+    ``{"effort": "none"}`` or ``{"effort": "low"}``.
     """
     normalized_image_paths = tuple(Path(path) for path in (image_paths or ()))
     url = f"{base_url.rstrip('/')}/chat/completions"

@@ -10,9 +10,9 @@ from PySide6.QtCore import QObject, Signal, Slot
 
 from core.pipelines import CancelledError
 from core.video_qa_local_run import (
-    VIDEO_QA_RUN_MODE_WHISPER_VLM,
     VideoQALocalRunParams,
     VideoQAPreflightBlockedError,
+    default_video_qa_local_run_options,
     run_local_video_qa,
 )
 
@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from core.video_qa_context import VideoQAContextBundle
     from core.video_qa_local_run import (
         VideoQALMHttpTarget,
+        VideoQALocalRunOptions,
     )
     from core.whisperx_wrapper import WhisperXWrapper
 
@@ -47,10 +48,11 @@ class VideoQALocalRunWorker(QObject):
         whisper: WhisperXWrapper,
         chunk_lm: VideoQALMHttpTarget,
         final_lm: VideoQALMHttpTarget,
-        video_qa_mode: str = VIDEO_QA_RUN_MODE_WHISPER_VLM,
         video_chunking_enabled: bool = True,
+        run_options: VideoQALocalRunOptions | None = None,
     ) -> None:
         super().__init__()
+        resolved_run = run_options or default_video_qa_local_run_options()
         self._params = VideoQALocalRunParams(
             context=context,
             output_dir=output_dir,
@@ -58,8 +60,8 @@ class VideoQALocalRunWorker(QObject):
             chunk_lm=chunk_lm,
             final_lm=final_lm,
             frame_sample_fps=frame_sample_fps,
-            video_qa_mode=video_qa_mode,
             video_chunking_enabled=video_chunking_enabled,
+            run_options=resolved_run,
         )
         self._whisper = whisper
         self._cancel = False

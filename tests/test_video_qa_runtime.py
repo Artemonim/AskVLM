@@ -168,6 +168,33 @@ def test_budget_estimate_tracks_source_question_attachments_and_chunks(
     assert estimate.warnings == ()
 
 
+def test_budget_estimate_caps_large_text_attachment_preview(
+    tmp_path: Path,
+) -> None:
+    """Large text attachments use a bounded inline preview for budgeting."""
+    source_media = tmp_path / "clip.mp4"
+    source_media.write_bytes(b"abc")
+    source = LocalFileProvider().resolve(source_media)
+
+    large_text = "0123456789abcdef\n" * 6000
+    notes = tmp_path / "big.txt"
+    notes.write_text(large_text, encoding="utf-8")
+
+    bundle = normalize_video_qa_context(
+        source=source,
+        question="What is shown?",
+        attachments=[notes],
+    )
+
+    preview = bundle.attachment_text_previews[0]
+    assert preview is not None
+    assert len(preview) < len(large_text)
+    assert bundle.attachments[0].budget_tokens < 5000
+
+    estimate = build_video_qa_budget_estimate(bundle, chunk_count=1)
+    assert estimate.attachment_tokens == bundle.attachment_budget_tokens
+
+
 def test_budget_estimate_warns_when_chunk_plan_is_missing(
     tmp_path: Path,
 ) -> None:

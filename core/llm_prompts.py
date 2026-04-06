@@ -160,15 +160,35 @@ def _chunk_input_to_payload(
     }
 
 
+def _render_final_request_frame_lines(frame_refs: Iterable[str]) -> list[str]:
+    """Return prompt lines for chunk-start frames attached to the final request."""
+    normalized = tuple(str(ref).strip() for ref in frame_refs if str(ref).strip())
+    if not normalized:
+        return []
+    return [
+        "Chunk-start frames attached in this request:",
+        *(f"- {frame_ref}" for frame_ref in normalized),
+    ]
+
+
 def build_final_synthesis_prompt(
     context: VideoQAContextBundle,
     chunk_inputs: Sequence[VideoQAChunkSynthesisInput],
+    *,
+    transcript_body: str | None = None,
+    final_frame_refs: Iterable[str] = (),
 ) -> str:
     """Build the final answer synthesis prompt from chunk analysis records."""
     prompt_parts = [FINAL_SYNTHESIS_INSTRUCTION]
     context_block = context.render_prompt_block()
     if context_block:
         prompt_parts.append(f"Context:\n{context_block}")
+    body = str(transcript_body or "").strip()
+    if body:
+        prompt_parts.append(f"Full transcript:\n{body}")
+    final_frame_lines = _render_final_request_frame_lines(final_frame_refs)
+    if final_frame_lines:
+        prompt_parts.append("\n".join(final_frame_lines))
     prompt_parts.append(
         "Completed chunk analysis records:\n"
         + json.dumps(

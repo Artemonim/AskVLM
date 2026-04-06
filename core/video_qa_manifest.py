@@ -281,6 +281,7 @@ def validate_manifest_timestamp(value: str) -> str:
 
 def _attachment_to_dict(attachment: VideoQAAttachment) -> dict[str, object]:
     return {
+        "path": None if attachment.path is None else str(attachment.path),
         "name": attachment.name,
         "type": attachment.type,
         "size": attachment.size,
@@ -293,7 +294,12 @@ def _attachment_to_dict(attachment: VideoQAAttachment) -> dict[str, object]:
 def _attachment_from_dict(raw: Mapping[str, object]) -> VideoQAAttachment:
     attachment_type = _require_str(raw, "type")
     _validate_literal("type", attachment_type, _VALID_ATTACHMENT_TYPES)
+    path_raw = raw.get("path")
+    if path_raw is not None and not isinstance(path_raw, str):
+        msg = "Manifest field 'path' must be a string or null."
+        raise TypeError(msg)
     return VideoQAAttachment(
+        path=None if path_raw is None else Path(path_raw),
         name=_require_str(raw, "name"),
         type=cast("Literal['text', 'code', 'image']", attachment_type),
         size=_require_int(raw, "size"),

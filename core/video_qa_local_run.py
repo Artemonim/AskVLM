@@ -45,9 +45,13 @@ from .video_qa_executor import (
     VideoQATranscriptArtifacts,
     run_video_qa_executor,
 )
-from .video_qa_lm_studio_chunk_inferencer import VideoQALMStudioChunkInferencer
+from .video_qa_lm_studio_chunk_inferencer import (
+    VideoQALMStudioChunkInferencer,
+    VideoQALMStudioChunkRequestConfig,
+)
 from .video_qa_lm_studio_client import (
     LMStudioClientError,
+    build_provider_reasoning_option,
     request_chat_completion,
 )
 from .video_qa_orchestration import (
@@ -84,9 +88,6 @@ DEFAULT_LM_STUDIO_OPENAI_BASE_URL: Final[str] = "http://127.0.0.1:1234/v1"
 DEFAULT_OPENROUTER_OPENAI_BASE_URL: Final[str] = "https://openrouter.ai/api/v1"
 # * Environment variable read by the GUI when Video QA scope is Cloud (Bearer auth).
 OPENROUTER_API_KEY_ENV: Final[str] = "OPENROUTER_API_KEY"
-# * Run mode: Whisper ASR + per-chunk VLM (default) vs frames-only VLM (no ASR).
-VIDEO_QA_RUN_MODE_WHISPER_VLM: Final[str] = "whisper_vlm"
-VIDEO_QA_RUN_MODE_VLM_ONLY: Final[str] = "vlm_only"
 # * Video QA-only Whisper unload control for crash mitigation around teardown.
 # ! Native CUDA / faster-whisper model teardown can hard-crash the whole Python process
 # * when unloading mid-run inside a long-lived GUI; this is a toolchain limitation, not a
@@ -108,6 +109,56 @@ class VideoQALMHttpTarget:
     base_url: str
     model_id: str
     authorization_bearer: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VideoQAFinalRequestOptions:
+    """Optional chunked final-request enrichments."""
+
+    include_transcript: bool = False
+    include_start_frame_per_chunk: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class VideoQALocalRunOptions:
+    """Optional backend toggles for Video QA runtime requests."""
+
+    final_request: VideoQAFinalRequestOptions = field(
+        default_factory=VideoQAFinalRequestOptions
+    )
+    reasoning_enabled: bool = False
+
+
+def default_video_qa_local_run_options() -> VideoQALocalRunOptions:
+    """Return the default optional backend toggles for Video QA."""
+    return VideoQALocalRunOptions()
+
+
+@dataclass(frozen=True, slots=True)
+class _VideoQALMStudioRequestOptions:
+    """Shared LM Studio request knobs for final-answer calls."""
+
+    temperature: float = 0.0
+    timeout: float | None = None
+    request_chat_fn: Callable[..., object] | None = None
+    should_cancel: Callable[[], bool] | None = None
+    authorization_bearer: str | None = None
+    reasoning: str | Mapping[str, object] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _VideoQAFinalSynthesisOptions:
+    """Optional chunked final-synthesis prompt enrichments."""
+
+    include_transcript_in_final_prompt: bool = False
+    include_start_frame_per_chunk_in_final_request: bool = False
+    chunk_start_frame_paths_provider: (
+        Callable[
+            [VideoQARunManifest, Sequence[VideoQAChunkExecutionResult]],
+            tuple[str, ...],
+        ]
+        | None
+    ) = None
 
 
 # * Fraction of the 0..1 progress curve treated as pre-VLM (maps to 0-100 on a 0-200 bar).
@@ -362,23 +413,6 @@ class VideoQAWhisperTranscriptProvider:
         return artifacts
 
 
-class VideoQAVLMOnlyEmptyTranscriptProvider:
-    """No-op transcript for VLM-only runs (Whisper ASR is skipped)."""
-
-    def prepare_transcript(
-        self,
-        _context: VideoQAContextBundle,
-        _manifest: VideoQARunManifest,
-    ) -> VideoQATranscriptArtifacts:
-        """Return empty transcript artifacts so chunk prompts are frames-only."""
-        _ = (_context, _manifest)
-        return VideoQATranscriptArtifacts(
-            transcript_text="",
-            subtitle_text="",
-            segments=(),
-        )
-
-
 def _whisper_transcribe_to_artifacts(  # noqa: C901
     whisper: WhisperXWrapper,
     media_path: Path,
@@ -499,9 +533,7 @@ class VideoQAFFmpegFrameMaterializer:
         """Write sampled chunk frames under ``frames_dir`` and return their paths."""
         _ = (manifest, transcript)
         self._frames_dir.mkdir(parents=True, exist_ok=True)
-        safe = "".join(
-            ch if ch.isalnum() or ch in "-._" else "_" for ch in chunk.chunk_id
-        )
+        safe = _safe_chunk_artifact_name(chunk.chunk_id)
         output_pattern = self._frames_dir / f"{safe}-%03d.png"
         outputs = extract_frames_for_span(
             self._video_path,
@@ -517,6 +549,11 @@ class VideoQAFFmpegFrameMaterializer:
             self._video_path, representative_timestamp, fallback_output
         )
         return (str(fallback_output.resolve()),)
+
+
+def _safe_chunk_artifact_name(chunk_id: str) -> str:
+    """Return a filesystem-safe chunk artifact stem."""
+    return "".join(ch if ch.isalnum() or ch in "-._" else "_" for ch in chunk_id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -616,6 +653,43 @@ def _collect_chunk_synthesis_inputs(
     return tuple(records), has_low_confidence
 
 
+def _build_chunk_start_frame_paths_provider(
+    *,
+    media_path: Path,
+    staging_dir: Path,
+    should_cancel: Callable[[], bool] | None,
+) -> Callable[
+    [VideoQARunManifest, Sequence[VideoQAChunkExecutionResult]], tuple[str, ...]
+]:
+    """Return a callback that materializes one exact start frame per completed chunk."""
+    output_dir = staging_dir / "final_chunk_start_frames"
+
+    def provide(
+        manifest: VideoQARunManifest,
+        chunk_results: Sequence[VideoQAChunkExecutionResult],
+    ) -> tuple[str, ...]:
+        manifest_by_id = {chunk.chunk_id: chunk for chunk in manifest.chunks}
+        materialized: list[str] = []
+        output_dir.mkdir(parents=True, exist_ok=True)
+        for result in chunk_results:
+            if result.status not in ("completed", "skipped_completed"):
+                continue
+            if should_cancel and should_cancel():
+                msg = "Canceled"
+                raise CancelledError(msg)
+            chunk = manifest_by_id.get(result.chunk_id)
+            if chunk is None:
+                continue
+            output_file = (
+                output_dir / f"{_safe_chunk_artifact_name(result.chunk_id)}-start.png"
+            )
+            extract_frame_to_file(media_path, chunk.t_start, output_file)
+            materialized.append(str(output_file.resolve()))
+        return tuple(materialized)
+
+    return provide
+
+
 def _validate_final_synthesis_payload(
     payload: object,
 ) -> tuple[str, tuple[VideoQAEvidenceItem, ...], bool, str | None] | None:
@@ -688,19 +762,32 @@ class VideoQALMStudioAnswerSynthesizer:
         *,
         base_url: str,
         model: str,
-        temperature: float = 0.0,
-        timeout: float | None = None,
-        request_chat_fn: Callable[..., object] | None = None,
-        should_cancel: Callable[[], bool] | None = None,
-        authorization_bearer: str | None = None,
+        request_options: _VideoQALMStudioRequestOptions | None = None,
+        synthesis_options: _VideoQAFinalSynthesisOptions | None = None,
     ) -> None:
+        resolved_request_options = request_options or _VideoQALMStudioRequestOptions()
+        resolved_synthesis_options = (
+            synthesis_options or _VideoQAFinalSynthesisOptions()
+        )
         self._base_url = base_url
         self._model = model
-        self._temperature = temperature
-        self._timeout = timeout
-        self._request_chat_fn = request_chat_fn or request_chat_completion
-        self._should_cancel = should_cancel
-        self._authorization_bearer = authorization_bearer
+        self._temperature = resolved_request_options.temperature
+        self._timeout = resolved_request_options.timeout
+        self._request_chat_fn = (
+            resolved_request_options.request_chat_fn or request_chat_completion
+        )
+        self._should_cancel = resolved_request_options.should_cancel
+        self._authorization_bearer = resolved_request_options.authorization_bearer
+        self._reasoning = resolved_request_options.reasoning
+        self._include_transcript_in_final_prompt = (
+            resolved_synthesis_options.include_transcript_in_final_prompt
+        )
+        self._include_start_frame_per_chunk_in_final_request = (
+            resolved_synthesis_options.include_start_frame_per_chunk_in_final_request
+        )
+        self._chunk_start_frame_paths_provider = (
+            resolved_synthesis_options.chunk_start_frame_paths_provider
+        )
 
     def aggregate(
         self,
@@ -728,17 +815,39 @@ class VideoQALMStudioAnswerSynthesizer:
                 manifest_run_id=manifest.run_id,
                 uncertainty_note="The synthesis pass had no completed chunk analysis inputs.",
             )
-        prompt = build_final_synthesis_prompt(context, chunk_inputs)
+        transcript_body = (
+            _transcript_body_for_prompt(transcript)
+            if self._include_transcript_in_final_prompt
+            else ""
+        )
+        start_frame_paths = (
+            self._chunk_start_frame_paths_provider(manifest, chunk_results)
+            if self._include_start_frame_per_chunk_in_final_request
+            and self._chunk_start_frame_paths_provider is not None
+            else ()
+        )
+        prompt = build_final_synthesis_prompt(
+            context,
+            chunk_inputs,
+            transcript_body=transcript_body,
+            final_frame_refs=start_frame_paths,
+        )
+        image_paths: tuple[Path | str, ...] = (
+            *context.enabled_image_attachment_paths,
+            *start_frame_paths,
+        )
         try:
             response = self._request_chat_fn(
                 self._base_url,
                 prompt,
+                image_paths=image_paths,
                 json_schema=FINAL_SYNTHESIS_JSON_SCHEMA,
                 model=self._model,
                 temperature=self._temperature,
                 timeout=self._timeout,
                 should_cancel=self._should_cancel,
                 authorization_bearer=self._authorization_bearer,
+                reasoning=self._reasoning,
             )
         except LMStudioClientError as exc:
             msg = f"Final Video QA synthesis failed: {exc}"
@@ -771,12 +880,12 @@ class VideoQALMStudioAnswerSynthesizer:
         )
 
 
-def _transcript_body_for_direct_whole_video_prompt(
+def _transcript_body_for_prompt(
     transcript: VideoQATranscriptArtifacts,
     *,
     max_chars: int = 120_000,
 ) -> str:
-    """Build bounded full-transcript text for the direct whole-video solver prompt."""
+    """Build bounded full-transcript text for direct or final synthesis prompts."""
     body = transcript.transcript_text.strip() or transcript.subtitle_text.strip()
     if body:
         return body if len(body) <= max_chars else body[: max_chars - 3] + "..."
@@ -814,19 +923,19 @@ class VideoQALMStudioDirectWholeVideoSolver:
         *,
         base_url: str,
         model: str,
-        temperature: float = 0.0,
-        timeout: float | None = None,
-        request_chat_fn: Callable[..., object] | None = None,
-        should_cancel: Callable[[], bool] | None = None,
-        authorization_bearer: str | None = None,
+        request_options: _VideoQALMStudioRequestOptions | None = None,
     ) -> None:
+        resolved_request_options = request_options or _VideoQALMStudioRequestOptions()
         self._base_url = base_url
         self._model = model
-        self._temperature = temperature
-        self._timeout = timeout
-        self._request_chat_fn = request_chat_fn or request_chat_completion
-        self._should_cancel = should_cancel
-        self._authorization_bearer = authorization_bearer
+        self._temperature = resolved_request_options.temperature
+        self._timeout = resolved_request_options.timeout
+        self._request_chat_fn = (
+            resolved_request_options.request_chat_fn or request_chat_completion
+        )
+        self._should_cancel = resolved_request_options.should_cancel
+        self._authorization_bearer = resolved_request_options.authorization_bearer
+        self._reasoning = resolved_request_options.reasoning
 
     def solve(
         self,
@@ -838,7 +947,7 @@ class VideoQALMStudioDirectWholeVideoSolver:
         frames: tuple[str, ...],
     ) -> VideoQAAnswerBundle:
         """Run one multimodal request with the final JSON schema and return the bundle."""
-        tx_body = _transcript_body_for_direct_whole_video_prompt(transcript)
+        tx_body = _transcript_body_for_prompt(transcript)
         prompt = build_direct_whole_video_final_prompt(
             context,
             transcript_body=tx_body,
@@ -846,17 +955,22 @@ class VideoQALMStudioDirectWholeVideoSolver:
             chunk_time_span=(chunk.t_start, chunk.t_end),
             frame_paths=frames,
         )
+        image_paths: tuple[Path | str, ...] = (
+            *frames,
+            *context.enabled_image_attachment_paths,
+        )
         try:
             response = self._request_chat_fn(
                 self._base_url,
                 prompt,
-                image_paths=frames,
+                image_paths=image_paths,
                 json_schema=FINAL_SYNTHESIS_JSON_SCHEMA,
                 model=self._model,
                 temperature=self._temperature,
                 timeout=self._timeout,
                 should_cancel=self._should_cancel,
                 authorization_bearer=self._authorization_bearer,
+                reasoning=self._reasoning,
             )
         except LMStudioClientError as exc:
             msg = f"Direct whole-video Video QA failed: {exc}"
@@ -904,6 +1018,7 @@ def _run_local_video_qa_direct_whole_video(  # noqa: C901, PLR0913
     pipeline_log: Callable[[str], None] | None,
     before_final_solve: Callable[[], None] | None,
     direct_solver: VideoQALMStudioDirectWholeVideoSolver | None,
+    final_reasoning: str | Mapping[str, object] | None,
 ) -> VideoQAExecutorRunOutcome:
     """Transcript + whole-span frames + one final multimodal call (no chunk inferencer)."""
     rep = representative_frame_policy or default_representative_frame_policy()
@@ -975,8 +1090,11 @@ def _run_local_video_qa_direct_whole_video(  # noqa: C901, PLR0913
         solver = direct_solver or VideoQALMStudioDirectWholeVideoSolver(
             base_url=final_lm.base_url,
             model=final_lm.model_id,
-            should_cancel=should_cancel,
-            authorization_bearer=final_lm.authorization_bearer,
+            request_options=_VideoQALMStudioRequestOptions(
+                should_cancel=should_cancel,
+                authorization_bearer=final_lm.authorization_bearer,
+                reasoning=final_reasoning,
+            ),
         )
         answer_bundle = solver.solve(
             context=context,
@@ -1040,8 +1158,10 @@ class VideoQALocalRunParams:
     chunk_lm: VideoQALMHttpTarget
     final_lm: VideoQALMHttpTarget
     frame_sample_fps: float = field(default_factory=_default_frame_sample_fps)
-    video_qa_mode: str = VIDEO_QA_RUN_MODE_WHISPER_VLM
     video_chunking_enabled: bool = True
+    run_options: VideoQALocalRunOptions = field(
+        default_factory=default_video_qa_local_run_options
+    )
 
 
 def _build_lm_studio_dual_local_swap_hook(
@@ -1110,6 +1230,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     progress: Callable[[str, float], None] | None,
     pipeline_log: Callable[[str], None] | None = None,
     frame_sample_fps: float | None = None,
+    run_options: VideoQALocalRunOptions | None = None,
     chunk_inferencer_override: VideoQAChunkInferencer | None = None,
     transcript_override: VideoQATranscriptProvider | None = None,
     frame_override: VideoQAFrameMaterializer | None = None,
@@ -1120,6 +1241,7 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
     if context.source is None:
         msg = "Video QA context has no local source."
         raise ValueError(msg)
+    resolved_run_options = run_options or default_video_qa_local_run_options()
     media_path = Path(context.source.path)
     frames_dir = staging_dir / "frames"
     transcript: VideoQATranscriptProvider
@@ -1156,8 +1278,14 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
             context,
             base_url=chunk_lm.base_url,
             model=chunk_lm.model_id,
-            should_cancel=should_cancel,
-            authorization_bearer=chunk_lm.authorization_bearer,
+            request_config=VideoQALMStudioChunkRequestConfig(
+                should_cancel=should_cancel,
+                authorization_bearer=chunk_lm.authorization_bearer,
+                reasoning=build_provider_reasoning_option(
+                    chunk_lm.base_url,
+                    enabled=resolved_run_options.reasoning_enabled,
+                ),
+            ),
         )
     aggregator: VideoQAAnswerAggregator
     if aggregator_override is not None:
@@ -1166,8 +1294,29 @@ def build_video_qa_local_executor_deps(  # noqa: PLR0913
         aggregator = VideoQALMStudioAnswerSynthesizer(
             base_url=final_lm.base_url,
             model=final_lm.model_id,
-            should_cancel=should_cancel,
-            authorization_bearer=final_lm.authorization_bearer,
+            request_options=_VideoQALMStudioRequestOptions(
+                should_cancel=should_cancel,
+                authorization_bearer=final_lm.authorization_bearer,
+                reasoning=build_provider_reasoning_option(
+                    final_lm.base_url,
+                    enabled=resolved_run_options.reasoning_enabled,
+                ),
+            ),
+            synthesis_options=_VideoQAFinalSynthesisOptions(
+                include_transcript_in_final_prompt=(
+                    resolved_run_options.final_request.include_transcript
+                ),
+                include_start_frame_per_chunk_in_final_request=(
+                    resolved_run_options.final_request.include_start_frame_per_chunk
+                ),
+                chunk_start_frame_paths_provider=(
+                    _build_chunk_start_frame_paths_provider(
+                        media_path=media_path,
+                        staging_dir=staging_dir,
+                        should_cancel=should_cancel,
+                    )
+                ),
+            ),
         )
     return VideoQAExecutorDeps(
         transcript=transcript,
@@ -1371,18 +1520,6 @@ def _wrap_local_executor_deps_with_progress(
     )
 
 
-def _effective_transcript_override_for_params(
-    params: VideoQALocalRunParams,
-    transcript_override: VideoQATranscriptProvider | None,
-) -> VideoQATranscriptProvider | None:
-    """Resolve transcript provider: explicit override, else VLM-only empty ASR."""
-    if transcript_override is not None:
-        return transcript_override
-    if params.video_qa_mode == VIDEO_QA_RUN_MODE_VLM_ONLY:
-        return VideoQAVLMOnlyEmptyTranscriptProvider()
-    return None
-
-
 def run_local_video_qa(  # noqa: C901, PLR0912, PLR0913, PLR0915
     *,
     params: VideoQALocalRunParams,
@@ -1446,14 +1583,6 @@ def run_local_video_qa(  # noqa: C901, PLR0912, PLR0913, PLR0915
     )
     if pipeline_log:
         pipeline_log(f"✓ Preflight OK — {len(chunk_plan)} chunk(s) planned.")
-    if pipeline_log and params.video_qa_mode == VIDEO_QA_RUN_MODE_VLM_ONLY:
-        pipeline_log(
-            "→ Mode: VLM-only (Whisper ASR skipped; ffmpeg frame extraction unchanged)"
-        )
-
-    effective_transcript_override = _effective_transcript_override_for_params(
-        params, transcript_override
-    )
 
     manifest = build_video_qa_preparation_manifest(ctx)
     staging_dir = params.output_dir / "_video_qa_work" / manifest.run_id
@@ -1485,8 +1614,9 @@ def run_local_video_qa(  # noqa: C901, PLR0912, PLR0913, PLR0915
             progress=progress,
             pipeline_log=pipeline_log,
             frame_sample_fps=params.frame_sample_fps,
+            run_options=params.run_options,
             chunk_inferencer_override=chunk_inferencer_override,
-            transcript_override=effective_transcript_override,
+            transcript_override=transcript_override,
             frame_override=frame_override,
             aggregator_override=aggregator_override,
             before_answer_aggregate=None,
@@ -1522,6 +1652,10 @@ def run_local_video_qa(  # noqa: C901, PLR0912, PLR0913, PLR0915
             pipeline_log=pipeline_log,
             before_final_solve=None,
             direct_solver=direct_whole_video_solver,
+            final_reasoning=build_provider_reasoning_option(
+                params.final_lm.base_url,
+                enabled=params.run_options.reasoning_enabled,
+            ),
         )
     else:
         swap_hook = _build_lm_studio_dual_local_swap_hook(
@@ -1541,8 +1675,9 @@ def run_local_video_qa(  # noqa: C901, PLR0912, PLR0913, PLR0915
             progress=progress,
             pipeline_log=pipeline_log,
             frame_sample_fps=params.frame_sample_fps,
+            run_options=params.run_options,
             chunk_inferencer_override=chunk_inferencer_override,
-            transcript_override=effective_transcript_override,
+            transcript_override=transcript_override,
             frame_override=frame_override,
             aggregator_override=aggregator_override,
             before_answer_aggregate=swap_hook,

@@ -46,9 +46,9 @@ from core.video_qa_local_run import (
     DEFAULT_LM_STUDIO_OPENAI_BASE_URL,
     DEFAULT_OPENROUTER_OPENAI_BASE_URL,
     OPENROUTER_API_KEY_ENV,
-    VIDEO_QA_RUN_MODE_VLM_ONLY,
-    VIDEO_QA_RUN_MODE_WHISPER_VLM,
+    VideoQAFinalRequestOptions,
     VideoQALMHttpTarget,
+    VideoQALocalRunOptions,
 )
 from core.video_qa_orchestration import (
     build_video_qa_preflight_report,
@@ -504,16 +504,8 @@ class VideoQAPanel(QWidget):
         row.addWidget(QLabel("fps"))
 
     def _build_preflight_mode_row(self, pre_layout: QVBoxLayout) -> None:
-        """Pipeline mode (Whisper+VLM vs VLM-only) and optional time chunking."""
+        """Chunking and optional final-request / reasoning toggles."""
         mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Pipeline mode:"))
-        self.video_qa_mode_combo = QComboBox()
-        self.video_qa_mode_combo.addItems(["Whisper + VLM", "VLM-only"])
-        self.video_qa_mode_combo.currentIndexChanged.connect(
-            self._schedule_preflight_refresh
-        )
-        mode_row.addWidget(self.video_qa_mode_combo)
-        mode_row.addSpacing(16)
         self.chk_video_chunking = QCheckBox("Chunk video (~30s segments)")
         self.chk_video_chunking.setChecked(True)
         self.chk_video_chunking.setToolTip(
@@ -521,6 +513,37 @@ class VideoQAPanel(QWidget):
         )
         self.chk_video_chunking.stateChanged.connect(self._schedule_preflight_refresh)
         mode_row.addWidget(self.chk_video_chunking)
+        mode_row.addSpacing(12)
+        self.chk_final_include_transcript = QCheckBox("Transcript in final")
+        self.chk_final_include_transcript.setToolTip(
+            "When chunking is on, include the ASR transcript in the final synthesis request."
+        )
+        self.chk_final_include_transcript.stateChanged.connect(
+            self._schedule_preflight_refresh
+        )
+        mode_row.addWidget(self.chk_final_include_transcript)
+        mode_row.addSpacing(8)
+        self.chk_final_include_start_frame_per_chunk = QCheckBox(
+            "Start frame per chunk (final)"
+        )
+        self.chk_final_include_start_frame_per_chunk.setToolTip(
+            "When chunking is on, attach one frame from the start of each chunk to the "
+            "final synthesis request."
+        )
+        self.chk_final_include_start_frame_per_chunk.stateChanged.connect(
+            self._schedule_preflight_refresh
+        )
+        mode_row.addWidget(self.chk_final_include_start_frame_per_chunk)
+        mode_row.addSpacing(8)
+        self.chk_reasoning_enabled = QCheckBox("Reasoning")
+        self.chk_reasoning_enabled.setToolTip(
+            "Request provider reasoning tokens where the backend and model support it "
+            "(chunk and final LM calls)."
+        )
+        self.chk_reasoning_enabled.stateChanged.connect(
+            self._schedule_preflight_refresh
+        )
+        mode_row.addWidget(self.chk_reasoning_enabled)
         mode_row.addStretch(1)
         pre_layout.addLayout(mode_row)
 
@@ -717,16 +740,31 @@ class VideoQAPanel(QWidget):
         """Set the current GUI budget limit."""
         self.budget_spin.setValue(tokens)
 
-    def video_qa_run_mode(self) -> str:
-        """Return the current run mode string for :class:`VideoQALocalRunParams`."""
-        if self.video_qa_mode_combo.currentIndex() == 1:
-            return VIDEO_QA_RUN_MODE_VLM_ONLY
-        return VIDEO_QA_RUN_MODE_WHISPER_VLM
+    def video_qa_local_run_options(self) -> VideoQALocalRunOptions:
+        """Return backend run toggles for :class:`VideoQALocalRunParams`."""
+        return VideoQALocalRunOptions(
+            final_request=VideoQAFinalRequestOptions(
+                include_transcript=self.chk_final_include_transcript.isChecked(),
+                include_start_frame_per_chunk=self.chk_final_include_start_frame_per_chunk.isChecked(),
+            ),
+            reasoning_enabled=self.chk_reasoning_enabled.isChecked(),
+        )
 
-    def set_video_qa_run_mode(self, mode: str) -> None:
-        """Select the pipeline mode combo from a backend mode string."""
-        idx = 1 if mode == VIDEO_QA_RUN_MODE_VLM_ONLY else 0
-        self.video_qa_mode_combo.setCurrentIndex(idx)
+    def set_video_qa_run_toggles(
+        self,
+        *,
+        chunking_enabled: bool,
+        final_include_transcript: bool,
+        final_include_start_frame_per_chunk: bool,
+        reasoning_enabled: bool,
+    ) -> None:
+        """Restore chunking and run-option checkboxes (used by settings persistence)."""
+        self.chk_video_chunking.setChecked(chunking_enabled)
+        self.chk_final_include_transcript.setChecked(final_include_transcript)
+        self.chk_final_include_start_frame_per_chunk.setChecked(
+            final_include_start_frame_per_chunk
+        )
+        self.chk_reasoning_enabled.setChecked(reasoning_enabled)
 
     def video_chunking_enabled(self) -> bool:
         """Return whether time chunking is enabled (uniform ~30s when on)."""
@@ -738,13 +776,10 @@ class VideoQAPanel(QWidget):
 
     def _preflight_pipeline_label_text(self) -> str:
         """Human-readable pipeline + chunking summary for the preflight form."""
-        if self.video_qa_mode_combo.currentIndex() == 1:
-            mode_name = "VLM-only"
-        else:
-            mode_name = "Whisper + VLM"
+        base = "ASR + per-chunk VLM + final answer"
         if self.chk_video_chunking.isChecked():
-            return f"{mode_name} · chunking on (uniform ~30s segments)"
-        return f"{mode_name} · chunking off (single full-span chunk)"
+            return f"{base} · chunking on (uniform ~30s segments)"
+        return f"{base} · chunking off (single full-span chunk)"
 
     def _lm_row_target(
         self,
