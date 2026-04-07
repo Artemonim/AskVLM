@@ -221,3 +221,7 @@ class DiarizationPipeline:
         except Exception:  # noqa: BLE001
             return []
         return out
+
+    def close(self) -> None:
+        """Release the loaded diarization backend."""
+        self._pipeline = None

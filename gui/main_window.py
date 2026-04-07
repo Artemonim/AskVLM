@@ -2469,7 +2469,7 @@ class PipelineWorker(QObject):
                 return LocalPipeline(
                     model_root=base.model_root,
                     whisper_model=base.whisperx.model_name,
-                    llm_model=base.formatter.model_name,
+                    llm_model=base.llm_model_name,
                     engine=base.engine,
                     enable_diarization=base.enable_diarization,
                     enable_dialog_blocks=base.enable_dialog_blocks,

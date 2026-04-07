@@ -61,7 +61,7 @@ The easiest way to start is using the PowerShell wrapper, which runs quality che
 pwsh -File run.ps1
 
 # Or launch GUI directly (skips checks)
-python main.py
+python -m gui.main_window
 # Or: pwsh -File run.ps1 -FastLaunch
 ```
 
@@ -145,7 +145,7 @@ pwsh -File run.ps1 -- --tool ruff
 
 ```bash
 # Launch the Quick Transcribe interface
-python main.py
+python -m gui.main_window
 
 # Or use the PowerShell wrapper
 pwsh -File run.ps1 -FastLaunch
@@ -163,24 +163,40 @@ pwsh -File run.ps1 -FastLaunch
 
 ```bash
 python -m pip install .[ml]
-python cli.py -i PATH_TO_MEDIA -o output_dir --whisper-model base --enable-diarization --enable-dialog-blocks --export-format txt
+python cli.py external-transcribe PATH_TO_MEDIA
 ```
 
-**Available Options:**
-- `--whisper-model`: Model size (tiny, base, small, medium, large)
-- `--enable-diarization`: Enable speaker identification
-- `--enable-dialog-blocks`: Enable LLM-based text formatting
-- `--export-format`: Output format (txt, srt, vtt, json)
-- `--device`: Processing device (auto, cuda, cpu)
+**External CLI Transcriber**
+- `python cli.py external-transcribe PATH_TO_MEDIA` prints plain transcript text to `stdout`
+- Default Whisper model: `small`
+- JIT behavior: Whisper loads only when transcription starts and unloads before process exit
+- CUDA safety: if Whisper cannot use GPU memory, AskVLM retries Whisper on CPU automatically
+- Optional file output: `python cli.py external-transcribe PATH_TO_MEDIA --output-file transcript.txt`
+- Optional diarization remains disabled by default and may require additional GPU memory
+
+**Batch CLI**
+```bash
+python cli.py transcribe PATH_TO_MEDIA -o output_dir --whisper-model small --export txt
+```
+
+**Useful Options**
+- `--whisper-model`: Whisper model name for the selected command
+- `--diarization`: Enable speaker identification
+- `--dialog-blocks`: Enable LLM-based text formatting
+- `--export`: Output format for batch mode (`txt`, `srt`, `vtt`, `json`)
+- `--device`: Processing device (`auto`, `cuda`, `cpu`)
 - `--language`: Language code for transcription
+- `--stdout/--no-stdout`: Control plain-text stdout output for `external-transcribe`
+
+See [doc/EXTERNAL_CLI_TRANSCRIBER.md](doc/EXTERNAL_CLI_TRANSCRIBER.md) for detailed integration instructions.
 
 **Environment Variables:**
 - `HF_TOKEN`: Hugging Face token for pyannote models (optional, community pipeline preferred)
 - `LLM_GGUF_PATH`: Path to local llama.cpp GGUF file for LLM formatting (optional)
 
 **Notes:**
-- Engine automatically selects fastest available: WhisperX → faster-whisper → OpenAI Whisper
-- Automatic fallback on OOM: GPU compute type → CPU → smaller model
+- AskVLM transcription uses the local Whisper/Faster-Whisper pipeline
+- Automatic fallback on CUDA memory pressure retries Whisper on CPU when possible
 - GPU memory management with VRAM checks
 
 ## 📋 Code Quality Standards

@@ -81,3 +81,7 @@ class LLMFormatter:
         except (KeyError, TypeError, ValueError) as e:
             logging.getLogger(__name__).debug("LLM format fallback: %s", e)
         return text
+
+    def close(self) -> None:
+        """Release the loaded LLM backend."""
+        self._llm = None

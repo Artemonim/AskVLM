@@ -78,10 +78,55 @@ class WhisperXWrapper:
         self.model_root = model_root
         self._model: Any | None = None
         self._align_model: Any | None = None
+        self._active_device: str | None = None
+        self._active_compute_type: str | None = None
 
-    # * Model is fixed to large-v3 per project policy; VRAM autoselection removed
+    def _cuda_available(self) -> bool:
+        return bool(
+            torch_mod is not None
+            and getattr(torch_mod, "cuda", None) is not None
+            and torch_mod.cuda.is_available()
+        )
 
-    def _load_model(self) -> None:
+    def _normalize_compute_type(self, device: str) -> str:
+        requested = self.compute_type
+        if requested == "auto":
+            return "float16" if device == "cuda" else "int8"
+        if device == "cpu" and requested in {"float16", "int8_float16"}:
+            return "int8"
+        return requested
+
+    def _is_cuda_memory_error(self, exc: Exception) -> bool:
+        exc_name = type(exc).__name__.lower()
+        if "outofmemory" in exc_name:
+            return True
+        message = str(exc).lower()
+        return any(
+            token in message
+            for token in (
+                "cuda out of memory",
+                "cuda error: out of memory",
+                "cudnn_status_alloc_failed",
+                "cuda failed with error out of memory",
+                "not enough memory",
+            )
+        )
+
+    def _load_attempts(self, preferred_device: str | None = None) -> list[str]:
+        if preferred_device is not None:
+            return [preferred_device]
+        if self.device == "cpu":
+            return ["cpu"]
+        if self.device in {"auto", "cuda"}:
+            if self._cuda_available():
+                return ["cuda", "cpu"]
+            logging.getLogger(__name__).warning(
+                "CUDA is unavailable; loading Whisper on CPU."
+            )
+            return ["cpu"]
+        return [self.device]
+
+    def _load_model(self, *, preferred_device: str | None = None) -> None:
         # Defensive: some callers may reset internals; tolerate missing attrs
         if getattr(self, "_model", None) is not None:
             return
@@ -90,34 +135,48 @@ class WhisperXWrapper:
             raise RuntimeError(msg)
 
         download_root = str(self.model_root) if self.model_root else None
-        # * compute_type: prefer float16 on CUDA by default for quality; allow override
-        ct = self.compute_type
-        if ct == "auto":
-            if (
-                torch_mod is not None
-                and getattr(torch_mod, "cuda", None) is not None
-                and torch_mod.cuda.is_available()
-            ):
-                ct = "float16"
-            else:
-                ct = "int8_float16"  # CPU hybrid computation
-        # * Try primary load; if OOM, downgrade compute_type/device
-        # Allow CPU device for hybrid computation
         chosen_model = self.model_name
-        logging.getLogger(__name__).info(
-            "Using Whisper model: %s (device=%s, compute=%s)",
-            chosen_model,
-            self.device,
-            ct if self.device == "cuda" else "int8_float16",
-        )
-        # Force int8_float16 compute when running on CPU as most optimal hybrid compute type
-        compute_type_final = ct if self.device == "cuda" else "int8_float16"
-        self._model = fw_whisper_cls(
-            chosen_model,
-            device=self.device,
-            compute_type=compute_type_final,
-            download_root=download_root,
-        )
+        logger = logging.getLogger(__name__)
+        last_error: Exception | None = None
+        attempts = self._load_attempts(preferred_device=preferred_device)
+
+        for device_name in attempts:
+            compute_type_final = self._normalize_compute_type(device_name)
+            logger.info(
+                "Using Whisper model: %s (device=%s, compute=%s)",
+                chosen_model,
+                device_name,
+                compute_type_final,
+            )
+            try:
+                self._model = fw_whisper_cls(
+                    chosen_model,
+                    device=device_name,
+                    compute_type=compute_type_final,
+                    download_root=download_root,
+                )
+            except Exception as exc:
+                last_error = exc
+                self._model = None
+                self._active_device = None
+                self._active_compute_type = None
+                if (
+                    device_name == "cuda"
+                    and "cpu" in attempts
+                    and self._is_cuda_memory_error(exc)
+                ):
+                    logger.warning(
+                        "Whisper load hit CUDA memory pressure; retrying on CPU."
+                    )
+                    self.unload(safe=False)
+                    continue
+                raise
+            self._active_device = device_name
+            self._active_compute_type = compute_type_final
+            return
+
+        if last_error is not None:
+            raise last_error
 
     def _load_align_model(self) -> None:
         if self._align_model is None and whisperx_mod is not None:
@@ -145,6 +204,8 @@ class WhisperXWrapper:
                     del self._model
             self._model = None
             self._align_model = None
+            self._active_device = None
+            self._active_compute_type = None
             logger.info("WhisperXWrapper.unload: after clearing model refs")
         finally:
             if not safe:
@@ -182,34 +243,24 @@ class WhisperXWrapper:
                         )
             logger.info("WhisperXWrapper.unload: finished")
 
-    def transcribe(
+    def _transcribe_once(
         self,
-        audio_path: Path,
-        language: str | None = None,
         *,
-        on_segment: Callable[[dict[str, Any]], None] | None = None,
-        progress: Callable[[float, str], None] | None = None,
-        **kwargs: object,
+        audio_path: Path,
+        language: str | None,
+        on_segment: Callable[[dict[str, Any]], None] | None,
+        progress: Callable[[float, str], None] | None,
+        preferred_device: str | None,
+        kwargs: dict[str, object],
     ) -> dict[str, Any]:
-        """Transcribe audio and return faster-whisper style result dict.
-
-        Returns a dict with keys: text, segments (list of {start,end,text}).
-        """
-        self._load_model()
+        self._load_model(preferred_device=preferred_device)
         model = self._model
         if model is None:
             msg = "Whisper model failed to load"
             raise RuntimeError(msg)
         segments_out: list[dict[str, Any]] = []
         text_parts: list[str] = []
-        # * Filter out non-faster-whisper kwargs (subtitle layout hints etc.)
-        _kwargs_all = dict(kwargs)
-        for _k in ("max_line_width", "max_line_count"):
-            _kwargs_all.pop(_k, None)
-        # streaming iterator
-        segments, _info = model.transcribe(
-            str(audio_path), language=language, **_kwargs_all
-        )
+        segments, _info = model.transcribe(str(audio_path), language=language, **kwargs)
         for seg in segments:
             start = float(seg.start)
             end = float(seg.end)
@@ -226,6 +277,48 @@ class WhisperXWrapper:
                 p = max(0.0, min(1.0, end))
                 progress(p, "transcribe")
         return {"text": " ".join(text_parts).strip(), "segments": segments_out}
+
+    def transcribe(
+        self,
+        audio_path: Path,
+        language: str | None = None,
+        *,
+        on_segment: Callable[[dict[str, Any]], None] | None = None,
+        progress: Callable[[float, str], None] | None = None,
+        **kwargs: object,
+    ) -> dict[str, Any]:
+        """Transcribe audio and return faster-whisper style result dict.
+
+        Returns a dict with keys: text, segments (list of {start,end,text}).
+        """
+        # * Filter out non-faster-whisper kwargs (subtitle layout hints etc.)
+        _kwargs_all = dict(kwargs)
+        for _k in ("max_line_width", "max_line_count"):
+            _kwargs_all.pop(_k, None)
+        try:
+            return self._transcribe_once(
+                audio_path=audio_path,
+                language=language,
+                on_segment=on_segment,
+                progress=progress,
+                preferred_device=None,
+                kwargs=_kwargs_all,
+            )
+        except Exception as exc:
+            if self._active_device == "cuda" and self._is_cuda_memory_error(exc):
+                logging.getLogger(__name__).warning(
+                    "Whisper transcription hit CUDA memory pressure; retrying on CPU."
+                )
+                self.unload(safe=False)
+                return self._transcribe_once(
+                    audio_path=audio_path,
+                    language=language,
+                    on_segment=on_segment,
+                    progress=progress,
+                    preferred_device="cpu",
+                    kwargs=_kwargs_all,
+                )
+            raise
 
     def align(
         self,

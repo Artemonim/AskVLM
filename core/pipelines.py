@@ -3,6 +3,7 @@ import os
 from collections.abc import Callable
 from pathlib import Path
 from time import monotonic
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, cast
 
 from editing.text_model import Document, TextSegment
@@ -53,7 +54,7 @@ class LocalPipeline:
         self.device = device
         self.compute_type = compute_type
         # STT engine (Faster-Whisper via WhisperX)
-        w_device = "cuda" if device in {"auto", "cuda"} else "cpu"
+        w_device = device if device in {"auto", "cuda", "cpu"} else "auto"
         self.whisperx = WhisperXWrapper(
             model_name="large-v3" if whisper_model == "auto" else whisper_model,
             model_root=self.model_root,
@@ -65,7 +66,43 @@ class LocalPipeline:
         self.enable_dialog_blocks = enable_dialog_blocks
         # Lazy init to avoid importing heavy backends when not needed
         self.diarizer: DiarizationPipeline | None = None
-        self.formatter = LLMFormatter(model_name=llm_model, model_path=None)
+        self._llm_model = llm_model
+        self.formatter: LLMFormatter | None = None
+
+    def _get_formatter(self) -> LLMFormatter:
+        if self.formatter is None:
+            self.formatter = LLMFormatter(model_name=self._llm_model, model_path=None)
+        return self.formatter
+
+    @property
+    def llm_model_name(self) -> str:
+        """Return the configured LLM formatter model name."""
+        return self._llm_model
+
+    def close(self, *, aggressive: bool = False) -> None:
+        """Release loaded ML backends held by the pipeline."""
+        self.whisperx.unload(safe=not aggressive)
+        if self.diarizer is not None:
+            with contextlib.suppress(Exception):
+                self.diarizer.close()
+            self.diarizer = None
+        if self.formatter is not None:
+            with contextlib.suppress(Exception):
+                self.formatter.close()
+            self.formatter = None
+
+    def __enter__(self) -> "LocalPipeline":
+        """Return the pipeline as a context-managed resource."""
+        return self
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _tb: TracebackType | None,
+    ) -> None:
+        """Release heavy ML resources when leaving the context manager."""
+        self.close(aggressive=True)
 
     def process(  # noqa: C901, PLR0915
         self,
@@ -200,7 +237,7 @@ class LocalPipeline:
         # * Step 4: Format text using LLM (optional blocks)
         if self.enable_dialog_blocks:
             report("Formatting", 0.82)
-            formatted_text = self.formatter.format_text(raw_text)
+            formatted_text = self._get_formatter().format_text(raw_text)
             report("Formatting complete", 0.9)
         else:
             formatted_text = raw_text
@@ -212,7 +249,11 @@ class LocalPipeline:
             transcript_segments=transcript_segments,
             diarization_segments=diarization_segments,
             enable_dialog_blocks=self.enable_dialog_blocks,
-            format_text_fn=self.formatter.format_text,
+            format_text_fn=(
+                self._get_formatter().format_text
+                if self.enable_dialog_blocks
+                else _identity_format_text
+            ),
         )
         # * Mark document so text/JSON exporters can build dialog blocks when enabled
         doc.dialog_blocks_enabled = bool(self.enable_dialog_blocks)
@@ -236,6 +277,11 @@ def create_default_local_pipeline() -> LocalPipeline:
     - compute_type="auto" (prefers float16 on CUDA)
     """
     return LocalPipeline()
+
+
+def _identity_format_text(text: str) -> str:
+    """Return text unchanged."""
+    return text
 
 
 def _build_document(
