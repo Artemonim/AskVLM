@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import json
+import os
+import subprocess
+import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import typer
 
@@ -63,6 +68,185 @@ def _create_local_pipeline(  # noqa: PLR0913
 def _write_plain_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class _ExternalChildAttemptResult:
+    success_text: Optional[str]
+    return_code: int
+    stdout: str
+    stderr: str
+
+
+def _normalize_transcript_text(text: Optional[str]) -> str:
+    value = text or ""
+    return value if value.strip() else ""
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        delete=False,
+        dir=path.parent,
+        prefix=f"{path.name}.",
+        suffix=".tmp",
+    ) as temp_file:
+        json.dump(payload, temp_file)
+        temp_file.flush()
+        os.fsync(temp_file.fileno())
+        temp_path = Path(temp_file.name)
+    temp_path.replace(path)
+
+
+def _read_child_success_result(path: Path) -> Optional[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("status") != "ok":
+        return None
+    text = data.get("text")
+    if not isinstance(text, str):
+        return None
+    return _normalize_transcript_text(text)
+
+
+def _run_external_transcribe_once(  # noqa: PLR0913
+    *,
+    input_path: Path,
+    whisper_model: str,
+    language: Optional[str],
+    device: str,
+    compute_type: str,
+    diarization: bool,
+    dialog_blocks: bool,
+    work_dir: Optional[Path],
+    before_close: Optional[Callable[[str], None]] = None,
+) -> str:
+    pipeline = _create_local_pipeline(
+        whisper_model=whisper_model,
+        engine="whisperx",
+        diarization=diarization,
+        dialog_blocks=dialog_blocks,
+        language=language,
+        device=device,
+        compute_type=compute_type,
+    )
+    try:
+        if work_dir is None:
+            with tempfile.TemporaryDirectory(prefix="askvlm-cli-") as temp_dir:
+                text = pipeline.process(input_path, Path(temp_dir)).get_full_text()
+        else:
+            work_dir.mkdir(parents=True, exist_ok=True)
+            text = pipeline.process(input_path, work_dir).get_full_text()
+        normalized_text = _normalize_transcript_text(text)
+        if before_close is not None:
+            before_close(normalized_text)
+        return normalized_text
+    finally:
+        pipeline.close(aggressive=False)
+
+
+def _build_external_child_command(  # noqa: PLR0913
+    *,
+    input_path: Path,
+    whisper_model: str,
+    language: Optional[str],
+    device: str,
+    compute_type: str,
+    diarization: bool,
+    dialog_blocks: bool,
+    work_dir: Optional[Path],
+    child_result_file: Path,
+) -> list[str]:
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        "external-transcribe",
+        str(input_path),
+        "--whisper-model",
+        whisper_model,
+        "--device",
+        device,
+        "--compute-type",
+        compute_type,
+        "--_internal-child-mode",
+        "--_internal-result-file",
+        str(child_result_file),
+    ]
+    if language is not None:
+        command.extend(["--language", language])
+    if diarization:
+        command.append("--diarization")
+    if dialog_blocks:
+        command.append("--dialog-blocks")
+    if work_dir is not None:
+        command.extend(["--work-dir", str(work_dir)])
+    return command
+
+
+def _run_external_transcribe_isolated_attempt(  # noqa: PLR0913
+    *,
+    input_path: Path,
+    whisper_model: str,
+    language: Optional[str],
+    device: str,
+    compute_type: str,
+    diarization: bool,
+    dialog_blocks: bool,
+    work_dir: Optional[Path],
+) -> _ExternalChildAttemptResult:
+    with tempfile.TemporaryDirectory(prefix="askvlm-ext-ipc-") as ipc_dir:
+        child_result_file = Path(ipc_dir) / "child_result.json"
+        command = _build_external_child_command(
+            input_path=input_path,
+            whisper_model=whisper_model,
+            language=language,
+            device=device,
+            compute_type=compute_type,
+            diarization=diarization,
+            dialog_blocks=dialog_blocks,
+            work_dir=work_dir,
+            child_result_file=child_result_file,
+        )
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return _ExternalChildAttemptResult(
+            success_text=_read_child_success_result(child_result_file),
+            return_code=completed.returncode,
+            stdout=completed.stdout or "",
+            stderr=completed.stderr or "",
+        )
+
+
+def _is_windows_crash_like_return_code(return_code: int) -> bool:
+    if return_code < 0:
+        return True
+    return (return_code & 0xFFFFFFFF) >= 0xC0000000
+
+
+def _raise_external_transcribe_error(attempt: _ExternalChildAttemptResult) -> None:
+    details = (attempt.stderr or "").strip() or (attempt.stdout or "").strip()
+    if details:
+        typer.secho(details, err=True)
+    raise typer.Exit(code=1)
+
+
+def _emit_external_transcribe_outputs(
+    *, text: str, output_file: Optional[Path], stdout: bool
+) -> None:
+    if output_file is not None:
+        _write_plain_text(output_file, text)
+    if stdout and text:
+        typer.echo(text)
 
 
 @app.command()
@@ -271,37 +455,113 @@ def external_transcribe(  # noqa: PLR0913
             "a temporary directory and deletes it after completion."
         ),
     ),
+    _internal_child_mode: bool = typer.Option(
+        False,
+        "--_internal-child-mode",
+        hidden=True,
+    ),
+    _internal_result_file: Optional[Path] = typer.Option(
+        None,
+        "--_internal-result-file",
+        hidden=True,
+    ),
 ) -> None:
     """Transcribe one media file and return plain text for external applications."""
     if not stdout and output_file is None:
         raise typer.BadParameter(
             "Either keep --stdout enabled or provide --output-file."
         )
+    if _internal_child_mode:
+        if _internal_result_file is None:
+            raise typer.BadParameter(
+                "Internal child mode requires --_internal-result-file."
+            )
+        try:
+            _run_external_transcribe_once(
+                input_path=input_path,
+                whisper_model=whisper_model,
+                language=language,
+                device=device,
+                compute_type=compute_type,
+                diarization=diarization,
+                dialog_blocks=dialog_blocks,
+                work_dir=work_dir,
+                before_close=lambda text: _write_json_atomic(
+                    _internal_result_file,
+                    {"status": "ok", "text": text},
+                ),
+            )
+            return
+        except Exception as exc:
+            if not _internal_result_file.exists():
+                with contextlib.suppress(Exception):
+                    _write_json_atomic(
+                        _internal_result_file,
+                        {
+                            "status": "error",
+                            "error_type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    )
+            raise
 
-    pipeline = _create_local_pipeline(
+    windows_non_cpu = sys.platform.startswith("win") and device.lower() != "cpu"
+    if windows_non_cpu:
+        first_attempt = _run_external_transcribe_isolated_attempt(
+            input_path=input_path,
+            whisper_model=whisper_model,
+            language=language,
+            device=device,
+            compute_type=compute_type,
+            diarization=diarization,
+            dialog_blocks=dialog_blocks,
+            work_dir=work_dir,
+        )
+        if first_attempt.success_text is not None:
+            _emit_external_transcribe_outputs(
+                text=first_attempt.success_text,
+                output_file=output_file,
+                stdout=stdout,
+            )
+            return
+
+        if not _is_windows_crash_like_return_code(first_attempt.return_code):
+            _raise_external_transcribe_error(first_attempt)
+
+        retry_attempt = _run_external_transcribe_isolated_attempt(
+            input_path=input_path,
+            whisper_model=whisper_model,
+            language=language,
+            device="cpu",
+            compute_type=compute_type,
+            diarization=diarization,
+            dialog_blocks=dialog_blocks,
+            work_dir=work_dir,
+        )
+        if retry_attempt.success_text is not None:
+            _emit_external_transcribe_outputs(
+                text=retry_attempt.success_text,
+                output_file=output_file,
+                stdout=stdout,
+            )
+            return
+        _raise_external_transcribe_error(retry_attempt)
+
+    _run_external_transcribe_once(
+        input_path=input_path,
         whisper_model=whisper_model,
-        engine="whisperx",
-        diarization=diarization,
-        dialog_blocks=dialog_blocks,
         language=language,
         device=device,
         compute_type=compute_type,
+        diarization=diarization,
+        dialog_blocks=dialog_blocks,
+        work_dir=work_dir,
+        before_close=lambda text: _emit_external_transcribe_outputs(
+            text=text,
+            output_file=output_file,
+            stdout=stdout,
+        ),
     )
-    try:
-        if work_dir is None:
-            with tempfile.TemporaryDirectory(prefix="askvlm-cli-") as temp_dir:
-                text = pipeline.process(input_path, Path(temp_dir)).get_full_text()
-        else:
-            work_dir.mkdir(parents=True, exist_ok=True)
-            text = pipeline.process(input_path, work_dir).get_full_text()
-    finally:
-        with contextlib.suppress(Exception):
-            pipeline.close(aggressive=True)
-
-    if output_file is not None:
-        _write_plain_text(output_file, text)
-    if stdout:
-        typer.echo(text)
 
 
 

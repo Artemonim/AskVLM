@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import subprocess
+from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 import cli
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
 
 _RUNNER = CliRunner()
 
@@ -26,18 +23,23 @@ def test_external_transcribe_uses_small_and_stdout_by_default(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The external CLI defaults to a small one-shot stdout contract."""
+    monkeypatch.setattr(cli.sys, "platform", "linux")
     input_path = tmp_path / "clip.wav"
     input_path.write_text("stub", encoding="utf-8")
     work_dir = tmp_path / "work"
     calls: dict[str, object] = {}
 
+    events: list[str] = []
+
     class _StubPipeline:
         def process(self, input_media: Path, process_work_dir: Path) -> _StubDocument:
+            events.append("process")
             calls["process_input"] = input_media
             calls["process_work_dir"] = process_work_dir
             return _StubDocument("transcribed text")
 
         def close(self, *, aggressive: bool = False) -> None:
+            events.append("close")
             calls["close_aggressive"] = aggressive
 
     def _fake_create_local_pipeline(**kwargs: object) -> _StubPipeline:
@@ -46,6 +48,14 @@ def test_external_transcribe_uses_small_and_stdout_by_default(
 
     monkeypatch.setattr(cli, "_create_local_pipeline", _fake_create_local_pipeline)
 
+    real_echo = cli.typer.echo
+
+    def _tracking_echo(message: str | None = None, **kwargs: object) -> None:
+        events.append("stdout")
+        real_echo(message, **kwargs)
+
+    monkeypatch.setattr(cli.typer, "echo", _tracking_echo)
+
     result = _RUNNER.invoke(
         cli.app,
         ["external-transcribe", str(input_path), "--work-dir", str(work_dir)],
@@ -53,6 +63,7 @@ def test_external_transcribe_uses_small_and_stdout_by_default(
 
     assert result.exit_code == 0
     assert result.stdout == "transcribed text\n"
+    assert events == ["process", "stdout", "close"]
     assert calls["pipeline_kwargs"] == {
         "whisper_model": "small",
         "engine": "whisperx",
@@ -64,28 +75,41 @@ def test_external_transcribe_uses_small_and_stdout_by_default(
     }
     assert calls["process_input"] == input_path
     assert calls["process_work_dir"] == work_dir
-    assert calls["close_aggressive"] is True
+    assert calls["close_aggressive"] is False
 
 
 def test_external_transcribe_writes_output_file_without_stdout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The external CLI can write a file without emitting transcript stdout."""
+    monkeypatch.setattr(cli.sys, "platform", "linux")
     input_path = tmp_path / "clip.wav"
     input_path.write_text("stub", encoding="utf-8")
     output_file = tmp_path / "nested" / "transcript.txt"
 
+    events: list[str] = []
+    calls: dict[str, object] = {}
+
     class _StubPipeline:
         def process(self, _input_media: Path, _process_work_dir: Path) -> _StubDocument:
+            events.append("process")
             return _StubDocument("saved transcript")
 
         def close(self, *, aggressive: bool = False) -> None:
-            _ = aggressive
+            events.append("close")
+            calls["close_aggressive"] = aggressive
 
     def _fake_create_local_pipeline(**_kwargs: object) -> _StubPipeline:
         return _StubPipeline()
 
+    real_write_plain = cli._write_plain_text  # noqa: SLF001
+
+    def _tracing_write_plain(out_path: Path, text: str) -> None:
+        events.append("write_file")
+        real_write_plain(out_path, text)
+
     monkeypatch.setattr(cli, "_create_local_pipeline", _fake_create_local_pipeline)
+    monkeypatch.setattr(cli, "_write_plain_text", _tracing_write_plain)
 
     result = _RUNNER.invoke(
         cli.app,
@@ -103,3 +127,216 @@ def test_external_transcribe_writes_output_file_without_stdout(
     assert result.exit_code == 0
     assert result.stdout == ""
     assert output_file.read_text(encoding="utf-8") == "saved transcript"
+    assert events == ["process", "write_file", "close"]
+    assert calls["close_aggressive"] is False
+
+
+@pytest.mark.parametrize("stub_text", ["", "   \n\t  "])
+def test_external_transcribe_accepts_empty_transcript_as_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stub_text: str,
+) -> None:
+    """Whitespace-only transcripts are successful and stay silent in stdout/stderr."""
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    output_file = tmp_path / "out.txt"
+    calls: dict[str, object] = {}
+    events: list[str] = []
+
+    class _StubPipeline:
+        def process(self, _input_media: Path, _process_work_dir: Path) -> _StubDocument:
+            return _StubDocument(stub_text)
+
+        def close(self, *, aggressive: bool = False) -> None:
+            calls["close_aggressive"] = aggressive
+
+    real_echo = cli.typer.echo
+
+    def _tracking_echo(message: str | None = None, **kwargs: object) -> None:
+        events.append("stdout")
+        real_echo(message, **kwargs)
+
+    monkeypatch.setattr(
+        cli,
+        "_create_local_pipeline",
+        lambda **_kwargs: _StubPipeline(),
+    )
+    monkeypatch.setattr(cli.typer, "echo", _tracking_echo)
+
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(input_path),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--output-file",
+            str(output_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == ""
+    assert result.stderr == ""
+    assert output_file.exists()
+    assert output_file.read_text(encoding="utf-8") == ""
+    assert events == []
+    assert calls["close_aggressive"] is False
+
+
+def test_external_transcribe_isolated_attempt_prefers_result_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Child JSON result is source of truth even with crash-like return code."""
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+
+    def _fake_run(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        result_path = Path(command[command.index("--_internal-result-file") + 1])
+        result_path.write_text(
+            '{"status":"ok","text":"from child"}',
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(
+            command,
+            3221226505,
+            stdout="",
+            stderr="native crash after write",
+        )
+
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
+
+    run_isolated_attempt = cli._run_external_transcribe_isolated_attempt  # noqa: SLF001
+    result = run_isolated_attempt(
+        input_path=input_path,
+        whisper_model="small",
+        language=None,
+        device="cuda",
+        compute_type="auto",
+        diarization=False,
+        dialog_blocks=False,
+        work_dir=tmp_path / "work",
+    )
+
+    assert result.success_text == "from child"
+    assert result.return_code == 3221226505
+
+
+def test_external_transcribe_windows_parent_uses_successful_child_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows parent accepts successful child result despite crash-like code."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    output_file = tmp_path / "result.txt"
+    called_devices: list[str] = []
+    attempt_result_cls = cli._ExternalChildAttemptResult  # noqa: SLF001
+
+    def _fake_attempt(**kwargs: object) -> object:
+        called_devices.append(str(kwargs["device"]))
+        return attempt_result_cls(
+            success_text="isolated text",
+            return_code=3221226505,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli, "_run_external_transcribe_isolated_attempt", _fake_attempt)
+
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(input_path),
+            "--output-file",
+            str(output_file),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "isolated text\n"
+    assert result.stderr == ""
+    assert output_file.read_text(encoding="utf-8") == "isolated text"
+    assert called_devices == ["auto"]
+
+
+def test_external_transcribe_windows_crash_like_failures_retry_once_on_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows parent does exactly one CPU retry for crash-like child failures."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    called_devices: list[str] = []
+    attempt_result_cls = cli._ExternalChildAttemptResult  # noqa: SLF001
+
+    def _fake_attempt(**kwargs: object) -> object:
+        called_devices.append(str(kwargs["device"]))
+        if len(called_devices) == 1:
+            return attempt_result_cls(
+                success_text=None,
+                return_code=3221226505,
+                stdout="",
+                stderr="native crash",
+            )
+        return attempt_result_cls(
+            success_text="cpu recovered text",
+            return_code=0,
+            stdout="",
+            stderr="",
+        )
+
+    monkeypatch.setattr(cli, "_run_external_transcribe_isolated_attempt", _fake_attempt)
+
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(input_path),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert result.stdout == "cpu recovered text\n"
+    assert result.stderr == ""
+    assert called_devices == ["auto", "cpu"]
+
+
+def test_external_transcribe_windows_non_crash_error_does_not_retry_cpu(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows parent does not retry CPU for regular child errors."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    called_devices: list[str] = []
+    attempt_result_cls = cli._ExternalChildAttemptResult  # noqa: SLF001
+
+    def _fake_attempt(**kwargs: object) -> object:
+        called_devices.append(str(kwargs["device"]))
+        return attempt_result_cls(
+            success_text=None,
+            return_code=2,
+            stdout="",
+            stderr="regular child failure",
+        )
+
+    monkeypatch.setattr(cli, "_run_external_transcribe_isolated_attempt", _fake_attempt)
+
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(input_path),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert "regular child failure" in (result.stderr or "")
+    assert called_devices == ["auto"]
