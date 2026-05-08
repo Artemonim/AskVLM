@@ -1,6 +1,6 @@
 ---
 name: Middle SWE
-model: gpt-5.1-codex-max-xhigh
+model: gpt-5.3-codex-high
 description: Хороший экономичный вариант
 ---
 
