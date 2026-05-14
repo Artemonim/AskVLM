@@ -4,8 +4,6 @@
 
 AI-powered desktop toolkit for speech transcription, subtitle generation, and multimodal video analysis (Video QA). Built around local ML pipelines with optional cloud LLM support.
 
-**License**: MIT
-
 ## Overview
 
 AskVLM combines three workflows in a single PySide6-based desktop application:
@@ -77,6 +75,8 @@ The application opens with a mode selector (Text + Subtitles / Video QA) and rem
 - Run the analysis: AskVLM chunks the video, extracts representative frames, runs ASR via WhisperX, and sends each chunk to a VLM.
 - View the grounded Markdown answer and evidence log.
 - Supports LM Studio (local) and OpenRouter (cloud) as LLM backends.
+
+![Video QA GUI](doc/media/VideoQA%20GUI.png)
 
 ## CLI
 
@@ -191,6 +191,8 @@ tools/          Benchmarking utilities (STT benchmarks, OOM threshold finder)
 tests/          Pytest test suite (unit, integration, E2E)
 doc/            Design documents, integration guides
 ```
+
+![Multimodal GUI Architecture](doc/media/Multimodal%20GUI%20Design%2001%20-%20%D0%90%D1%80%D1%85%D0%B8%D1%82%D0%B5%D0%BA%D1%82%D1%83%D1%80%D0%BD%D0%B0%D1%8F%20%D1%81%D1%85%D0%B5%D0%BC%D0%B0.png)
 
 ## Code Quality
 
