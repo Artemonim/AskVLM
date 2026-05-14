@@ -146,6 +146,7 @@ logs/
 temporary/
 .deps_last_check
 .pip_audit_last_run
+.specstory/
 
 # ! Additional ignores for code quality tools
 .ruff_cache/
