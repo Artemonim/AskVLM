@@ -1,431 +1,282 @@
+ [🇷🇺 Русский](README.ru.md) | [🇬🇧 English](README.md)
+
 # AskVLM
 
-AI-powered speech transcription and editing toolkit with comprehensive code quality assurance.
+Десктопный AI-инструмент для транскрипции речи, генерации субтитров и мультимодального анализа видео (Video QA). Построен на локальных ML-пайплайнах с опциональной поддержкой облачных LLM.
 
-**Current Status**: Phase 1.7 (Simple GUI MVP) - Quick Transcribe interface with batch processing capabilities.
+**Лицензия**: MIT
 
-## 🚀 Quick Start
+## Обзор
 
-### Prerequisites
+AskVLM объединяет три рабочих процесса в одном PySide6-приложении:
 
-**⚠️ Important:** This project targets **Python 3.11 only** (`requires-python` in `pyproject.toml`, local `build.ps1`, and ML/tooling checks). Python 3.12+ is not supported in this repository yet.
+- **Текстовый режим** — транскрипция аудио/видео в текст с опциональной диаризацией говорящих и LLM-форматированием.
+- **Режим субтитров** — генерация субтитров (SRT/VTT) с правилами читаемости, предпросмотр и прожиг в видео через FFmpeg.
+- **Режим Video QA** — задайте вопрос о видео на естественном языке; AskVLM разбивает видео на чанки, извлекает репрезентативные кадры, запускает ASR и обращается к VLM (LM Studio или OpenRouter) для формирования обоснованного ответа.
 
-#### System Requirements
+## Быстрый старт
 
-- **Python**: 3.11.x (required)
-- **RAM**: Minimum 8GB, recommended 16GB+
-- **GPU**: NVIDIA GPU with CUDA support (optional, CPU fallback available)
-- **VRAM**: Minimum 4GB, recommended 8GB+ for larger models
-- **Storage**: 2GB+ for models and temporary files
+### Требования
 
-Check your Python version:
+- **Python**: 3.11.x (обязательно; 3.12+ не поддерживается)
+- **ОС**: Windows (основная), Linux (community)
+- **RAM**: минимум 8 ГБ, рекомендуется 16 ГБ+
+- **GPU**: NVIDIA с CUDA (опционально, есть fallback на CPU)
+- **VRAM**: минимум 4 ГБ, рекомендуется 8 ГБ+ для крупных моделей
+- **Диск**: 2 ГБ+ под модели и временные файлы
 
-```bash
-python --version
-```
+См. [PYTHON_SETUP.md](PYTHON_SETUP.md) для установки или выбора нужной версии Python.
 
-If you need to install or select Python 3.11, see [PYTHON_SETUP.md](PYTHON_SETUP.md).
-
-#### Dependencies
-
-The project uses optional ML dependencies that are installed separately:
+### Установка
 
 ```bash
-# Core dependencies (always installed)
-pip install -e .
-
-# ML dependencies (for transcription/diarization)
-pip install -e .[ml]
-```
-
-### Development Setup
-
-```bash
-# Clone the repository
 git clone <repository-url>
 cd AskVLM
 
-# Install development dependencies and setup environment
-make setup-dev
+# Базовые зависимости
+pip install -e .
 
-# Run local CI (auto-fix + lint + type-check + tests)
-pwsh -NoProfile -ExecutionPolicy Bypass -File run.ps1
-```
-
-### First Run
-
-The easiest way to start is using the PowerShell wrapper, which runs quality checks and launches the GUI:
-
-```bash
-# Run quality checks and launch GUI (recommended)
-pwsh -File run.ps1
-
-# Or launch GUI directly (skips checks)
-python -m gui.main_window
-# Or: pwsh -File run.ps1 -FastLaunch
-```
-
-**Note**: On first run, the application will create default settings and download required models automatically. If you haven't installed ML dependencies yet, you'll need to run:
-
-```bash
+# ML-зависимости (транскрипция, диаризация, LLM-форматирование)
 pip install -e .[ml]
+
+# Инструменты разработки (линтеры, тесты)
+pip install -e .[dev]
 ```
 
-### Code Quality Tools
-
-This project uses strict code quality standards with multiple linters and static analyzers:
-
-#### 🔍 **Automated Checks**
-
--   **Ruff**: Fast Python linter and formatter (replaces flake8, isort, black)
--   **MyPy**: Static type checking with strict mode
--   **Bandit**: Security vulnerability analysis
--   **Pylint**: Comprehensive code quality analysis
--   **Pytest**: Testing framework with coverage reporting
-
-#### ⚡ **Quick Commands**
+### Запуск
 
 ```bash
-# Run all quality checks
-python test.py
-
-# Fast checks only (skip pylint)
-python test.py --quick
-
-# Auto-format code
-python test.py --format-only
-
-# Type checking only
-python test.py --type-check
-
-# Security analysis only
-python test.py --security
-
-# Run tests only
-python test.py --tests
-
-# Clean up cache and temporary files
-python test.py --clean
-
-# Install dev dependencies
-python test.py --install-deps
-```
-
-#### 🛠️ **Using Makefile**
-
-```bash
-make help          # Show all available commands
-make setup-dev     # Complete development setup
-make check-all     # Run all quality checks
-make format        # Auto-format code
-make fix           # Auto-fix issues where possible
-make clean         # Clean up generated files
-make clean-all     # Deep clean including temp files
-make clean-verbose # Clean with detailed output
-```
-
-#### 🔧 **Automated Quality Checks**
-
-All quality checks are integrated into `build.py` and PowerShell wrappers - no need for separate pre-commit setup. By default, successful checks automatically launch the GUI application.
-
-```bash
-# Run all checks and launch GUI if successful
+# Проверки качества кода + запуск GUI (рекомендуется)
 pwsh -File run.ps1
 
-# Run checks only (no GUI launch)
-pwsh -File run.ps1 -SkipLaunch
-
-# Launch GUI directly (skip checks)
+# Запуск GUI напрямую (без проверок)
 pwsh -File run.ps1 -FastLaunch
-
-# Single tool example
-pwsh -File run.ps1 -- --tool ruff
-
-### GUI Usage (Recommended)
-
-```bash
-# Launch the Quick Transcribe interface
+# или
 python -m gui.main_window
-
-# Or use the PowerShell wrapper
-pwsh -File run.ps1 -FastLaunch
 ```
 
-**Quick Transcribe Features:**
-- Choose single file or entire folder for batch processing
-- Toggle diarization (speaker identification) on/off
-- Toggle dialog blocks formatting on/off
-- Export formats: TXT, SRT, VTT, JSON
-- Real-time progress with cancel support
-- Automatic output to `transcriptions/` folder
+При первом запуске приложение создаёт настройки по умолчанию и автоматически скачивает нужные модели. Если ML-зависимости не установлены, выполните `pip install -e .[ml]`.
 
-### CLI Usage
+## GUI
+
+Приложение открывается с выбором режима (Text + Subtitles / Video QA) и запоминает последний выбор между сессиями.
+
+### Text + Subtitles
+
+- Выбор отдельного файла или целой папки для пакетной обработки.
+- Включение/отключение диаризации и LLM-форматирования диалогов.
+- Экспорт в TXT, SRT, VTT или JSON.
+- Предпросмотр субтитров и прожиг в видео.
+- Прогресс в реальном времени с возможностью отмены; результат в `transcriptions/`.
+
+### Video QA
+
+- Укажите локальный видеофайл (или YouTube-ссылку, экспериментально).
+- Введите вопрос на естественном языке и опционально прикрепите контекстные файлы (txt, md, код, изображения).
+- Просмотрите preflight-сводку (источник, число чанков, примерный бюджет токенов).
+- Запустите анализ: AskVLM разбивает видео на чанки, извлекает кадры, выполняет ASR через WhisperX и отправляет каждый чанк в VLM.
+- Получите обоснованный Markdown-ответ и лог доказательств.
+- Поддержка LM Studio (локально) и OpenRouter (облако) в качестве LLM-бэкендов.
+
+## CLI
+
+AskVLM предоставляет три CLI-команды через [Typer](https://typer.tiangolo.com/):
+
+### `transcribe` — пакетная транскрипция
 
 ```bash
-python -m pip install .[ml]
+python cli.py transcribe PATH -o output_dir --whisper-model large-v3 --export txt
+```
+
+Основные опции: `--whisper-model`, `--diarization/--no-diarization`, `--dialog-blocks`, `--export` (txt/srt/vtt/json), `--device` (auto/cuda/cpu), `--language`, `--engine` (whisper/whisperx/auto), `--recursive`, `--compute-type`.
+
+### `subtitle` — генерация субтитров с прожигом
+
+```bash
+python cli.py subtitle PATH -o output_dir --burn-in --whisper-model large-v3
+```
+
+Генерирует SRT с настраиваемыми правилами читаемости (макс. CPS, длина строки, лимиты длительности кью) и опционально прожигает субтитры в видео через FFmpeg.
+
+Основные опции: `--max-cps`, `--max-line-chars`, `--max-lines`, `--min-duration`, `--max-duration`, `--burn-in/--no-burn-in`, `--save-srt/--no-save-srt`, `--diarization`.
+
+### `external-transcribe` — транскрипция для интеграций
+
+```bash
 python cli.py external-transcribe PATH_TO_MEDIA
 ```
 
-**External CLI Transcriber**
-- `python cli.py external-transcribe PATH_TO_MEDIA` prints plain transcript text to `stdout`
-- Default Whisper model: `small`
-- JIT behavior: Whisper loads only when transcription starts and unloads before process exit
-- CUDA safety: if Whisper cannot use GPU memory, AskVLM retries Whisper on CPU automatically
-- Optional file output: `python cli.py external-transcribe PATH_TO_MEDIA --output-file transcript.txt`
-- Optional diarization remains disabled by default and may require additional GPU memory
+Выводит текст транскрипции в stdout. Предназначен как машинно-читаемый endpoint для внешних приложений.
 
-**Batch CLI**
-```bash
-python cli.py transcribe PATH_TO_MEDIA -o output_dir --whisper-model small --export txt
+- Whisper-модель по умолчанию: `small`.
+- JIT-загрузка модели: Whisper загружается при старте транскрипции и выгружается перед выходом.
+- Безопасность CUDA: на Windows, если дочерний GPU-процесс падает (OOM), AskVLM автоматически повторяет на CPU в изолированном подпроцессе.
+- Опциональный файловый вывод: `--output-file transcript.txt`.
+- Диаризация отключена по умолчанию (экономия VRAM).
+
+Подробности — [doc/EXTERNAL_CLI_TRANSCRIBER.md](doc/EXTERNAL_CLI_TRANSCRIBER.md).
+
+### Переменные окружения
+
+| Переменная | Назначение |
+| --- | --- |
+| `HF_TOKEN` | Токен Hugging Face для моделей диаризации PyAnnote (опционально) |
+| `LLM_GGUF_PATH` | Путь к локальному GGUF-файлу для LLM-форматирования текста (опционально) |
+| `OPENROUTER_API_KEY` | API-ключ OpenRouter для облачной VLM в режиме Video QA (опционально) |
+
+## LLM-бэкенды
+
+AskVLM использует LLM в двух независимых контекстах. Оба опциональны — приложение работает без настроенных LLM, но часть функций деградирует (форматирование не применяется) или становится недоступной (Video QA).
+
+### Форматирование текста (dialog blocks)
+
+Когда включён `--dialog-blocks` (CLI) или соответствующий тогл (GUI), сырой вывод ASR отправляется в локальную LLM для восстановления пунктуации, регистра и разбивки на абзацы. Форматтер использует **llama-cpp-python** с GGUF-моделью.
+
+Настройка:
+
+1. Установите ML-зависимости: `pip install -e .[ml]` (включает `llama-cpp-python`).
+2. Задайте переменную окружения `LLM_GGUF_PATH`, указывающую на ваш `.gguf`-файл.
+3. Если доступна CUDA GPU, форматтер автоматически выгружает слои на GPU; иначе работает на CPU.
+
+Если путь к GGUF не задан или `llama-cpp-python` отсутствует, форматтер молча деградирует — транскрипция продолжается без форматирования.
+
+### Video QA (мультимодальный анализ)
+
+В режиме Video QA каждый чанк видео (репрезентативные кадры + фрагмент транскрипции) отправляется в Vision-Language Model для обоснованного анализа. Поддерживаются два бэкенда:
+
+**LM Studio (локально)**
+
+- Запустите [LM Studio](https://lmstudio.ai/) и загрузите VLM (например, вариант Qwen-VL или LLaVA).
+- AskVLM подключается через OpenAI-совместимый endpoint `http://127.0.0.1:1234/v1`.
+- Приложение управляет жизненным циклом моделей через LM Studio Developer REST API: может перечислять, загружать и выгружать инстансы моделей, чтобы делить один GPU между Whisper и VLM.
+
+**OpenRouter (облако)**
+
+- Задайте `OPENROUTER_API_KEY` в `.env` или как переменную окружения.
+- Выберите мультимодальную модель в GUI (например, `qwen/qwen3.6-plus:free`).
+- Поддержка параметра `reasoning` OpenRouter с настраиваемым уровнем усилий (`none`, `low`, `medium`, `high`).
+- Подробности — [doc/OPENROUTER_INTEGRATION.md](doc/OPENROUTER_INTEGRATION.md).
+
+Оба бэкенда используют единый промпт-контракт (`core/llm_prompts.py`): структурированный JSON-анализ по чанкам с последующим финальным синтезом, формирующим обоснованный ответ с доказательствами и маркерами неопределённости.
+
+### Доктрина GPU-памяти
+
+В VRAM одновременно находится только одна тяжёлая нейросеть. При переходе между стадиями пайплайна (например, Whisper → VLM) предыдущая модель выгружается в RAM или освобождается полностью перед загрузкой следующей. Это позволяет выполнять полный пайплайн Video QA на одном GPU с 8 ГБ.
+
+## Архитектура
+
+```
+core/           Ядро обработки
+  ffmpeg.py             Конвертация аудио/видео через FFmpeg
+  whisper_wrapper.py    Бэкенд OpenAI Whisper
+  whisperx_wrapper.py   Бэкенд WhisperX (пословные таймстемпы)
+  diarization.py        Диаризация говорящих через PyAnnote
+  llm_formatter.py      LLM-форматирование текста
+  pipelines.py          Оркестрация LocalPipeline
+  gpu_guard.py          Проверка VRAM и защита от OOM
+  settings.py           Настройки приложения
+  lm_studio_rest.py     REST-клиент LM Studio
+  video_qa_*.py         Пайплайн Video QA (чанкинг, кадры, оркестрация, манифест, политики)
+gui/            Интерфейс на PySide6
+  main_window.py        Главное окно с маршрутизацией режимов
+  video_qa.py           Экран Video QA
+  wysiwyg_editor.py     WYSIWYG-редактор транскрипции
+  subtitle_preview.py   Виджет предпросмотра субтитров
+  speaker_sidebar.py    Боковая панель управления говорящими
+  preferences_dialog.py Диалог настроек
+  export_dialog.py      Диалог экспорта
+editing/        Текстовая модель и операции редактирования
+utils/          Экспортеры, логирование, загрузчик моделей, хелперы
+tools/          Утилиты бенчмаркинга (бенчмарки STT, поиск порога OOM)
+tests/          Тестовый набор Pytest (юнит, интеграционные, E2E)
+doc/            Проектная документация, гайды по интеграции
 ```
 
-**Useful Options**
-- `--whisper-model`: Whisper model name for the selected command
-- `--diarization`: Enable speaker identification
-- `--dialog-blocks`: Enable LLM-based text formatting
-- `--export`: Output format for batch mode (`txt`, `srt`, `vtt`, `json`)
-- `--device`: Processing device (`auto`, `cuda`, `cpu`)
-- `--language`: Language code for transcription
-- `--stdout/--no-stdout`: Control plain-text stdout output for `external-transcribe`
+## Качество кода
 
-See [doc/EXTERNAL_CLI_TRANSCRIBER.md](doc/EXTERNAL_CLI_TRANSCRIBER.md) for detailed integration instructions.
-
-**Environment Variables:**
-- `HF_TOKEN`: Hugging Face token for pyannote models (optional, community pipeline preferred)
-- `LLM_GGUF_PATH`: Path to local llama.cpp GGUF file for LLM formatting (optional)
-
-**Notes:**
-- AskVLM transcription uses the local Whisper/Faster-Whisper pipeline
-- Automatic fallback on CUDA memory pressure retries Whisper on CPU when possible
-- GPU memory management with VRAM checks
-
-## 📋 Code Quality Standards
-
-**Current Status**: ✅ All checks passing
-
--   **Type Hints**: All code must include comprehensive type annotations (MyPy strict mode)
--   **Documentation**: Google-style docstrings for all public APIs
--   **Security**: No security vulnerabilities (enforced by Bandit)
--   **Formatting**: Consistent code style (enforced by Ruff)
--   **Linting**: Strict Ruff rules with auto-fix capabilities
--   **Testing**: Pytest framework ready (tests to be added in Phase 1.5 completion)
--   **Comments**: Better Comments style with semantic markers
-
-**Quality Check Results:**
-- ✅ Ruff Format Check
-- ✅ Ruff Lint
-- ✅ MyPy Type Check
-- ✅ Bandit Security Check
-- ⚠️ Pytest Tests (framework ready, tests pending)
-- ⚠️ Pylint Analysis (optional, ML import warnings)
-
-## 🎯 Project Status
-
-**Phase 1.7 (Simple GUI MVP) - COMPLETED** ✅
-
-Core functionality implemented with Quick Transcribe interface:
-
-- **Local Processing Pipeline**: FFmpeg → Whisper/WhisperX → PyAnnote → LLM formatting
-- **GUI Interface**: PySide6-based Quick Transcribe with progress tracking
-- **Batch Processing**: Support for single files and entire folders
-- **Export Formats**: TXT, SRT, VTT, JSON with timestamps and speakers
-- **Smart Engine Selection**: Automatic WhisperX/faster-whisper/OpenAI Whisper fallback
-- **GPU Optimization**: VRAM checks and compute type auto-selection
-- **CLI Tools**: Batch processing with flexible options
-
-**Next Phase**: Phase 2 - Advanced Editing (WYSIWYG editor, undo/redo, speaker management)
-
-See [TODO.md](TODO.md) for the complete roadmap and current progress.
-
-## 🏗️ Architecture
-
-The project follows a modular architecture:
-
--   `core/`: Core processing modules (FFmpeg, Whisper, PyAnnote, LLM)
--   `gui/`: PySide6-based user interface
--   `editing/`: Text editing and manipulation tools
--   `utils/`: Utility functions and helpers
--   `tests/`: Test suite and fixtures
-
-## ✅ Current Features
-
-### Core Processing
-- **Multi-Engine STT**: WhisperX, faster-whisper, OpenAI Whisper with automatic fallback
-- **Speaker Diarization**: PyAnnote-based speaker identification (optional)
-- **Text Formatting**: LLM-based punctuation and paragraph formatting (optional)
-- **Audio Preprocessing**: FFmpeg-based conversion to optimal WAV format
-
-### User Interface
-- **Quick Transcribe GUI**: Drag-and-drop file/folder selection
-- **Real-time Progress**: Progress bar with step-by-step status updates
-- **Batch Processing**: Process multiple files with single click
-- **Settings Control**: Toggle diarization, formatting, export formats
-
-### Export & Output
-- **Multiple Formats**: TXT, SRT, VTT, JSON
-- **Speaker Metadata**: Timestamps and speaker identification in exports
-- **Organized Output**: Automatic folder creation and file naming
-
-### Performance & Reliability
-- **GPU Memory Management**: VRAM checks and OOM prevention
-- **Smart Fallbacks**: Automatic device/model selection based on hardware
-- **Background Processing**: Non-blocking GUI with cancel support
-- **Error Handling**: Graceful degradation and user-friendly error messages
-
-## 🚀 Planned Features
-
-### Advanced Editing (Phase 2)
-- **WYSIWYG Editor**: Rich text editing with speaker management
-- **Undo/Redo**: Full editing history with QUndoStack
-- **Speaker Management**: Rename speakers, merge/split segments
-- **Timeline View**: Visual timeline with speaker colors
-
-### Cloud Integration (Phase 2)
-- **Yandex SpeechKit**: Cloud-based transcription and diarization
-- **Hybrid Processing**: Local + cloud fallback options
-
-### Additional Formats (Phase 2)
-- **Office Documents**: DOCX, ODT with speaker styling
-- **Web Subtitles**: Advanced VTT with positioning
-- **Markdown Export**: Speaker-attributed markdown format
-
-
-## 🐛 Troubleshooting
-
-### Common Issues
-
-**"No module named 'faster_whisper'"**
-```bash
-pip install -e .[ml]
-```
-ML dependencies are required for transcription features.
-
-**"CUDA out of memory"**
-- The application automatically falls back to CPU
-- Try smaller Whisper models (base/small instead of medium/large)
-- Close other GPU-intensive applications
-
-**"Permission denied" when creating output folder**
-- Check write permissions in the output directory
-- Try running as administrator (Windows) or with sudo (Linux)
-
-**GUI doesn't start**
-```bash
-python main.py
-```
-Check console output for error messages.
-
-### Environment Variables
+Все проверки запускаются через `run.ps1` → `build.py`. Отдельная настройка pre-commit не нужна.
 
 ```bash
-# Hugging Face token for PyAnnote models (optional)
-export HF_TOKEN="your_huggingface_token"
+# Полный пайплайн: авто-фикс → линт → тайпчек → тесты → аудит безопасности
+pwsh -File run.ps1 -SkipLaunch
 
-# Local LLM model path (optional)
-export LLM_GGUF_PATH="/path/to/model.gguf"
+# Быстрый режим (без медленных тестов)
+pwsh -File run.ps1 -SkipLaunch -Fast
+
+# Один инструмент
+pwsh -File run.ps1 -Tool ruff
+
+# Только запуск GUI
+pwsh -File run.ps1 -FastLaunch
 ```
 
-### Performance Tips
+**Тулчейн**: Ruff (формат + линт), MyPy (strict), Pyright, Bandit (безопасность), Pytest (с покрытием), pip-audit.
 
-- **GPU Processing**: Use NVIDIA GPU with 8GB+ VRAM for best performance
-- **CPU Fallback**: Works on any system but slower
-- **Model Size**: Start with "base" model, upgrade if quality is insufficient
-- **Batch Processing**: Process multiple files at once for efficiency
+```bash
+# Шорткаты Makefile
+make setup-dev     # Полная настройка dev-окружения
+make check-all     # Запуск всех проверок
+make format        # Авто-форматирование
+make clean         # Очистка сгенерированных файлов
+```
 
-## 📚 FAQ
+## Устранение неполадок
 
-**Q: What's the difference between Whisper, faster-whisper, and WhisperX?**
-A: WhisperX provides word-level timestamps, faster-whisper is optimized for speed, OpenAI Whisper is the original. The app automatically selects the best available option.
+### «No module named 'faster_whisper'»
 
-**Q: Can I use this without a GPU?**
-A: Yes, CPU processing is supported but significantly slower. GPU with CUDA is recommended for practical usage.
+Установите ML-зависимости: `pip install -e .[ml]`
 
-**Q: How accurate is speaker diarization?**
-A: Accuracy depends on audio quality and number of speakers. PyAnnote provides industry-standard diarization but may not be perfect for overlapping speech.
+### «CUDA out of memory»
 
-**Q: Can I edit the transcription after processing?**
-A: Basic viewing is available now. Full WYSIWYG editing with undo/redo is planned for Phase 2.
+Приложение автоматически переключается на CPU. Также можно попробовать меньшую модель Whisper (`base` или `small` вместо `large-v3`) или закрыть другие GPU-приложения.
 
-**Q: What audio/video formats are supported?**
-A: Any format supported by FFmpeg: MP3, MP4, WAV, AVI, MKV, MOV, etc. Audio is automatically converted to optimal format for processing.
+### CUDA не обнаружена (PyTorch без GPU)
 
-**Q: How much storage space do models require?**
-A: Whisper models range from ~100MB (tiny) to ~3GB (large). PyAnnote models are ~20MB. Total: 1-4GB depending on selected models.
+PyTorch установлен без CUDA-колёс. Переустановите с явным суффиксом CUDA:
 
-## Troubleshooting
-
-### CUDA Not Detected (PyTorch CPU-only version)
-
-**Symptom:** Error message: "CUDA is required for ML processing, but no compatible GPU is available."
-
-**Cause:** PyTorch was installed with CPU-only support instead of CUDA-enabled wheels. This happens when pip cannot find CUDA wheels or encounters network issues, falling back to CPU-only version from PyPI.
-
-**Solution:**
-
-**⚠️ Important:** Always specify explicit CUDA version suffix (e.g., `+cu128`) to prevent CPU fallback!
-
-1. **For CUDA 12.8** (recommended for RTX 30/40 series):
-   ```powershell
-   pip uninstall torch torchvision torchaudio -y
-   pip cache purge
-   pip install --no-cache-dir `
-     torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 `
-     --index-url https://download.pytorch.org/whl/cu128 `
-     --extra-index-url https://pypi.org/simple
-   ```
-
-2. **For CUDA 12.4**:
-   ```powershell
-   pip uninstall torch torchvision torchaudio -y
-   pip cache purge
-   pip install --no-cache-dir `
-     torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 `
-     --index-url https://download.pytorch.org/whl/cu124 `
-     --extra-index-url https://pypi.org/simple
-   ```
-
-3. **For CUDA 12.1**:
-   ```powershell
-   pip uninstall torch torchvision torchaudio -y
-   pip cache purge
-   pip install --no-cache-dir `
-     torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 `
-     --index-url https://download.pytorch.org/whl/cu121 `
-     --extra-index-url https://pypi.org/simple
-   ```
-
-4. **Using the build script** (automatic with fallback):
-   ```powershell
-   .\.venv\Scripts\Activate.ps1
-   .\build.ps1 -EnsureCUDA
-   ```
-
-**Verification:**
 ```powershell
-python -c "import torch; print(f'PyTorch: {torch.__version__}'); print(f'CUDA available: {torch.cuda.is_available()}'); print(f'CUDA version: {torch.version.cuda}'); print(f'GPU: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"N/A\"}')"
+pip uninstall torch torchvision torchaudio -y
+pip cache purge
+pip install --no-cache-dir `
+  torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 `
+  --index-url https://download.pytorch.org/whl/cu128 `
+  --extra-index-url https://pypi.org/simple
 ```
 
-Expected output:
-```
-PyTorch: 2.9.0+cu128
-CUDA available: True
-CUDA version: 12.8
-GPU: NVIDIA GeForce RTX XXXX
-```
+Или через билд-скрипт: `.\build.ps1 -EnsureCUDA`
 
-**For detailed troubleshooting** (network issues, manual downloads, etc.), see [doc/CUDA_SETUP.md](doc/CUDA_SETUP.md).
+Проверка:
 
-### Installation Requirements
-
-- **NVIDIA GPU:** GeForce GTX 960 or better (Maxwell architecture or newer)
-  - Example: **NVIDIA GeForce RTX 3070** ✅ (fully supported; RTX 30/40 series use CUDA 12.x wheels)
-- **NVIDIA Driver:** Latest version (visit https://www.nvidia.com/Download/driverDetails.aspx)
-- **CUDA Toolkit:** Optional (PyTorch includes CUDA runtime with wheels)
-- **cuDNN:** Included with PyTorch wheels
-
-To check your NVIDIA driver version:
 ```powershell
-nvidia-smi
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-If `nvidia-smi` is not found, install the latest NVIDIA driver from: https://www.nvidia.com/Download/driverDetails.aspx
+Подробности — [doc/CUDA_SETUP.md](doc/CUDA_SETUP.md).
+
+### GUI не запускается
+
+```bash
+python -m gui.main_window
+```
+
+Проверьте вывод консоли на наличие ошибок.
+
+### Советы по производительности
+
+- Используйте NVIDIA GPU с 8 ГБ+ VRAM для лучшей производительности.
+- Начните с модели Whisper `base` или `small`; переключайтесь на `large-v3`, если качество недостаточно.
+- Обрабатывайте несколько файлов пакетом.
+- Для Video QA локальный LM Studio-инстанс устраняет задержки облачного API.
+
+## Документация
+
+| Документ | Описание |
+| --- | --- |
+| [PYTHON_SETUP.md](PYTHON_SETUP.md) | Гайд по установке Python 3.11 |
+| [doc/CUDA_SETUP.md](doc/CUDA_SETUP.md) | Настройка CUDA и PyTorch для GPU |
+| [doc/EXTERNAL_CLI_TRANSCRIBER.md](doc/EXTERNAL_CLI_TRANSCRIBER.md) | Гайд по интеграции `external-transcribe` |
+| [doc/AutoSubtitles.md](doc/AutoSubtitles.md) | Дизайн пайплайна субтитров |
+| [doc/Multimodal GUI Design.md](doc/Multimodal%20GUI%20Design.md) | Архитектура мультимодального GUI |
+| [doc/OPENROUTER_INTEGRATION.md](doc/OPENROUTER_INTEGRATION.md) | Справка по интеграции с OpenRouter |
+| [doc/Disfluency-Cleanup-Design.md](doc/Disfluency-Cleanup-Design.md) | Дизайн очистки дисфлюенций |
+| [TODO.md](TODO.md) | Роадмап и текущий прогресс |
