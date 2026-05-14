@@ -103,7 +103,7 @@ Expected output:
 ```
 CUDA available: True
 CUDA version: 12.1
-GPU: NVIDIA GeForce RTX 3070
+GPU: NVIDIA GeForce RTX XXXX
 ```
 
 ## Troubleshooting
@@ -221,17 +221,19 @@ pip install torch torchvision torchaudio --index-url https://download.pytorch.or
 
 ## System Information
 
-- **Your GPU**: NVIDIA GeForce RTX 3070
-- **VRAM**: 8 GB
-- **Supported Models**: All Whisper models (tiny to large), PyAnnote, 7B LLM
+To check your system's GPU and VRAM:
+
+```powershell
+python -c "import torch; props = torch.cuda.get_device_properties(0); print(f'GPU: {props.name}'); print(f'VRAM: {props.total_memory / 1e9:.1f} GB')"
+```
 
 ## Advanced: System Requirements
 
-| Requirement | Minimum | Recommended | Your System |
+| Requirement | Minimum | Recommended | RTX 30/40 series |
 |---|---|---|---|
-| GPU | GTX 960 (Maxwell) | RTX 2070+ | RTX 3070 ✅ |
-| VRAM | 6 GB | 8-12 GB | 8 GB ✅ |
-| CUDA Version | 11.8 | 12.1-12.4 | 12.1+ ✅ |
+| GPU | GTX 960 (Maxwell) | RTX 2070+ | RTX 30/40 series |
+| VRAM | 6 GB | 8-12 GB | 8+ GB |
+| CUDA Version | 11.8 | 12.1-12.4 | 12.4+ |
 | Driver Version | 450+ | Latest | Check with nvidia-smi |
 
 ## References

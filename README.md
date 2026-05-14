@@ -8,11 +8,11 @@ AI-powered speech transcription and editing toolkit with comprehensive code qual
 
 ### Prerequisites
 
-**⚠️ Important:** This project requires **Python 3.11 or 3.12**. Python 3.13+ is not yet supported by ML libraries.
+**⚠️ Important:** This project targets **Python 3.11 only** (`requires-python` in `pyproject.toml`, local `build.ps1`, and ML/tooling checks). Python 3.12+ is not supported in this repository yet.
 
 #### System Requirements
 
-- **Python**: 3.11 or 3.12
+- **Python**: 3.11.x (required)
 - **RAM**: Minimum 8GB, recommended 16GB+
 - **GPU**: NVIDIA GPU with CUDA support (optional, CPU fallback available)
 - **VRAM**: Minimum 4GB, recommended 8GB+ for larger models
@@ -24,7 +24,7 @@ Check your Python version:
 python --version
 ```
 
-If you need to switch Python versions, see [PYTHON_SETUP.md](PYTHON_SETUP.md) for detailed instructions.
+If you need to install or select Python 3.11, see [PYTHON_SETUP.md](PYTHON_SETUP.md).
 
 #### Dependencies
 
@@ -410,7 +410,7 @@ Expected output:
 PyTorch: 2.9.0+cu128
 CUDA available: True
 CUDA version: 12.8
-GPU: NVIDIA GeForce RTX 3070
+GPU: NVIDIA GeForce RTX XXXX
 ```
 
 **For detailed troubleshooting** (network issues, manual downloads, etc.), see [doc/CUDA_SETUP.md](doc/CUDA_SETUP.md).
@@ -418,7 +418,7 @@ GPU: NVIDIA GeForce RTX 3070
 ### Installation Requirements
 
 - **NVIDIA GPU:** GeForce GTX 960 or better (Maxwell architecture or newer)
-  - Your System: **NVIDIA GeForce RTX 3070** ✅ (fully supported)
+  - Example: **NVIDIA GeForce RTX 3070** ✅ (fully supported; RTX 30/40 series use CUDA 12.x wheels)
 - **NVIDIA Driver:** Latest version (visit https://www.nvidia.com/Download/driverDetails.aspx)
 - **CUDA Toolkit:** Optional (PyTorch includes CUDA runtime with wheels)
 - **cuDNN:** Included with PyTorch wheels

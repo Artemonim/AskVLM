@@ -32,8 +32,8 @@ See `doc/CUDA_SETUP.md` for detailed troubleshooting and system requirements.
 
 ---
 
-**Status After Fix:**
-- ✅ PyTorch: 2.5.1+cu121 (CUDA-enabled)
-- ✅ GPU: NVIDIA GeForce RTX 3070
-- ✅ VRAM: 8 GB
+**Example Status After Fix:**
+- ✅ PyTorch: 2.9.0+cu128 (CUDA-enabled)
+- ✅ GPU: NVIDIA GeForce RTX XXXX (your GPU)
+- ✅ VRAM: 8 GB+
 - ✅ All checks passing
