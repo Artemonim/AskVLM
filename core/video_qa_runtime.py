@@ -227,6 +227,9 @@ class VideoQABudgetPolicy:
     source_bytes_per_token: int = 2048
     min_source_tokens: int = 256
     max_source_tokens: int = 4096
+    frame_budget_max: int = 0
+    # * 0 = disabled (backward-compatible default); >0 activates adaptive fallback
+    frame_sample_fps_fallback: float = 0.2
 
 
 def _estimate_source_tokens(size_bytes: int, policy: VideoQABudgetPolicy) -> int:

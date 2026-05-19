@@ -123,7 +123,8 @@ python cli.py external-transcribe INPUT_PATH [options]
 3. Parent считает этот JSON источником истины:
    - если JSON валиден и содержит `status=ok`, это успех даже при crash-like коде завершения child после записи результата;
    - если валидного успешного JSON нет и код завершения похож на native crash, parent делает ровно один retry на CPU;
-   - если валидного успешного JSON нет и ошибка не crash-like, parent отдаёт ошибку наружу без CPU retry.
+   - если валидного успешного JSON нет, ошибка не crash-like и stderr не содержит маркер внутренней IPC-ошибки — parent отдаёт ошибку наружу без CPU retry;
+   - если валидного успешного JSON нет и stderr содержит маркер внутренней IPC-ошибки (сбой инициализации child-процесса), parent выполняет один retry на CPU как защитная мера.
 
 ## JIT-загрузка и выгрузка
 
@@ -183,8 +184,84 @@ python cli.py external-transcribe "C:\media\draft.wav" --dialog-blocks
 
 Эти опции по умолчанию выключены: они увеличивают стоимость старта и могут подгружать дополнительные ML-бэкенды.
 
+## Извлечение кадров из видео (`external-extract-frames`)
+
+`python cli.py external-extract-frames ...` — внешний CLI «один вызов — один видеофайл» для приложений, которым нужно извлечь кадры с адаптивным FPS.
+
+### Контракт
+
+```text
+python cli.py external-extract-frames INPUT_PATH --output-dir PATH [options]
+```
+
+Входные аргументы:
+
+- `INPUT_PATH` — видеофайл.
+- `--output-dir PATH` — каталог для сохранения кадров (создаётся автоматически).
+
+Параметры выборки:
+
+- `--fps FLOAT` (по умолчанию `0.5`) — целевой FPS.
+- `--fps-fallback FLOAT` (по умолчанию `0.2`) — FPS при превышении бюджета.
+- `--frame-budget INT` (по умолчанию `20`) — максимальное число кадров. `0` отключает ограничение.
+
+Поведение адаптивного FPS:
+
+1. Оценивается `ceil(duration_s × fps)`.
+2. Если оценка ≤ `--frame-budget`, используется `--fps`.
+3. Если оценка > `--frame-budget`, используется `--fps-fallback`.
+
+Выход:
+
+- По умолчанию — пути к файлам кадров в `stdout`, один на строку.
+- С `--json` — JSON-объект `{"frames": [...], "fps_used": N, "duration_s": N}`.
+- Код завершения `0` при успехе (в том числе при нулевой длительности видео). Код `1` при ошибке.
+
+### Примеры
+
+```powershell
+# Извлечь кадры в /tmp/frames с адаптивным FPS
+python cli.py external-extract-frames "C:\media\clip.mp4" `
+  --output-dir "C:\media\frames"
+
+# Получить JSON-манифест
+python cli.py external-extract-frames "C:\media\clip.mp4" `
+  --output-dir "C:\media\frames" --json
+
+# Форсировать 1 FPS, без ограничения числа кадров
+python cli.py external-extract-frames "C:\media\clip.mp4" `
+  --output-dir "C:\media\frames" --fps 1.0 --frame-budget 0
+```
+
+### Рекомендуемый паттерн интеграции (Python)
+
+```python
+import json
+import subprocess
+
+result = subprocess.run(
+    [
+        "python", "cli.py", "external-extract-frames",
+        r"C:\media\clip.mp4",
+        "--output-dir", r"C:\media\frames",
+        "--json",
+    ],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+
+if result.returncode != 0:
+    raise RuntimeError(result.stderr or "AskVLM frame extraction error")
+
+manifest = json.loads(result.stdout)
+frame_paths = manifest["frames"]
+fps_used    = manifest["fps_used"]
+```
+
 ## Примечания
 
 - AskVLM хранит кэши моделей в каталоге `.cache/` проекта.
 - `external-transcribe` рассчитан на один файл на один запуск процесса.
+- `external-extract-frames` рассчитан на один видеофайл на один запуск процесса; кадры остаются в `--output-dir` после завершения.
 - Для пакетного экспорта в `txt`, `srt`, `vtt` или `json` используйте `python cli.py transcribe ...`.

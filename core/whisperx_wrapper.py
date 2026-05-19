@@ -197,6 +197,15 @@ class WhisperXWrapper:
             safe,
             self.device,
         )
+        # * Capture VRAM before unload for diagnostics
+        _vram_before_mb: float | None = None
+        if (
+            self.device == "cuda"
+            and torch_mod is not None
+            and getattr(torch_mod, "cuda", None) is not None
+        ):
+            with contextlib.suppress(Exception):
+                _vram_before_mb = torch_mod.cuda.memory_allocated() / (1024 * 1024)
         try:
             if getattr(self, "_model", None) is not None:
                 logger.info("WhisperXWrapper.unload: before deleting self._model")
@@ -227,6 +236,17 @@ class WhisperXWrapper:
             with contextlib.suppress(Exception):
                 _gc.collect()
             logger.info("WhisperXWrapper.unload: after gc.collect()")
+            # * Log VRAM delta to confirm model was released
+            if _vram_before_mb is not None and torch_mod is not None and getattr(torch_mod, "cuda", None) is not None:
+                with contextlib.suppress(Exception):
+                    _vram_after_mb = torch_mod.cuda.memory_allocated() / (1024 * 1024)
+                    _vram_freed_mb = _vram_before_mb - _vram_after_mb
+                    logger.info(
+                        "WhisperXWrapper.unload: vram_before_mb=%.1f vram_after_mb=%.1f freed_mb=%.1f",
+                        _vram_before_mb,
+                        _vram_after_mb,
+                        _vram_freed_mb,
+                    )
             if not safe:
                 with contextlib.suppress(Exception):
                     if (

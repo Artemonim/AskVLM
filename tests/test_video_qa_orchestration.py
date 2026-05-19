@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+
 from core.video_qa_context import normalize_video_qa_context
 from core.video_qa_manifest import (
     SCHEMA_VERSION,
@@ -403,6 +405,13 @@ def tiny_budget() -> VideoQABudgetPolicy:
         min_source_tokens=256,
         max_source_tokens=1024,
     )
+
+
+def test_video_qa_budget_policy_adaptive_fallback_fields_have_correct_defaults() -> None:
+    """New adaptive fields default to disabled (0) and 0.2 FPS fallback."""
+    policy = VideoQABudgetPolicy()
+    assert policy.frame_budget_max == 0  # disabled by default
+    assert policy.frame_sample_fps_fallback == pytest.approx(0.2)
 
 
 def test_subtitle_first_separation_invariants() -> None:

@@ -123,7 +123,8 @@ For `external-transcribe` on Windows with `--device != cpu`, AskVLM runs transcr
 3. The parent treats this JSON as the source of truth:
    - if the JSON is valid and contains `status=ok`, this is success even with a crash-like child exit code after the result was written;
    - if no valid successful JSON is found and the exit code looks like a native crash, the parent makes exactly one CPU retry;
-   - if no valid successful JSON is found and the error is not crash-like, the parent surfaces the error without a CPU retry.
+   - if no valid successful JSON is found, the error is not crash-like, and stderr does not contain an internal IPC error marker — the parent surfaces the error without a CPU retry;
+   - if no valid successful JSON is found and stderr contains an internal IPC error marker (child-process initialization failure), the parent makes exactly one CPU retry as a safety measure.
 
 ## JIT Loading and Unloading
 
@@ -183,8 +184,84 @@ python cli.py external-transcribe "C:\media\draft.wav" --dialog-blocks
 
 These options are disabled by default: they increase startup cost and may load additional ML backends.
 
+## Video Frame Extraction (`external-extract-frames`)
+
+`python cli.py external-extract-frames ...` — a stable external CLI entry point "one call — one video file" for applications that need to extract frames with adaptive FPS.
+
+### Contract
+
+```text
+python cli.py external-extract-frames INPUT_PATH --output-dir PATH [options]
+```
+
+Arguments:
+
+- `INPUT_PATH` — a single video file.
+- `--output-dir PATH` — directory where extracted frame images are written (created automatically).
+
+Sampling options:
+
+- `--fps FLOAT` (default `0.5`) — target sampling rate in frames per second.
+- `--fps-fallback FLOAT` (default `0.2`) — FPS used when frame budget would be exceeded.
+- `--frame-budget INT` (default `20`) — maximum number of frames to extract. `0` disables the cap.
+
+Adaptive FPS behavior:
+
+1. Estimates `ceil(duration_s × fps)`.
+2. If estimate ≤ `--frame-budget`, uses `--fps`.
+3. If estimate > `--frame-budget`, uses `--fps-fallback`.
+
+Output:
+
+- By default prints extracted frame file paths to `stdout`, one per line.
+- With `--json` prints a JSON object: `{"frames": [...], "fps_used": N, "duration_s": N}`.
+- Exit code `0` on success (including zero-duration video). Exit code `1` on failure.
+
+### Examples
+
+```powershell
+# Extract frames to C:\media\frames with adaptive FPS
+python cli.py external-extract-frames "C:\media\clip.mp4" `
+  --output-dir "C:\media\frames"
+
+# Get a JSON manifest
+python cli.py external-extract-frames "C:\media\clip.mp4" `
+  --output-dir "C:\media\frames" --json
+
+# Force 1 FPS, no frame cap
+python cli.py external-extract-frames "C:\media\clip.mp4" `
+  --output-dir "C:\media\frames" --fps 1.0 --frame-budget 0
+```
+
+### Recommended Integration Pattern (Python)
+
+```python
+import json
+import subprocess
+
+result = subprocess.run(
+    [
+        "python", "cli.py", "external-extract-frames",
+        r"C:\media\clip.mp4",
+        "--output-dir", r"C:\media\frames",
+        "--json",
+    ],
+    capture_output=True,
+    text=True,
+    check=False,
+)
+
+if result.returncode != 0:
+    raise RuntimeError(result.stderr or "AskVLM frame extraction error")
+
+manifest = json.loads(result.stdout)
+frame_paths = manifest["frames"]
+fps_used    = manifest["fps_used"]
+```
+
 ## Notes
 
 - AskVLM stores model caches in the project's `.cache/` directory.
 - `external-transcribe` is designed for one file per process invocation.
+- `external-extract-frames` is designed for one video file per process invocation; frames persist in `--output-dir` after the process exits.
 - For batch export to `txt`, `srt`, `vtt`, or `json`, use `python cli.py transcribe ...`.

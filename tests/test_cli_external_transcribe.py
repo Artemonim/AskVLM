@@ -196,7 +196,9 @@ def test_external_transcribe_isolated_attempt_prefers_result_file(
     def _fake_run(
         command: list[str], **_kwargs: object
     ) -> subprocess.CompletedProcess[str]:
-        result_path = Path(command[command.index("--_internal-result-file") + 1])
+        result_path = Path(
+            next(a for a in command if a.startswith("--_internal-result-file=")).split("=", 1)[1]
+        )
         result_path.write_text(
             '{"status":"ok","text":"from child"}',
             encoding="utf-8",
@@ -340,3 +342,51 @@ def test_external_transcribe_windows_non_crash_error_does_not_retry_cpu(
     assert result.stdout == ""
     assert "regular child failure" in (result.stderr or "")
     assert called_devices == ["auto"]
+
+
+def test_is_internal_child_ipc_error_detects_marker() -> None:
+    """_is_internal_child_ipc_error returns True only for the IPC marker text."""
+    _is_err = cli._is_internal_child_ipc_error  # noqa: SLF001
+    assert _is_err("...Internal child mode requires --_internal-result-file...")
+    assert not _is_err("some other error")
+    assert not _is_err("")
+    assert not _is_err(None)
+
+
+def test_external_transcribe_internal_ipc_error_retries_on_cpu(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """exit_code=1 with 'Internal child mode' stderr triggers CPU retry, not fatal error."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    call_count = 0
+
+    def _fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # ! First attempt: simulate IPC error (result file NOT written)
+            return subprocess.CompletedProcess(
+                args=command,
+                returncode=1,
+                stdout="",
+                stderr="Internal child mode requires --_internal-result-file.",
+            )
+        # * Second attempt (CPU retry): write result JSON and succeed
+        result_path = Path(
+            next(a for a in command if a.startswith("--_internal-result-file=")).split("=", 1)[1]
+        )
+        result_path.write_text('{"status":"ok","text":"cpu fallback text"}', encoding="utf-8")
+        return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(cli.subprocess, "run", _fake_run)
+
+    input_file = tmp_path / "audio.wav"
+    input_file.write_bytes(b"fake")
+
+    result = _RUNNER.invoke(
+        cli.app,
+        ["external-transcribe", str(input_file), "--device", "cuda"],
+    )
+    assert result.exit_code == 0
+    assert "cpu fallback text" in result.output
+    assert call_count == 2  # * first attempt + one CPU retry

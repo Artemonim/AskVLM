@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import importlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -175,8 +176,7 @@ def _build_external_child_command(  # noqa: PLR0913
         "--compute-type",
         compute_type,
         "--_internal-child-mode",
-        "--_internal-result-file",
-        str(child_result_file),
+        f"--_internal-result-file={child_result_file}",
     ]
     if language is not None:
         command.extend(["--language", language])
@@ -218,6 +218,7 @@ def _run_external_transcribe_isolated_attempt(  # noqa: PLR0913
             check=False,
             capture_output=True,
             text=True,
+            env={**os.environ, "_ASKVLM_CHILD_RESULT_FILE": str(child_result_file)},
         )
         return _ExternalChildAttemptResult(
             success_text=_read_child_success_result(child_result_file),
@@ -231,6 +232,21 @@ def _is_windows_crash_like_return_code(return_code: int) -> bool:
     if return_code < 0:
         return True
     return (return_code & 0xFFFFFFFF) >= 0xC0000000
+
+
+_INTERNAL_CHILD_IPC_ERROR = "Internal child mode requires"
+
+
+def _is_internal_child_ipc_error(stderr: str) -> bool:
+    """Return True when child stderr signals a missing IPC result-file path.
+
+    Args:
+        stderr: The captured stderr string from the child process, or None.
+
+    Returns:
+        True if the IPC setup error marker is present in stderr.
+    """
+    return _INTERNAL_CHILD_IPC_ERROR in (stderr or "")
 
 
 def _raise_external_transcribe_error(attempt: _ExternalChildAttemptResult) -> None:
@@ -471,6 +487,12 @@ def external_transcribe(  # noqa: PLR0913
         raise typer.BadParameter(
             "Either keep --stdout enabled or provide --output-file."
         )
+    # * Env-var fallback: recover IPC path if CLI arg was not parsed
+    if _internal_child_mode and _internal_result_file is None:
+        _env_path = os.environ.get("_ASKVLM_CHILD_RESULT_FILE")
+        if _env_path:
+            _internal_result_file = Path(_env_path)
+
     if _internal_child_mode:
         if _internal_result_file is None:
             raise typer.BadParameter(
@@ -525,7 +547,10 @@ def external_transcribe(  # noqa: PLR0913
             )
             return
 
-        if not _is_windows_crash_like_return_code(first_attempt.return_code):
+        if (
+            not _is_windows_crash_like_return_code(first_attempt.return_code)
+            and not _is_internal_child_ipc_error(first_attempt.stderr)
+        ):
             _raise_external_transcribe_error(first_attempt)
 
         retry_attempt = _run_external_transcribe_isolated_attempt(
@@ -564,6 +589,104 @@ def external_transcribe(  # noqa: PLR0913
     )
 
 
+@app.command("external-extract-frames")
+def external_extract_frames(  # noqa: PLR0913
+    input_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        readable=True,
+        file_okay=True,
+        dir_okay=False,
+        help="Video file to extract frames from.",
+    ),
+    output_dir: Path = typer.Option(
+        ...,
+        "--output-dir",
+        "-o",
+        help="Directory where extracted frame images are written.",
+    ),
+    fps: float = typer.Option(
+        0.5,
+        "--fps",
+        help="Target sampling rate in frames per second (default: 0.5).",
+        min=0.001,
+    ),
+    fps_fallback: float = typer.Option(
+        0.2,
+        "--fps-fallback",
+        help="Fallback FPS used when frame-budget would be exceeded (default: 0.2).",
+        min=0.001,
+    ),
+    frame_budget: int = typer.Option(
+        20,
+        "--frame-budget",
+        help=(
+            "Maximum number of frames to extract. "
+            "When the target FPS would produce more frames, fps-fallback is used instead. "
+            "0 disables the cap."
+        ),
+        min=0,
+    ),
+    as_json: bool = typer.Option(
+        False,
+        "--json/--no-json",
+        help="Output a JSON object instead of one path per line.",
+    ),
+) -> None:
+    """Extract video frames at adaptive FPS for external vision pipelines.
+
+    Writes frame images to OUTPUT_DIR. Prints extracted frame paths to stdout
+    (one per line), or a JSON manifest when --json is used.
+
+    Exit code 0 on success (even if the video has zero frames). Exit code 1 on
+    any processing failure.
+    """
+    import json as _json
+
+    from core.ffmpeg import extract_frames_for_span, get_media_duration_seconds
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    duration_s = get_media_duration_seconds(input_path)
+    if duration_s <= 0.0:
+        typer.secho(
+            f"Warning: could not determine duration of {input_path}; defaulting to 0 frames.",
+            err=True,
+        )
+        if as_json:
+            typer.echo(
+                _json.dumps({"frames": [], "fps_used": fps, "duration_s": 0.0})
+            )
+        return
+
+    # * Select FPS: use target unless frame budget would be exceeded
+    effective_fps = fps
+    if frame_budget > 0:
+        estimated = math.ceil(duration_s * fps)
+        if estimated > frame_budget:
+            effective_fps = fps_fallback
+
+    frame_paths = extract_frames_for_span(
+        video_file=input_path,
+        start_s=0.0,
+        end_s=duration_s,
+        output_pattern=output_dir / "frame-%06d.png",
+        fps=effective_fps,
+    )
+
+    if as_json:
+        typer.echo(
+            _json.dumps(
+                {
+                    "frames": [str(p) for p in frame_paths],
+                    "fps_used": effective_fps,
+                    "duration_s": duration_s,
+                }
+            )
+        )
+    else:
+        for p in frame_paths:
+            typer.echo(str(p))
 
 
 def main() -> None:
