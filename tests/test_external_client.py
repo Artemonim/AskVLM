@@ -1,0 +1,239 @@
+"""Unit tests for the transcription queue client orchestration."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from core import external_client as ec
+from core import external_queue as q
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+    import pytest
+
+
+def _request(tmp_path: Path, *, client_timeout_s: float = 5.0) -> ec.ClientRequest:
+    """Build a client request rooted at *tmp_path*.
+
+    Args:
+        tmp_path: Base directory for the input media file.
+        client_timeout_s: How long the client waits for a transcript.
+
+    Returns:
+        A populated :class:`~core.external_client.ClientRequest`.
+
+    """
+    media = tmp_path / "clip.wav"
+    media.write_text("stub", encoding="utf-8")
+    return ec.ClientRequest(
+        input_path=media,
+        language=None,
+        device="cpu",
+        compute_type="auto",
+        whisper_model="small",
+        client_timeout_s=client_timeout_s,
+        daemon_workers=1,
+    )
+
+
+def _write_results(
+    queue_dir: Path, status: q.ResultStatus, text: str, detail: str | None
+) -> None:
+    """Publish a result for every currently-incoming job.
+
+    Args:
+        queue_dir: The queue root directory.
+        status: Terminal status to publish.
+        text: Transcript text to publish.
+        detail: Optional error detail to publish.
+
+    """
+    for job_id in q.list_incoming_job_ids(queue_dir):
+        q.write_result(
+            queue_dir,
+            q.TranscribeResult(job_id, status, text, None, detail, 1.0),
+        )
+
+
+def test_run_client_transcribe_ok(tmp_path: Path) -> None:
+    """A published ``ok`` result returns the transcript text."""
+
+    def _spawn() -> None:
+        q.write_heartbeat(tmp_path, {"model": "small"})
+
+    def _sleeper(_seconds: float) -> None:
+        _write_results(tmp_path, "ok", "hello", None)
+
+    outcome = ec.run_client_transcribe(
+        _request(tmp_path),
+        queue_dir=tmp_path,
+        spawn=_spawn,
+        sleeper=_sleeper,
+        poll_interval_s=0.0,
+    )
+    assert outcome.status == "ok"
+    assert outcome.text == "hello"
+
+
+def test_run_client_transcribe_empty(tmp_path: Path) -> None:
+    """An ``empty`` result returns the empty status with no text."""
+
+    def _spawn() -> None:
+        q.write_heartbeat(tmp_path, {"model": "small"})
+
+    def _sleeper(_seconds: float) -> None:
+        _write_results(tmp_path, "empty", "", None)
+
+    outcome = ec.run_client_transcribe(
+        _request(tmp_path),
+        queue_dir=tmp_path,
+        spawn=_spawn,
+        sleeper=_sleeper,
+        poll_interval_s=0.0,
+    )
+    assert outcome.status == "empty"
+    assert outcome.text == ""
+
+
+def test_run_client_transcribe_error(tmp_path: Path) -> None:
+    """An ``error`` result surfaces as an error outcome with detail."""
+
+    def _spawn() -> None:
+        q.write_heartbeat(tmp_path, {"model": "small"})
+
+    def _sleeper(_seconds: float) -> None:
+        _write_results(tmp_path, "error", "", "bad input")
+
+    outcome = ec.run_client_transcribe(
+        _request(tmp_path),
+        queue_dir=tmp_path,
+        spawn=_spawn,
+        sleeper=_sleeper,
+        poll_interval_s=0.0,
+    )
+    assert outcome.status == "error"
+    assert outcome.detail == "bad input"
+
+
+def test_run_client_transcribe_timeout_signals_cancel(tmp_path: Path) -> None:
+    """Giving up writes a cancel marker and returns a timeout outcome."""
+
+    def _spawn() -> None:
+        q.write_heartbeat(tmp_path, {"model": "small"})
+
+    outcome = ec.run_client_transcribe(
+        _request(tmp_path, client_timeout_s=0.02),
+        queue_dir=tmp_path,
+        spawn=_spawn,
+        sleeper=lambda _seconds: None,
+        poll_interval_s=0.0,
+    )
+    assert outcome.status == "timeout"
+    assert any((tmp_path / "cancel").iterdir())
+
+
+def test_run_client_transcribe_unavailable(tmp_path: Path) -> None:
+    """When no daemon comes up, the client reports it as unavailable."""
+    clock_value = {"t": 0.0}
+
+    def _clock() -> float:
+        return clock_value["t"]
+
+    def _sleeper(_seconds: float) -> None:
+        clock_value["t"] += 5.0
+
+    outcome = ec.run_client_transcribe(
+        _request(tmp_path),
+        queue_dir=tmp_path,
+        spawn=lambda: None,
+        clock=_clock,
+        sleeper=_sleeper,
+    )
+    assert outcome.status == "unavailable"
+
+
+def test_ensure_daemon_running_already_alive(tmp_path: Path) -> None:
+    """A live daemon means no spawn is attempted."""
+    q.write_heartbeat(tmp_path, {"model": "small"})
+    spawned = {"n": 0}
+
+    def _spawn() -> None:
+        spawned["n"] += 1
+
+    assert ec.ensure_daemon_running(tmp_path, _request(tmp_path), spawn=_spawn)
+    assert spawned["n"] == 0
+
+
+def test_ensure_daemon_running_spawns_and_detects(tmp_path: Path) -> None:
+    """A spawned daemon that publishes a heartbeat is detected as alive."""
+    spawned = {"n": 0}
+
+    def _spawn() -> None:
+        spawned["n"] += 1
+        q.write_heartbeat(tmp_path, {"model": "small"})
+
+    assert ec.ensure_daemon_running(tmp_path, _request(tmp_path), spawn=_spawn)
+    assert spawned["n"] == 1
+
+
+def test_ensure_daemon_running_gives_up(tmp_path: Path) -> None:
+    """A daemon that never appears makes the helper give up."""
+    clock_value = {"t": 0.0}
+
+    def _clock() -> float:
+        return clock_value["t"]
+
+    def _sleeper(_seconds: float) -> None:
+        clock_value["t"] += 5.0
+
+    assert not ec.ensure_daemon_running(
+        tmp_path,
+        _request(tmp_path),
+        spawn=lambda: None,
+        clock=_clock,
+        sleeper=_sleeper,
+        start_timeout_s=20.0,
+    )
+
+
+def test_build_daemon_command_includes_options(tmp_path: Path) -> None:
+    """The daemon command carries model, device, and queue settings."""
+    request = ec.ClientRequest(
+        input_path=tmp_path / "a.wav",
+        language="ru",
+        device="cuda",
+        compute_type="auto",
+        whisper_model="small",
+        client_timeout_s=10.0,
+        daemon_workers=2,
+    )
+    command = ec._build_daemon_command(request, tmp_path)  # noqa: SLF001
+    assert "external-transcribe-daemon" in command
+    assert "--workers" in command
+    assert "2" in command
+    assert "--language" in command
+    assert "ru" in command
+
+
+def test_spawn_detached_daemon_invokes_popen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spawning launches a detached subprocess with the daemon command."""
+    captured: dict[str, object] = {}
+
+    class _FakePopen:
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(ec.subprocess, "Popen", _FakePopen)
+    ec._spawn_detached_daemon(_request(tmp_path), tmp_path)  # noqa: SLF001
+    command = captured["command"]
+    assert isinstance(command, list)
+    assert "external-transcribe-daemon" in command
+
+
+def test_heartbeat_stale_seconds_is_positive() -> None:
+    """The exported staleness window is a positive number of seconds."""
+    assert ec.heartbeat_stale_seconds() > 0

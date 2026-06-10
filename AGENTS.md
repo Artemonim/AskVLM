@@ -13,6 +13,7 @@
 ## Code Map
 - `gui/` — окно, маршрутизация режимов и worker orchestration.
 - `core/` — pipeline, FFmpeg, STT, diarization и settings.
+- - `external_queue.py` / `external_daemon.py` / `external_client.py` — single-orchestrator транскрипция: файловая очередь, резидентный демон-пул и тонкий клиент для `external-transcribe` (см. `doc/EXTERNAL_CLI_TRANSCRIBER.md`). По умолчанию `external-transcribe` идёт через демон; `--no-daemon` — legacy one-shot.
 - `editing/` — text model и editing tools.
 - `utils/` — exporters, logging и общие helpers.
 - `tests/` — автоматические проверки и E2E сценарии.

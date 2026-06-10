@@ -7,6 +7,7 @@ import pytest
 from typer.testing import CliRunner
 
 import cli
+from core.external_client import ClientOutcome
 
 _RUNNER = CliRunner()
 
@@ -58,7 +59,13 @@ def test_external_transcribe_uses_small_and_stdout_by_default(
 
     result = _RUNNER.invoke(
         cli.app,
-        ["external-transcribe", str(input_path), "--work-dir", str(work_dir)],
+        [
+            "external-transcribe",
+            str(input_path),
+            "--no-daemon",
+            "--work-dir",
+            str(work_dir),
+        ],
     )
 
     assert result.exit_code == 0
@@ -116,6 +123,7 @@ def test_external_transcribe_writes_output_file_without_stdout(
         [
             "external-transcribe",
             str(input_path),
+            "--no-daemon",
             "--work-dir",
             str(tmp_path / "work"),
             "--output-file",
@@ -170,6 +178,7 @@ def test_external_transcribe_accepts_empty_transcript_as_success(
         [
             "external-transcribe",
             str(input_path),
+            "--no-daemon",
             "--work-dir",
             str(tmp_path / "work"),
             "--output-file",
@@ -197,7 +206,9 @@ def test_external_transcribe_isolated_attempt_prefers_result_file(
         command: list[str], **_kwargs: object
     ) -> subprocess.CompletedProcess[str]:
         result_path = Path(
-            next(a for a in command if a.startswith("--_internal-result-file=")).split("=", 1)[1]
+            next(a for a in command if a.startswith("--_internal-result-file=")).split(
+                "=", 1
+            )[1]
         )
         result_path.write_text(
             '{"status":"ok","text":"from child"}',
@@ -255,6 +266,7 @@ def test_external_transcribe_windows_parent_uses_successful_child_result(
         [
             "external-transcribe",
             str(input_path),
+            "--no-daemon",
             "--output-file",
             str(output_file),
         ],
@@ -300,6 +312,7 @@ def test_external_transcribe_windows_crash_like_failures_retry_once_on_cpu(
         [
             "external-transcribe",
             str(input_path),
+            "--no-daemon",
         ],
     )
 
@@ -335,6 +348,7 @@ def test_external_transcribe_windows_non_crash_error_does_not_retry_cpu(
         [
             "external-transcribe",
             str(input_path),
+            "--no-daemon",
         ],
     )
 
@@ -360,7 +374,9 @@ def test_external_transcribe_internal_ipc_error_retries_on_cpu(
     monkeypatch.setattr(cli.sys, "platform", "win32")
     call_count = 0
 
-    def _fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+    def _fake_run(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
         nonlocal call_count
         call_count += 1
         if call_count == 1:
@@ -373,10 +389,16 @@ def test_external_transcribe_internal_ipc_error_retries_on_cpu(
             )
         # * Second attempt (CPU retry): write result JSON and succeed
         result_path = Path(
-            next(a for a in command if a.startswith("--_internal-result-file=")).split("=", 1)[1]
+            next(a for a in command if a.startswith("--_internal-result-file=")).split(
+                "=", 1
+            )[1]
         )
-        result_path.write_text('{"status":"ok","text":"cpu fallback text"}', encoding="utf-8")
-        return subprocess.CompletedProcess(args=command, returncode=0, stdout="", stderr="")
+        result_path.write_text(
+            '{"status":"ok","text":"cpu fallback text"}', encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(
+            args=command, returncode=0, stdout="", stderr=""
+        )
 
     monkeypatch.setattr(cli.subprocess, "run", _fake_run)
 
@@ -385,8 +407,78 @@ def test_external_transcribe_internal_ipc_error_retries_on_cpu(
 
     result = _RUNNER.invoke(
         cli.app,
-        ["external-transcribe", str(input_file), "--device", "cuda"],
+        ["external-transcribe", str(input_file), "--no-daemon", "--device", "cuda"],
     )
     assert result.exit_code == 0
     assert "cpu fallback text" in result.output
     assert call_count == 2  # * first attempt + one CPU retry
+
+
+def test_external_transcribe_daemon_mode_echoes_transcript(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default daemon mode prints the transcript returned by the client."""
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+
+    def _fake_client(_request: object) -> ClientOutcome:
+        return ClientOutcome("ok", "daemon text", None)
+
+    monkeypatch.setattr(cli, "run_client_transcribe", _fake_client)
+    result = _RUNNER.invoke(cli.app, ["external-transcribe", str(input_path)])
+    assert result.exit_code == 0
+    assert result.stdout == "daemon text\n"
+
+
+def test_external_transcribe_daemon_mode_timeout_uses_timeout_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client timeout maps to the dedicated timeout exit code and stderr marker."""
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+
+    def _fake_client(_request: object) -> ClientOutcome:
+        return ClientOutcome("timeout", "", "slow")
+
+    monkeypatch.setattr(cli, "run_client_transcribe", _fake_client)
+    result = _RUNNER.invoke(cli.app, ["external-transcribe", str(input_path)])
+    assert result.exit_code == cli.EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT
+    assert "ASKVLM_CLIENT_TIMEOUT" in (result.stderr or "")
+
+
+def test_external_transcribe_daemon_mode_unavailable_uses_unavailable_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unavailable daemon maps to the dedicated unavailable exit code."""
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+
+    def _fake_client(_request: object) -> ClientOutcome:
+        return ClientOutcome("unavailable", "", "down")
+
+    monkeypatch.setattr(cli, "run_client_transcribe", _fake_client)
+    result = _RUNNER.invoke(cli.app, ["external-transcribe", str(input_path)])
+    assert result.exit_code == cli.EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT
+    assert "ASKVLM_DAEMON_UNAVAILABLE" in (result.stderr or "")
+
+
+def test_external_transcribe_daemon_command_invokes_run_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The daemon subcommand forwards the worker count into the daemon config."""
+    captured: dict[str, object] = {}
+
+    def _fake_run_daemon(queue_dir: object, **kwargs: object) -> int:
+        captured["queue_dir"] = queue_dir
+        captured["config"] = kwargs.get("config")
+        return 0
+
+    monkeypatch.setattr(cli, "run_daemon", _fake_run_daemon)
+    result = _RUNNER.invoke(
+        cli.app,
+        ["external-transcribe-daemon", "--workers", "2", "--device", "cpu"],
+    )
+    assert result.exit_code == 0
+    config = captured["config"]
+    assert isinstance(config, cli.DaemonConfig)
+    assert config.max_workers == 2

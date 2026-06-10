@@ -5,14 +5,20 @@ import importlib
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType
 from typing import Any, Callable, Optional
 
 import typer
+
+from core.external_client import ClientRequest, run_client_transcribe
+from core.external_daemon import DaemonConfig, run_daemon
 
 app = typer.Typer(
     help=(
@@ -265,6 +271,73 @@ def _emit_external_transcribe_outputs(
         typer.echo(text)
 
 
+# * Distinct exit codes let a caller (for example the Telegram bot) react to a
+# * busy/unavailable transcription service without parsing free-form stderr.
+EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT = 10
+EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT = 11
+_CLIENT_TIMEOUT_MARKER = "ASKVLM_CLIENT_TIMEOUT"
+_DAEMON_UNAVAILABLE_MARKER = "ASKVLM_DAEMON_UNAVAILABLE"
+
+
+def _run_external_transcribe_via_daemon(  # noqa: PLR0913
+    *,
+    input_path: Path,
+    language: Optional[str],
+    device: str,
+    compute_type: str,
+    whisper_model: str,
+    client_timeout: float,
+    daemon_workers: int,
+    output_file: Optional[Path],
+    stdout: bool,
+) -> None:
+    """Transcribe through the shared daemon and map the outcome to CLI rules.
+
+    Args:
+        input_path: Media file to transcribe.
+        language: Optional language hint or ``None``.
+        device: Preferred device for a freshly spawned daemon.
+        compute_type: Preferred faster-whisper compute type.
+        whisper_model: Preferred Whisper model name.
+        client_timeout: Seconds to wait before giving up and signalling a drop.
+        daemon_workers: Worker count requested when spawning a new daemon.
+        output_file: Optional plain-text file to also write.
+        stdout: Whether to echo the transcript to stdout.
+
+    Raises:
+        typer.Exit: With code ``0`` on success, ``1`` on error,
+            :data:`EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT` on a client timeout, or
+            :data:`EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT` when no daemon is
+            reachable.
+    """
+    outcome = run_client_transcribe(
+        ClientRequest(
+            input_path=input_path,
+            language=language,
+            device=device,
+            compute_type=compute_type,
+            whisper_model=whisper_model,
+            client_timeout_s=client_timeout,
+            daemon_workers=daemon_workers,
+        )
+    )
+    if outcome.status in {"ok", "empty"}:
+        _emit_external_transcribe_outputs(
+            text=outcome.text, output_file=output_file, stdout=stdout
+        )
+        return
+    if outcome.status == "timeout":
+        typer.secho(f"{_CLIENT_TIMEOUT_MARKER}: {outcome.detail or ''}".strip(), err=True)
+        raise typer.Exit(code=EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT)
+    if outcome.status == "unavailable":
+        typer.secho(
+            f"{_DAEMON_UNAVAILABLE_MARKER}: {outcome.detail or ''}".strip(), err=True
+        )
+        raise typer.Exit(code=EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT)
+    typer.secho(outcome.detail or "transcription failed", err=True)
+    raise typer.Exit(code=1)
+
+
 @app.command()
 def transcribe(
     input_path: Path = typer.Argument(
@@ -471,6 +544,33 @@ def external_transcribe(  # noqa: PLR0913
             "a temporary directory and deletes it after completion."
         ),
     ),
+    no_daemon: bool = typer.Option(
+        False,
+        "--no-daemon/--daemon",
+        help=(
+            "Run the legacy in-process one-shot flow instead of routing the "
+            "request through the shared transcription daemon."
+        ),
+    ),
+    client_timeout: float = typer.Option(
+        300.0,
+        "--client-timeout",
+        min=1.0,
+        help=(
+            "Daemon mode: seconds to wait for a transcript before giving up and "
+            "signalling the daemon to drop the job."
+        ),
+    ),
+    daemon_workers: int = typer.Option(
+        1,
+        "--daemon-workers",
+        min=1,
+        max=8,
+        help=(
+            "Daemon mode: worker count requested when a new daemon is spawned. "
+            "Defaults to 1 to keep a single active model in memory."
+        ),
+    ),
     _internal_child_mode: bool = typer.Option(
         False,
         "--_internal-child-mode",
@@ -526,6 +626,20 @@ def external_transcribe(  # noqa: PLR0913
                         },
                     )
             raise
+
+    if not no_daemon:
+        _run_external_transcribe_via_daemon(
+            input_path=input_path,
+            language=language,
+            device=device,
+            compute_type=compute_type,
+            whisper_model=whisper_model,
+            client_timeout=client_timeout,
+            daemon_workers=daemon_workers,
+            output_file=output_file,
+            stdout=stdout,
+        )
+        return
 
     windows_non_cpu = sys.platform.startswith("win") and device.lower() != "cpu"
     if windows_non_cpu:
@@ -587,6 +701,71 @@ def external_transcribe(  # noqa: PLR0913
             stdout=stdout,
         ),
     )
+
+
+def _install_stop_handlers(stop_event: threading.Event) -> None:
+    """Wire available stop signals to request a graceful daemon shutdown.
+
+    Args:
+        stop_event: Flag set when a stop signal is received.
+    """
+
+    def _handle(_signum: int, _frame: FrameType | None) -> None:
+        stop_event.set()
+
+    for sig_name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, sig_name, None)
+        if sig is None:
+            continue
+        with contextlib.suppress(ValueError, OSError):
+            signal.signal(sig, _handle)
+
+
+@app.command("external-transcribe-daemon")
+def external_transcribe_daemon(
+    workers: int = typer.Option(
+        1, "--workers", min=1, max=8, help="Concurrent resident workers (default: 1)."
+    ),
+    whisper_model: str = typer.Option(
+        "small", "--whisper-model", help="Resident Whisper model (default: small)."
+    ),
+    device: str = typer.Option(
+        "auto", "--device", help="Device for the resident model: auto|cuda|cpu."
+    ),
+    compute_type: str = typer.Option(
+        "auto", "--compute-type", help="faster-whisper compute type (default: auto)."
+    ),
+    language: Optional[str] = typer.Option(
+        None, "--language", help="Optional fixed language hint for the resident model."
+    ),
+    queue_dir: Optional[Path] = typer.Option(
+        None, "--queue-dir", help="Queue root to serve (default: project cache)."
+    ),
+    idle_shutdown: float = typer.Option(
+        600.0,
+        "--idle-shutdown",
+        min=1.0,
+        help="Exit after this many idle seconds to release VRAM (default: 600).",
+    ),
+) -> None:
+    """Run the singleton transcription daemon that serves the shared queue.
+
+    Only one daemon serves a given queue; a second invocation exits immediately
+    when the queue is already owned. The daemon loads the model once and serves
+    every ``external-transcribe`` client through the file-based queue.
+    """
+    config = DaemonConfig(
+        max_workers=workers,
+        whisper_model=whisper_model,
+        device=device,
+        compute_type=compute_type,
+        language=language,
+        idle_shutdown_s=idle_shutdown,
+    )
+    stop_event = threading.Event()
+    _install_stop_handlers(stop_event)
+    code = run_daemon(queue_dir, config=config, stop_event=stop_event)
+    raise typer.Exit(code=code)
 
 
 @app.command("external-extract-frames")

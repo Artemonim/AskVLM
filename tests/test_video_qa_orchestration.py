@@ -407,7 +407,9 @@ def tiny_budget() -> VideoQABudgetPolicy:
     )
 
 
-def test_video_qa_budget_policy_adaptive_fallback_fields_have_correct_defaults() -> None:
+def test_video_qa_budget_policy_adaptive_fallback_fields_have_correct_defaults() -> (
+    None
+):
     """New adaptive fields default to disabled (0) and 0.2 FPS fallback."""
     policy = VideoQABudgetPolicy()
     assert policy.frame_budget_max == 0  # disabled by default

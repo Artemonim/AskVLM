@@ -464,12 +464,17 @@ def build_video_qa_preflight_summary(  # noqa: PLR0913
             max(
                 1,
                 int(policy.minimum_frames_per_chunk),
-                math.ceil(max(0.0, chunk.t_end - chunk.t_start) * policy.frame_sample_fps_fallback),
+                math.ceil(
+                    max(0.0, chunk.t_end - chunk.t_start)
+                    * policy.frame_sample_fps_fallback
+                ),
             )
             for chunk in chunk_plan
         )
         sampled_frame_count = sum(per_chunk_frame_counts)
-        max_frames_per_chunk = max(per_chunk_frame_counts) if per_chunk_frame_counts else 0
+        max_frames_per_chunk = (
+            max(per_chunk_frame_counts) if per_chunk_frame_counts else 0
+        )
 
     budget = build_video_qa_budget_estimate(
         context,

@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-import math
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from typer.testing import CliRunner
@@ -42,7 +41,9 @@ def _fake_extract(
     return tuple(frames)
 
 
-def test_external_extract_frames_uses_target_fps_when_under_budget(tmp_path: Path) -> None:
+def test_external_extract_frames_uses_target_fps_when_under_budget(
+    tmp_path: Path,
+) -> None:
     """Target FPS is used when estimated frames <= frame_budget."""
     out_dir = tmp_path / "frames"
     # Create a stub video file so typer's exists=True check passes
@@ -58,10 +59,14 @@ def test_external_extract_frames_uses_target_fps_when_under_budget(tmp_path: Pat
             [
                 "external-extract-frames",
                 str(video_file),
-                "--output-dir", str(out_dir),
-                "--fps", "0.5",
-                "--fps-fallback", "0.2",
-                "--frame-budget", "20",
+                "--output-dir",
+                str(out_dir),
+                "--fps",
+                "0.5",
+                "--fps-fallback",
+                "0.2",
+                "--frame-budget",
+                "20",
             ],
         )
     assert result.exit_code == 0, result.output
@@ -85,10 +90,14 @@ def test_external_extract_frames_falls_back_when_over_budget(tmp_path: Path) -> 
             [
                 "external-extract-frames",
                 str(video_file),
-                "--output-dir", str(out_dir),
-                "--fps", "0.5",
-                "--fps-fallback", "0.2",
-                "--frame-budget", "20",
+                "--output-dir",
+                str(out_dir),
+                "--fps",
+                "0.5",
+                "--fps-fallback",
+                "0.2",
+                "--frame-budget",
+                "20",
             ],
         )
     assert result.exit_code == 0, result.output
@@ -111,10 +120,14 @@ def test_external_extract_frames_json_output(tmp_path: Path) -> None:
             [
                 "external-extract-frames",
                 str(video_file),
-                "--output-dir", str(out_dir),
-                "--fps", "0.5",
-                "--fps-fallback", "0.2",
-                "--frame-budget", "20",
+                "--output-dir",
+                str(out_dir),
+                "--fps",
+                "0.5",
+                "--fps-fallback",
+                "0.2",
+                "--frame-budget",
+                "20",
                 "--json",
             ],
         )
@@ -137,10 +150,14 @@ def test_external_extract_frames_zero_duration_exits_clean(tmp_path: Path) -> No
             [
                 "external-extract-frames",
                 str(video_file),
-                "--output-dir", str(out_dir),
-                "--fps", "0.5",
-                "--fps-fallback", "0.2",
-                "--frame-budget", "20",
+                "--output-dir",
+                str(out_dir),
+                "--fps",
+                "0.5",
+                "--fps-fallback",
+                "0.2",
+                "--frame-budget",
+                "20",
                 "--json",
             ],
         )
