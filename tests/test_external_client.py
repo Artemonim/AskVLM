@@ -234,6 +234,46 @@ def test_spawn_detached_daemon_invokes_popen(
     assert "external-transcribe-daemon" in command
 
 
+def test_spawn_detached_daemon_uses_headless_windows_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows daemon spawn uses hidden-window flags instead of DETACHED_PROCESS."""
+    captured: dict[str, object] = {}
+    create_no_window = 0x08000000
+    create_new_process_group = 0x00000200
+    detached_process = 0x00000008
+
+    class _FakePopen:
+        def __init__(self, command: list[str], **kwargs: object) -> None:
+            captured["command"] = command
+            captured["kwargs"] = kwargs
+
+    monkeypatch.setattr(ec, "is_windows", lambda: True)
+    monkeypatch.setattr(
+        ec.subprocess, "CREATE_NO_WINDOW", create_no_window, raising=False
+    )
+    monkeypatch.setattr(
+        ec.subprocess,
+        "CREATE_NEW_PROCESS_GROUP",
+        create_new_process_group,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ec.subprocess, "DETACHED_PROCESS", detached_process, raising=False
+    )
+    monkeypatch.setattr(ec.subprocess, "Popen", _FakePopen)
+
+    ec._spawn_detached_daemon(_request(tmp_path), tmp_path)  # noqa: SLF001
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    creationflags = kwargs["creationflags"]
+    assert isinstance(creationflags, int)
+    assert creationflags & create_no_window
+    assert creationflags & create_new_process_group
+    assert not (creationflags & detached_process)
+
+
 def test_heartbeat_stale_seconds_is_positive() -> None:
     """The exported staleness window is a positive number of seconds."""
     assert ec.heartbeat_stale_seconds() > 0

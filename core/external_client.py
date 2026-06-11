@@ -123,12 +123,28 @@ def _build_daemon_command(request: ClientRequest, queue_dir: Path) -> list[str]:
     return command
 
 
+def _daemon_creationflags() -> int:
+    """Return subprocess creation flags for a background daemon launch.
+
+    Returns:
+        Windows-specific flags that keep the daemon headless and independent,
+        or ``0`` on other platforms.
+
+    """
+    if not is_windows():
+        return 0
+    flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return flags
+
+
 def _spawn_detached_daemon(request: ClientRequest, queue_dir: Path) -> None:
     """Launch the daemon as a detached, independent process.
 
     The daemon must outlive the spawning client (it is a shared singleton), so
-    it is started detached with no inherited console. On Windows this prevents
-    the daemon from dying when the client's console closes.
+    it is started as a background process with no visible console window. On
+    Windows ``CREATE_NO_WINDOW`` is used instead of ``DETACHED_PROCESS`` because
+    console Python interpreters can still surface a terminal window otherwise.
 
     Args:
         request: The client request whose model/device seed the daemon.
@@ -138,11 +154,6 @@ def _spawn_detached_daemon(request: ClientRequest, queue_dir: Path) -> None:
     command = _build_daemon_command(request, queue_dir)
     log_path = queue_dir / "control" / "daemon.out.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    creationflags = 0
-    if is_windows():
-        creationflags = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
     with log_path.open("ab") as log_handle:
         subprocess.Popen(  # noqa: S603 - fixed argv, no shell, trusted interpreter
             command,
@@ -150,7 +161,7 @@ def _spawn_detached_daemon(request: ClientRequest, queue_dir: Path) -> None:
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
             stderr=subprocess.STDOUT,
-            creationflags=creationflags,
+            creationflags=_daemon_creationflags(),
             close_fds=True,
         )
 
