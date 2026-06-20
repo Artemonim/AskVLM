@@ -11,7 +11,35 @@ The flow is designed for machine interaction:
 - Speaker diarization and LLM dialog formatting are disabled by default.
 - Whisper is loaded on demand and unloaded after the command finishes.
 - If CUDA is available but VRAM allocation for Whisper fails, AskVLM automatically retries Whisper on CPU.
-- On Windows with `--device` other than `cpu`, the command runs in an isolated child process to reduce the impact of upstream crash-on-exit bugs (`faster-whisper`/`ctranslate2`) on the calling process.
+- On Windows with `--device` other than `cpu`, the command runs in an isolated child process to reduce the impact of upstream crash-on-exit bugs (`faster-whisper`/`ctranslate2`) on the calling process (legacy `--no-daemon` mode only).
+
+## Daemon orchestrator and file queue (default mode)
+
+Starting with this version, `external-transcribe` defaults to acting as a **thin client** of a single daemon orchestrator rather than loading the model in its own process:
+
+1. The client checks whether the daemon is alive (via heartbeat). If not, it starts one **detached** `external-transcribe-daemon` process and waits for readiness.
+2. The client enqueues a job in the file queue (default `<project>/.cache/external_queue`), waits for the result up to `--client-timeout`, prints the transcript, and exits.
+3. If `--client-timeout` expires, the client **signals the daemon to drop** the job (cancel marker) so the daemon does not waste resources on an abandoned task and the queue does not accumulate stale entries.
+4. **Bounded CPU recovery.** If the request targeted GPU (`--device` ≠ `cpu`) and the daemon was degraded (client timeout expired or daemon unavailable), the client performs one built-in (in-process) CPU transcription pass before exiting. On success it prints the transcript and exits with code `0`; only if the CPU pass also fails does the command return a degraded exit code (`10` for timeout, `11` for unavailable daemon). This prevents a stuck/unavailable GPU daemon from silently losing the transcript. For explicit `--device cpu`, no extra pass is performed (nothing to recover from).
+
+Why this matters:
+
+- **The model loads once** in the resident daemon, not per file — no repeated weight reads from disk and no "cold load per message".
+- **One process per machine** serves all invocations (`external-transcribe-daemon` is a singleton via lock + heartbeat). Parallelism is capped by `--workers` (default `1`, per the "one active neural network" doctrine).
+- **No orphaned workers**: heavy work lives in the daemon; the client is short-lived, and its crash does not leave background GPU processes behind.
+- The daemon shuts down after idle time (`--idle-shutdown`, default 600 s), freeing VRAM, and wakes on the next job.
+
+Start the daemon manually (optional — the client starts it automatically):
+
+```powershell
+python cli.py external-transcribe-daemon --workers 1 --whisper-model small --device cuda
+```
+
+Legacy one-shot run without the daemon (old "model in this same process" behavior):
+
+```powershell
+python cli.py external-transcribe "C:\media\call.wav" --no-daemon
+```
 
 ## Installation
 
@@ -113,6 +141,8 @@ Behavior of `--device auto`:
 This way an overloaded GPU does not block local integration as long as there is enough RAM in the system.
 
 The fallback guarantee applies to the standard single-pass Whisper path. Options like diarization may require additional GPU capacity.
+
+In addition to OOM fallback inside the Whisper path, daemon mode adds an external bounded CPU fallback at the client level: on timeout or GPU daemon unavailability, one in-process CPU pass is performed (see step 4 above). This covers cases where the GPU daemon hung or crashed and can no longer unload or switch to CPU on its own.
 
 ## Reliability on Windows (subprocess isolation)
 
@@ -216,6 +246,12 @@ Output:
 - By default prints extracted frame file paths to `stdout`, one per line.
 - With `--json` prints a JSON object: `{"frames": [...], "fps_used": N, "duration_s": N}`.
 - Exit code `0` on success (including zero-duration video). Exit code `1` on failure.
+
+Colorspace resilience:
+
+- Some containers tag frames with a color matrix that libswscale cannot convert to RGB for the image encoder (ffmpeg fails with `Invalid color space`).
+- Frames are extracted as-is first; on such failure, extraction is retried with progressively stronger colorspace-normalizing `-vf` strategies (reset tag to BT.709, force swscale matrices, pixel format normalization).
+- Total frame loss (exit code `1`) occurs only if all strategies yield zero frames.
 
 ### Examples
 

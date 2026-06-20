@@ -234,6 +234,71 @@ def extract_frame_to_file(
     return out
 
 
+# * ffmpeg colorspace fallbacks for frame extraction. Some containers tag frames
+# * with a color matrix that libswscale cannot map to RGB for the image encoder,
+# * which fails with "Invalid color space" and wipes the extracted frames. The
+# * plain attempt is tried first; on failure each strategy forces a known-good
+# * colorspace / pixel format before the encoder's implicit RGB conversion.
+# * Strategies are attempted in order until one yields frames.
+_FRAME_EXTRACT_VF_FALLBACKS: tuple[str, ...] = (
+    "",
+    # Reset a bogus/unspecified frame colorspace tag to BT.709 before conversion.
+    "setparams=colorspace=bt709,format=yuv420p",
+    # Force the swscale matrices on both sides for SD-tagged content.
+    "scale=w=iw:h=ih:in_color_matrix=bt709:out_color_matrix=bt709",
+    # Last-resort pixel-format normalization.
+    "format=yuv420p",
+)
+
+
+def _frame_extract_filtergraph(fps: float, colorspace_fix: str) -> str:
+    """Build the ``-vf`` filtergraph for one extraction attempt.
+
+    Args:
+        fps: Sampling rate for the span.
+        colorspace_fix: Extra filter chain appended after ``fps``, or ``""``.
+
+    Returns:
+        The linear ffmpeg filtergraph string.
+
+    """
+    base = f"fps={max(0.001, float(fps))}"
+    return f"{base},{colorspace_fix}" if colorspace_fix else base
+
+
+def _clear_extracted_frames(out_dir: Path, prefix: str, suffix: str) -> None:
+    """Remove any frames matching the numbered output pattern in *out_dir*."""
+    for existing in sorted(out_dir.glob(f"{prefix}*{suffix}")):
+        try:
+            existing.unlink()
+        except OSError:
+            logger.debug("Could not remove stale extracted frame: %s", existing)
+
+
+def _ffmpeg_error_text(exc: ffmpeg.Error) -> str:
+    """Return a bounded, human-readable tail of an ffmpeg error's stderr."""
+    stderr = getattr(exc, "stderr", None)
+    if isinstance(stderr, bytes):
+        return stderr.decode("utf-8", errors="replace")[-500:]
+    return str(stderr or exc)[-500:]
+
+
+def _run_frame_extraction_once(
+    video_file: Path,
+    start_s: float,
+    duration_s: float,
+    output_pattern: Path,
+    filtergraph: str,
+) -> None:
+    """Invoke ffmpeg for a single frame-extraction attempt (raises on failure)."""
+    (
+        ffmpeg.input(str(video_file), ss=max(0.0, float(start_s)), t=duration_s)
+        .output(str(output_pattern), start_number=1, vf=filtergraph)
+        .overwrite_output()
+        .run(quiet=True)
+    )
+
+
 def extract_frames_for_span(
     video_file: str | Path,
     start_s: float,
@@ -244,6 +309,12 @@ def extract_frames_for_span(
 ) -> tuple[Path, ...]:
     """Extract multiple frames for a time span into numbered files.
 
+    Frames are sampled with ffmpeg. When a container tags frames with a color
+    matrix that libswscale cannot map to RGB (``Invalid color space``), the
+    extraction is retried with progressively stronger colorspace-normalizing
+    filter chains so a single problematic colorspace no longer wipes the whole
+    span.
+
     Args:
         video_file: Input video path.
         start_s: Inclusive span start in seconds.
@@ -253,6 +324,9 @@ def extract_frames_for_span(
 
     Returns:
         Absolute output paths sorted by filename.
+
+    Raises:
+        ffmpeg.Error: When every colorspace strategy fails to run ffmpeg.
 
     """
     v = Path(video_file).resolve()
@@ -266,22 +340,31 @@ def extract_frames_for_span(
 
     prefix = stem.split("%", 1)[0]
     suffix = out_pattern.suffix
-    for existing in sorted(out_dir.glob(f"{prefix}*{suffix}")):
-        try:
-            existing.unlink()
-        except OSError:
-            logger.debug("Could not remove stale extracted frame: %s", existing)
-
     duration_s = max(1e-6, float(end_s) - float(start_s))
-    (
-        ffmpeg.input(str(v), ss=max(0.0, float(start_s)), t=duration_s)
-        .filter("fps", fps=max(0.001, float(fps)))
-        .output(str(out_pattern), start_number=1)
-        .overwrite_output()
-        .run(quiet=True)
-    )
-    return tuple(
-        path.resolve()
-        for path in sorted(out_dir.glob(f"{prefix}*{suffix}"))
-        if path.is_file()
-    )
+
+    last_error: ffmpeg.Error | None = None
+    for colorspace_fix in _FRAME_EXTRACT_VF_FALLBACKS:
+        # * Clear before each attempt so a successful run's glob holds only its frames.
+        _clear_extracted_frames(out_dir, prefix, suffix)
+        filtergraph = _frame_extract_filtergraph(fps, colorspace_fix)
+        try:
+            _run_frame_extraction_once(v, start_s, duration_s, out_pattern, filtergraph)
+        except ffmpeg.Error as exc:
+            last_error = exc
+            logger.debug(
+                "ffmpeg frame extract failed; trying next colorspace strategy: "
+                "vf=%s stderr=%s",
+                filtergraph,
+                _ffmpeg_error_text(exc),
+            )
+            continue
+        # * A clean exit is authoritative even with zero frames (not a colorspace fault).
+        return tuple(
+            path.resolve()
+            for path in sorted(out_dir.glob(f"{prefix}*{suffix}"))
+            if path.is_file()
+        )
+
+    if last_error is not None:
+        raise last_error
+    return ()

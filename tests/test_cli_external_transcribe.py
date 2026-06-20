@@ -430,10 +430,14 @@ def test_external_transcribe_daemon_mode_echoes_transcript(
     assert result.stdout == "daemon text\n"
 
 
-def test_external_transcribe_daemon_mode_timeout_uses_timeout_exit_code(
+def test_external_transcribe_daemon_mode_timeout_cpu_device_uses_timeout_exit_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A client timeout maps to the dedicated timeout exit code and stderr marker."""
+    """A client timeout on an explicit CPU request maps to the timeout exit code.
+
+    With ``--device cpu`` there is no GPU to recover from, so no CPU fallback runs
+    and the dedicated timeout exit code / stderr marker is surfaced directly.
+    """
     input_path = tmp_path / "clip.wav"
     input_path.write_text("stub", encoding="utf-8")
 
@@ -441,15 +445,17 @@ def test_external_transcribe_daemon_mode_timeout_uses_timeout_exit_code(
         return ClientOutcome("timeout", "", "slow")
 
     monkeypatch.setattr(cli, "run_client_transcribe", _fake_client)
-    result = _RUNNER.invoke(cli.app, ["external-transcribe", str(input_path)])
+    result = _RUNNER.invoke(
+        cli.app, ["external-transcribe", str(input_path), "--device", "cpu"]
+    )
     assert result.exit_code == cli.EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT
     assert "ASKVLM_CLIENT_TIMEOUT" in (result.stderr or "")
 
 
-def test_external_transcribe_daemon_mode_unavailable_uses_unavailable_exit_code(
+def test_external_transcribe_daemon_mode_unavailable_cpu_device_uses_unavailable_exit(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An unavailable daemon maps to the dedicated unavailable exit code."""
+    """An unavailable daemon on an explicit CPU request maps to the exit code."""
     input_path = tmp_path / "clip.wav"
     input_path.write_text("stub", encoding="utf-8")
 
@@ -457,9 +463,70 @@ def test_external_transcribe_daemon_mode_unavailable_uses_unavailable_exit_code(
         return ClientOutcome("unavailable", "", "down")
 
     monkeypatch.setattr(cli, "run_client_transcribe", _fake_client)
-    result = _RUNNER.invoke(cli.app, ["external-transcribe", str(input_path)])
+    result = _RUNNER.invoke(
+        cli.app, ["external-transcribe", str(input_path), "--device", "cpu"]
+    )
     assert result.exit_code == cli.EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT
     assert "ASKVLM_DAEMON_UNAVAILABLE" in (result.stderr or "")
+
+
+@pytest.mark.parametrize("degraded_status", ["timeout", "unavailable"])
+def test_external_transcribe_daemon_degraded_recovers_via_cpu_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, degraded_status: str
+) -> None:
+    """A degraded GPU-seeded daemon recovers the transcript via one CPU pass."""
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+
+    def _fake_client(_request: object) -> ClientOutcome:
+        return ClientOutcome(degraded_status, "", "degraded")
+
+    fallback_devices: list[object] = []
+
+    class _StubPipeline:
+        def process(self, _input_media: Path, _process_work_dir: Path) -> _StubDocument:
+            return _StubDocument("cpu recovered text")
+
+        def close(self, *, aggressive: bool = False) -> None:  # noqa: ARG002
+            return None
+
+    def _fake_create_local_pipeline(**kwargs: object) -> _StubPipeline:
+        fallback_devices.append(kwargs.get("device"))
+        return _StubPipeline()
+
+    monkeypatch.setattr(cli, "run_client_transcribe", _fake_client)
+    monkeypatch.setattr(cli, "_create_local_pipeline", _fake_create_local_pipeline)
+
+    # * Default device is "auto" (GPU-preferred), so the CPU fallback is eligible.
+    result = _RUNNER.invoke(cli.app, ["external-transcribe", str(input_path)])
+
+    assert result.exit_code == 0, result.output
+    assert result.stdout == "cpu recovered text\n"
+    assert fallback_devices == ["cpu"]
+
+
+def test_external_transcribe_daemon_timeout_cpu_fallback_failure_surfaces_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the CPU fallback also fails, the timeout exit code is still surfaced."""
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+
+    def _fake_client(_request: object) -> ClientOutcome:
+        return ClientOutcome("timeout", "", "slow")
+
+    def _boom(**_kwargs: object) -> object:
+        msg = "faster-whisper unavailable"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr(cli, "run_client_transcribe", _fake_client)
+    monkeypatch.setattr(cli, "_create_local_pipeline", _boom)
+
+    result = _RUNNER.invoke(cli.app, ["external-transcribe", str(input_path)])
+
+    assert result.exit_code == cli.EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT
+    assert "ASKVLM_CPU_FALLBACK_FAILED" in (result.stderr or "")
+    assert "ASKVLM_CLIENT_TIMEOUT" in (result.stderr or "")
 
 
 def test_external_transcribe_daemon_command_invokes_run_daemon(

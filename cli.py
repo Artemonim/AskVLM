@@ -277,6 +277,44 @@ EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT = 10
 EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT = 11
 _CLIENT_TIMEOUT_MARKER = "ASKVLM_CLIENT_TIMEOUT"
 _DAEMON_UNAVAILABLE_MARKER = "ASKVLM_DAEMON_UNAVAILABLE"
+_CPU_FALLBACK_FAILED_MARKER = "ASKVLM_CPU_FALLBACK_FAILED"
+
+# * Daemon outcomes that mean the service was reachable-but-degraded (the resident
+# * GPU model could not deliver a transcript in time, or no daemon answered) rather
+# * than the media being unprocessable — eligible for a bounded CPU recovery pass.
+_DAEMON_DEGRADED_STATUSES = frozenset({"timeout", "unavailable"})
+
+
+def _device_prefers_gpu(device: str) -> bool:
+    """Return True when *device* would run on GPU, so a CPU fallback differs.
+
+    Args:
+        device: The requested ``--device`` token (``auto``/``cuda``/``cpu``/...).
+
+    Returns:
+        True for everything except an explicit CPU request.
+    """
+    return device.strip().lower() != "cpu"
+
+
+def _try_cpu_fallback_transcribe(cpu_fallback: Callable[[], str]) -> Optional[str]:
+    """Run the bounded CPU fallback, swallowing failures.
+
+    Args:
+        cpu_fallback: Callable performing one in-process CPU transcription.
+
+    Returns:
+        The recovered transcript text (possibly empty), or ``None`` when the
+        fallback itself failed so the caller can surface the degraded exit code.
+    """
+    try:
+        return cpu_fallback()
+    except Exception as exc:  # noqa: BLE001 - best-effort recovery; original status still surfaced
+        typer.secho(
+            f"{_CPU_FALLBACK_FAILED_MARKER}: {type(exc).__name__}: {exc}".strip(),
+            err=True,
+        )
+        return None
 
 
 def _run_external_transcribe_via_daemon(  # noqa: PLR0913
@@ -290,8 +328,15 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
     daemon_workers: int,
     output_file: Optional[Path],
     stdout: bool,
+    cpu_fallback: Optional[Callable[[], str]] = None,
 ) -> None:
     """Transcribe through the shared daemon and map the outcome to CLI rules.
+
+    When the daemon is reachable-but-degraded (client timeout or no daemon) on a
+    GPU-seeded request, a bounded in-process CPU fallback is attempted before the
+    degraded exit code is surfaced. This restores the documented CUDA→CPU
+    recovery for the default daemon path, so a stuck/unavailable GPU daemon no
+    longer silently loses the transcript.
 
     Args:
         input_path: Media file to transcribe.
@@ -303,6 +348,8 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
         daemon_workers: Worker count requested when spawning a new daemon.
         output_file: Optional plain-text file to also write.
         stdout: Whether to echo the transcript to stdout.
+        cpu_fallback: Optional callable performing one in-process CPU
+            transcription, used only on a degraded GPU-seeded outcome.
 
     Raises:
         typer.Exit: With code ``0`` on success, ``1`` on error,
@@ -326,6 +373,17 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
             text=outcome.text, output_file=output_file, stdout=stdout
         )
         return
+    if (
+        outcome.status in _DAEMON_DEGRADED_STATUSES
+        and cpu_fallback is not None
+        and _device_prefers_gpu(device)
+    ):
+        recovered = _try_cpu_fallback_transcribe(cpu_fallback)
+        if recovered is not None:
+            _emit_external_transcribe_outputs(
+                text=recovered, output_file=output_file, stdout=stdout
+            )
+            return
     if outcome.status == "timeout":
         typer.secho(f"{_CLIENT_TIMEOUT_MARKER}: {outcome.detail or ''}".strip(), err=True)
         raise typer.Exit(code=EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT)
@@ -638,6 +696,19 @@ def external_transcribe(  # noqa: PLR0913
             daemon_workers=daemon_workers,
             output_file=output_file,
             stdout=stdout,
+            # * Bounded recovery when the resident GPU daemon is stuck/unavailable:
+            # * one in-process CPU pass on the same file. CPU Whisper does not need
+            # * the Windows subprocess isolation that the GPU path relies on.
+            cpu_fallback=lambda: _run_external_transcribe_once(
+                input_path=input_path,
+                whisper_model=whisper_model,
+                language=language,
+                device="cpu",
+                compute_type=compute_type,
+                diarization=diarization,
+                dialog_blocks=dialog_blocks,
+                work_dir=work_dir,
+            ),
         )
         return
 

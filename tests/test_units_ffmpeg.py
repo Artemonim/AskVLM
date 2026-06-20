@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from core import ffmpeg as ffm
 
 
@@ -62,6 +64,77 @@ def test_extract_frames_for_span_returns_multiple_files(
     assert len(outputs) >= 3
     assert all(path.exists() for path in outputs)
     assert all(path.suffix == ".png" for path in outputs)
+
+
+def test_frame_extract_filtergraph_appends_colorspace_fix() -> None:
+    """The filtergraph builder chains the colorspace fix after the fps filter."""
+    build = ffm._frame_extract_filtergraph  # noqa: SLF001
+    assert build(0.5, "") == "fps=0.5"
+    assert build(0.5, "format=yuv420p") == "fps=0.5,format=yuv420p"
+
+
+def test_extract_frames_for_span_recovers_from_invalid_color_space(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A first 'Invalid color space' failure is recovered by the next strategy."""
+    out_pattern = tmp_path / "chunk-%03d.png"
+    used_filtergraphs: list[str] = []
+
+    def _fake_run(
+        _video_file: Path,
+        _start_s: float,
+        _duration_s: float,
+        output_pattern: Path,
+        filtergraph: str,
+    ) -> None:
+        used_filtergraphs.append(filtergraph)
+        if len(used_filtergraphs) == 1:
+            msg = "ffmpeg"
+            raise ffm.ffmpeg.Error(msg, b"", b"[swscaler] Invalid color space")
+        # * The colorspace-normalized retry succeeds and writes a frame.
+        out_dir = Path(output_pattern).parent
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "chunk-001.png").write_bytes(b"frame")
+
+    monkeypatch.setattr(ffm, "_run_frame_extraction_once", _fake_run)
+
+    frames = ffm.extract_frames_for_span(
+        tmp_path / "video.mp4", 0.0, 2.0, out_pattern, fps=2.0
+    )
+
+    assert [p.name for p in frames] == ["chunk-001.png"]
+    # * Plain attempt first, then at least one colorspace-fixing strategy.
+    assert len(used_filtergraphs) >= 2
+    assert used_filtergraphs[0] == "fps=2.0"
+    assert "colorspace" in used_filtergraphs[1]
+
+
+def test_extract_frames_for_span_raises_after_all_strategies_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When every colorspace strategy fails, the last ffmpeg error propagates."""
+    out_pattern = tmp_path / "chunk-%03d.png"
+    attempts: list[str] = []
+
+    def _always_fail(
+        _video_file: Path,
+        _start_s: float,
+        _duration_s: float,
+        _output_pattern: Path,
+        filtergraph: str,
+    ) -> None:
+        attempts.append(filtergraph)
+        msg = "ffmpeg"
+        raise ffm.ffmpeg.Error(msg, b"", b"Invalid color space")
+
+    monkeypatch.setattr(ffm, "_run_frame_extraction_once", _always_fail)
+
+    with pytest.raises(ffm.ffmpeg.Error):
+        ffm.extract_frames_for_span(
+            tmp_path / "video.mp4", 0.0, 2.0, out_pattern, fps=1.0
+        )
+
+    assert len(attempts) == len(ffm._FRAME_EXTRACT_VF_FALLBACKS)  # noqa: SLF001
 
 
 def test_get_media_duration_real(short_audio_fixture: Path) -> None:
