@@ -106,6 +106,88 @@ def test_external_extract_frames_falls_back_when_over_budget(tmp_path: Path) -> 
     assert abs(call_kwargs.kwargs["fps"] - 0.2) < 1e-6
 
 
+def test_external_extract_frames_budget_is_hard_cap(tmp_path: Path) -> None:
+    """When fallback FPS still exceeds the budget, FPS derives from budget/duration."""
+    out_dir = tmp_path / "frames"
+    video_file = tmp_path / "video.mp4"
+    video_file.write_bytes(b"stub")
+    # 200s * 0.5 FPS = 100 > 20; fallback 200s * 0.2 = 40 > 20 → fps = 20/200 = 0.1
+    with (
+        patch("core.ffmpeg.get_media_duration_seconds", return_value=200.0),
+        patch("core.ffmpeg.extract_frames_for_span", wraps=_fake_extract) as mock_ex,
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "external-extract-frames",
+                str(video_file),
+                "--output-dir",
+                str(out_dir),
+                "--fps",
+                "0.5",
+                "--fps-fallback",
+                "0.2",
+                "--frame-budget",
+                "20",
+                "--json",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    call_kwargs = mock_ex.call_args
+    assert abs(call_kwargs.kwargs["fps"] - 0.1) < 1e-6
+    data = json.loads(result.output.strip())
+    assert len(data["frames"]) <= 20
+    assert data["fps_used"] == pytest.approx(0.1)
+
+
+def test_external_extract_frames_truncates_ffmpeg_overshoot(tmp_path: Path) -> None:
+    """Frames beyond the budget produced by ffmpeg rounding are truncated."""
+    out_dir = tmp_path / "frames"
+    video_file = tmp_path / "video.mp4"
+    video_file.write_bytes(b"stub")
+
+    def _overshoot_extract(
+        video_file: object,
+        start_s: float,
+        end_s: float,
+        output_pattern: Path,
+        *,
+        fps: float = 2.0,
+    ) -> tuple[Path, ...]:
+        out = Path(output_pattern).parent
+        out.mkdir(parents=True, exist_ok=True)
+        frames = []
+        for idx in range(1, 6):  # always 5 frames regardless of fps
+            p = out / f"frame-{idx:06d}.png"
+            p.write_bytes(b"fake")
+            frames.append(p)
+        return tuple(frames)
+
+    with (
+        patch("core.ffmpeg.get_media_duration_seconds", return_value=8.0),
+        patch("core.ffmpeg.extract_frames_for_span", wraps=_overshoot_extract),
+    ):
+        result = runner.invoke(
+            app,
+            [
+                "external-extract-frames",
+                str(video_file),
+                "--output-dir",
+                str(out_dir),
+                "--fps",
+                "0.5",
+                "--fps-fallback",
+                "0.2",
+                "--frame-budget",
+                "4",
+                "--json",
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output.strip())
+    assert len(data["frames"]) == 4
+
+
 def test_external_extract_frames_json_output(tmp_path: Path) -> None:
     """--json flag produces parseable JSON with expected keys."""
     out_dir = tmp_path / "frames"

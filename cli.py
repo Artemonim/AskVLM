@@ -915,6 +915,11 @@ def external_extract_frames(  # noqa: PLR0913
         estimated = math.ceil(duration_s * fps)
         if estimated > frame_budget:
             effective_fps = fps_fallback
+        # * Hard cap: when even the fallback FPS overshoots the budget, derive the
+        # * rate from the budget itself so sampling stays uniform over the full
+        # * duration instead of over-producing frames for the caller to truncate.
+        if math.ceil(duration_s * effective_fps) > frame_budget:
+            effective_fps = frame_budget / duration_s
 
     frame_paths = extract_frames_for_span(
         video_file=input_path,
@@ -923,6 +928,9 @@ def external_extract_frames(  # noqa: PLR0913
         output_pattern=output_dir / "frame-%06d.png",
         fps=effective_fps,
     )
+    # * ffmpeg fps rounding may still emit one extra frame; enforce the cap exactly.
+    if frame_budget > 0 and len(frame_paths) > frame_budget:
+        frame_paths = frame_paths[:frame_budget]
 
     if as_json:
         typer.echo(

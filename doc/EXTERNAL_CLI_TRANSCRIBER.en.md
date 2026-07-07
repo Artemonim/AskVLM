@@ -233,13 +233,15 @@ Sampling options:
 
 - `--fps FLOAT` (default `0.5`) — target sampling rate in frames per second.
 - `--fps-fallback FLOAT` (default `0.2`) — FPS used when frame budget would be exceeded.
-- `--frame-budget INT` (default `20`) — maximum number of frames to extract. `0` disables the cap.
+- `--frame-budget INT` (default `20`) — hard cap on the number of extracted frames. `0` disables the cap.
 
 Adaptive FPS behavior:
 
 1. Estimates `ceil(duration_s × fps)`.
 2. If estimate ≤ `--frame-budget`, uses `--fps`.
 3. If estimate > `--frame-budget`, uses `--fps-fallback`.
+4. If the fallback estimate still exceeds `--frame-budget`, uses `frame_budget / duration_s` so the budgeted number of frames samples the full duration uniformly.
+5. Any extra frame produced by ffmpeg rounding is truncated: the output never exceeds `--frame-budget`.
 
 Output:
 
