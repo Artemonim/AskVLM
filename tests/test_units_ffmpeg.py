@@ -76,9 +76,10 @@ def test_frame_extract_filtergraph_appends_colorspace_fix() -> None:
 def test_extract_frames_for_span_recovers_from_invalid_color_space(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A first 'Invalid color space' failure is recovered by the next strategy."""
+    """The input-override strategy recovers after every conservative retry fails."""
     out_pattern = tmp_path / "chunk-%03d.png"
     used_filtergraphs: list[str] = []
+    recovery_filter = "fps=2.0,colorspace=iall=bt709:all=bt709:format=yuv420p:fast=1"
 
     def _fake_run(
         _video_file: Path,
@@ -88,10 +89,10 @@ def test_extract_frames_for_span_recovers_from_invalid_color_space(
         filtergraph: str,
     ) -> None:
         used_filtergraphs.append(filtergraph)
-        if len(used_filtergraphs) == 1:
+        if filtergraph != recovery_filter:
             msg = "ffmpeg"
             raise ffm.ffmpeg.Error(msg, b"", b"[swscaler] Invalid color space")
-        # * The colorspace-normalized retry succeeds and writes a frame.
+        # * The final input-metadata override succeeds and writes a frame.
         out_dir = Path(output_pattern).parent
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / "chunk-001.png").write_bytes(b"frame")
@@ -103,10 +104,13 @@ def test_extract_frames_for_span_recovers_from_invalid_color_space(
     )
 
     assert [p.name for p in frames] == ["chunk-001.png"]
-    # * Plain attempt first, then at least one colorspace-fixing strategy.
-    assert len(used_filtergraphs) >= 2
-    assert used_filtergraphs[0] == "fps=2.0"
-    assert "colorspace" in used_filtergraphs[1]
+    assert used_filtergraphs == [
+        "fps=2.0",
+        "fps=2.0,setparams=colorspace=bt709,format=yuv420p",
+        "fps=2.0,scale=w=iw:h=ih:in_color_matrix=bt709:out_color_matrix=bt709",
+        "fps=2.0,format=yuv420p",
+        recovery_filter,
+    ]
 
 
 def test_extract_frames_for_span_raises_after_all_strategies_fail(
@@ -125,16 +129,20 @@ def test_extract_frames_for_span_raises_after_all_strategies_fail(
     ) -> None:
         attempts.append(filtergraph)
         msg = "ffmpeg"
-        raise ffm.ffmpeg.Error(msg, b"", b"Invalid color space")
+        error_text = f"Invalid color space on attempt {len(attempts)}".encode()
+        raise ffm.ffmpeg.Error(msg, b"", error_text)
 
     monkeypatch.setattr(ffm, "_run_frame_extraction_once", _always_fail)
 
-    with pytest.raises(ffm.ffmpeg.Error):
+    with pytest.raises(ffm.ffmpeg.Error) as exc_info:
         ffm.extract_frames_for_span(
             tmp_path / "video.mp4", 0.0, 2.0, out_pattern, fps=1.0
         )
 
     assert len(attempts) == len(ffm._FRAME_EXTRACT_VF_FALLBACKS)  # noqa: SLF001
+    assert exc_info.value.stderr == (
+        f"Invalid color space on attempt {len(attempts)}".encode()
+    )
 
 
 def test_get_media_duration_real(short_audio_fixture: Path) -> None:

@@ -242,12 +242,14 @@ def extract_frame_to_file(
 # * Strategies are attempted in order until one yields frames.
 _FRAME_EXTRACT_VF_FALLBACKS: tuple[str, ...] = (
     "",
-    # Reset a bogus/unspecified frame colorspace tag to BT.709 before conversion.
+    # * Reset a bogus/unspecified frame colorspace tag to BT.709 before conversion.
     "setparams=colorspace=bt709,format=yuv420p",
-    # Force the swscale matrices on both sides for SD-tagged content.
+    # * Force the swscale matrices on both sides for SD-tagged content.
     "scale=w=iw:h=ih:in_color_matrix=bt709:out_color_matrix=bt709",
-    # Last-resort pixel-format normalization.
+    # * Normalize the pixel format while preserving otherwise valid color metadata.
     "format=yuv420p",
+    # * Override every invalid input color property only after conservative fixes fail.
+    "colorspace=iall=bt709:all=bt709:format=yuv420p:fast=1",
 )
 
 
