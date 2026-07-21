@@ -606,7 +606,7 @@ def external_transcribe(  # noqa: PLR0913
         "--stt-provider",
         help=(
             "Speech-to-text provider: whisper (default) or gigaam-ctc "
-            "(CPU-only optional extra)."
+            "(CPU-only; included in .[ml])."
         ),
     ),
     language: Optional[str] = typer.Option(

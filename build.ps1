@@ -15,6 +15,10 @@ param(
     [switch]$FastLaunch,
     [switch]$Fast,
     [switch]$RecreateVenv,
+    # * ML + CUDA torch 2.10 are ensured by default on every build.ps1/run.ps1 entry.
+    [switch]$SkipEnsureML,
+    [switch]$SkipEnsureCUDA,
+    # * Deprecated aliases kept so old docs/scripts keep working (default is already on).
     [switch]$EnsureML,
     [switch]$EnsureCUDA
 )
@@ -34,8 +38,11 @@ function Show-Help {
     Write-Host "  -SkipLaunch       Run checks/tests only; do not launch the app"
     Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
     Write-Host "  -Fast             Skip slow and heavy ML tests (pytest)"
+    Write-Host "  -SkipEnsureML     Skip auto-install of .[ml] (default: ensure ML deps)"
+    Write-Host "  -SkipEnsureCUDA   Skip torch 2.10 CUDA repair (default: ensure CUDA stack)"
     Write-Host "  -Help             Show this help"
     Write-Host ""
+    Write-Host "By default this script installs missing .[ml] deps and repairs torch to 2.10+CUDA (cu128/cu126)." -ForegroundColor Yellow
     Write-Host "Coverage gates: FAIL <65%, WARN <75% (applied post-pytest)" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Examples:"
@@ -104,6 +111,11 @@ function Test-CUDA {
     python -c "import sys; import torch; ok = bool(getattr(torch,'cuda',None) and torch.cuda.is_available()); print('[CUDA CHECK] available=' + str(ok)); sys.exit(0 if ok else 1)" | Out-Null
     return $LASTEXITCODE -eq 0
 }
+# Helper: AskVLM ML stack needs torch 2.10.* with a working CUDA build
+function Test-TorchMlStack {
+    python -c "import sys; import torch; ver=str(getattr(torch,'__version__','')); cuda_ok=bool(getattr(torch,'cuda',None) and torch.cuda.is_available()); ok=cuda_ok and ver.startswith('2.10.'); print('[TORCH ML CHECK] version=' + ver + ' cuda=' + str(cuda_ok) + ' ok=' + str(ok)); sys.exit(0 if ok else 1)" | Out-Null
+    return $LASTEXITCODE -eq 0
+}
 
 try {
     python -c "import importlib.util,sys;mods=['ruff','mypy','pytest','pytest_cov','pip_audit','tqdm','huggingface_hub'];sys.exit(0 if all(importlib.util.find_spec(m) for m in mods) else 1)" | Out-Null
@@ -112,14 +124,22 @@ try {
         if (Test-Path "requirements-dev.txt") { python -m pip install -r requirements-dev.txt | Out-Null }
         if (Test-Path "requirements.txt") { python -m pip install -r requirements.txt | Out-Null }
         # Ensure tools present
-        try { python -m pip install -q pip-audit pytest-cov tqdm "huggingface_hub<0.20.0" | Out-Null } catch {}
+        # * transformers 5 (via [ml] / GigaAM) needs huggingface_hub 1.x — do not pin <0.20.
+        try { python -m pip install -q pip-audit pytest-cov tqdm huggingface_hub | Out-Null } catch {}
     }
 } catch {}
 
-# Ensure ML deps exist (only when requested)
-if ($EnsureML) {
+# * ML + CUDA are on by default; -EnsureML/-EnsureCUDA remain accepted no-ops.
+$doEnsureML = -not $SkipEnsureML
+$doEnsureCUDA = -not $SkipEnsureCUDA
+if ($EnsureML) { $doEnsureML = $true }
+if ($EnsureCUDA) { $doEnsureCUDA = $true }
+
+# Ensure ML deps exist (default on)
+if ($doEnsureML) {
     try {
-        $needMl = (-not (Test-Module numpy)) -or (-not (Test-Module torch)) -or (-not (Test-Module whisper)) -or (-not (Test-Module faster_whisper)) -or (-not (Test-Module whisperx)) -or (-not (Test-Module pyannote.audio))
+        # * whisperx PyPI package is optional (alignment); WhisperXWrapper uses faster-whisper.
+        $needMl = (-not (Test-Module numpy)) -or (-not (Test-Module torch)) -or (-not (Test-Module whisper)) -or (-not (Test-Module faster_whisper)) -or (-not (Test-Module pyannote.audio)) -or (-not (Test-Module transformers)) -or (-not (Test-Module sentencepiece)) -or (-not (Test-Module hydra)) -or (-not (Test-Module omegaconf))
         if ($needMl) {
             Write-Host "Installing ML dependencies (extras: ml)..." -ForegroundColor Yellow
             try { python -m pip install -q -U pip wheel setuptools } catch {}
@@ -133,13 +153,14 @@ if ($EnsureML) {
     } catch {}
 }
 
-# Ensure CUDA-enabled torch
-if ($EnsureCUDA -and -not (Test-CUDA)) {
-    Write-Host "Attempting to install CUDA-enabled PyTorch wheels..." -ForegroundColor Yellow
+# Ensure CUDA-enabled torch 2.10 (Whisper GPU + GigaAM-compatible stack) — default on
+# * Reinstall when CUDA is missing OR the installed torch is not 2.10.* (e.g. CPU
+# * wheel pulled by bare pip / outdated 2.5.x+cu124 from older EnsureCUDA).
+if ($doEnsureCUDA -and -not (Test-TorchMlStack)) {
+    Write-Host "Attempting to install CUDA-enabled PyTorch 2.10 wheels..." -ForegroundColor Yellow
     $cudaConfigs = @(
-        @{index="https://download.pytorch.org/whl/cu124"; torch="2.5.1+cu124"; vision="0.20.1+cu124"; audio="2.5.1+cu124"},
-        @{index="https://download.pytorch.org/whl/cu121"; torch="2.5.1+cu121"; vision="0.20.1+cu121"; audio="2.5.1+cu121"},
-        @{index="https://download.pytorch.org/whl/cu118"; torch="2.5.1+cu118"; vision="0.20.1+cu118"; audio="2.5.1+cu118"}
+        @{index="https://download.pytorch.org/whl/cu128"; torch="2.10.0+cu128"; vision="0.25.0+cu128"; audio="2.10.0+cu128"},
+        @{index="https://download.pytorch.org/whl/cu126"; torch="2.10.0+cu126"; vision="0.25.0+cu126"; audio="2.10.0+cu126"}
     )
     try { python -m pip uninstall -y torch torchvision torchaudio | Out-Null } catch {}
     try { python -m pip cache purge | Out-Null } catch {}
@@ -155,14 +176,14 @@ if ($EnsureCUDA -and -not (Test-CUDA)) {
         } catch {
             Write-Host ("  Failed to install from {0}: {1}" -f $cudaTag, $_.Exception.Message) -ForegroundColor Red
         }
-        if (Test-CUDA) {
-            Write-Host ("✓ Successfully installed PyTorch with {0}" -f $cudaTag) -ForegroundColor Green
+        if (Test-TorchMlStack) {
+            Write-Host ("✓ Successfully installed PyTorch 2.10 with {0}" -f $cudaTag) -ForegroundColor Green
             break
         }
         try { python -m pip uninstall -y torch torchvision torchaudio | Out-Null } catch {}
     }
-    if (-not (Test-CUDA)) {
-        Write-Error "CUDA is not available via PyTorch after installation attempts."
+    if (-not (Test-TorchMlStack)) {
+        Write-Error "CUDA torch 2.10 is not available via PyTorch after installation attempts (tried cu128, cu126)."
     }
 }
 

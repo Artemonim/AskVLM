@@ -38,10 +38,10 @@ _SHORTFORM_LIMIT_S = 25.0
 _CHUNK_S = 20.0
 
 _MISSING_EXTRA_MSG = (
-    "GigaAM Multilingual CTC requires the optional AskVLM extra "
-    '`pip install -e ".[gigaam]"` '
-    "(torch/torchaudio 2.10, transformers 5, hydra-core, omegaconf, "
-    "sentencepiece, pyannote.audio)."
+    "GigaAM Multilingual CTC requires the AskVLM ML extra "
+    '`pip install -e ".[ml]"` '
+    "(torch/torchaudio 2.10 via run.ps1/build.ps1 CUDA ensure, transformers 5, "
+    "hydra-core, omegaconf, sentencepiece, pyannote.audio)."
 )
 
 
@@ -53,7 +53,7 @@ def _raise_missing_extra(exc: BaseException) -> NoReturn:
             ``ModuleNotFoundError`` from torch/transformers or remote code).
 
     Raises:
-        RuntimeError: Always, with ``pip install -e ".[gigaam]"`` guidance and
+        RuntimeError: Always, with ``pip install -e ".[ml]"`` guidance and
             the missing module name when available.
 
     """

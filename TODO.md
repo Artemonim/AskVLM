@@ -12,7 +12,7 @@
 | Text mode | ✅ ready | Stable base workflow. |
 | Subtitle mode | ✅ ready | Stable preview/export/burn-in workflow. |
 | Whisper/WhisperX | ✅ ready for subtitle-first base, ✅ Video QA local run wired | Subtitle pipeline unchanged; Video QA uses ASR via `WhisperXWrapper` + `prepare_audio` without diarization/dialog formatting by default in the local run path. VRAM hand-off Whisper → LM phase not enforced yet (see §6). |
-| GigaAM CTC (optional) | ✅ ready for `external-transcribe` | CPU-only `--stt-provider gigaam-ctc` (`ai-sage/GigaAM-Multilingual` revision `ctc`); optional extra `.[gigaam]`; not used for CUDA / Whisper CUDA fallbacks / Windows GPU child isolation; daemon provider mismatch → unavailable. |
+| GigaAM CTC | ✅ ready for `external-transcribe` | CPU-only `--stt-provider gigaam-ctc` (`ai-sage/GigaAM-Multilingual` revision `ctc`); deps in `.[ml]`; `run.ps1`/`build.ps1` default-ensure torch 2.10 CUDA; not used for CUDA / Whisper CUDA fallbacks / Windows GPU child isolation; daemon provider mismatch → unavailable. |
 | Chunking | ✅ ready at planning level | Chunk planning exists in backend orchestration. |
 | Representative frames | ✅ ready for local GUI run | `core/video_qa_local_run.VideoQAFFmpegFrameMaterializer` uses `extract_frame_to_file`. |
 | LM Studio / VLM | 🟡 partial | GUI launch path runs chunk inferencer + LM Studio client; overflow vs live server behaviour still needs verification. |

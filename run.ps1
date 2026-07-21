@@ -8,7 +8,9 @@ param(
     [switch]$NoFix,
     [switch]$SkipLaunch,
     [switch]$FastLaunch,
-    [switch]$Fast
+    [switch]$Fast,
+    [switch]$SkipEnsureML,
+    [switch]$SkipEnsureCUDA
 )
 
 function Show-Help {
@@ -26,8 +28,11 @@ function Show-Help {
     Write-Host "  -SkipLaunch       Run checks/tests only; do not launch the app"
     Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
     Write-Host "  -Fast             Skip slow and heavy ML tests (pytest)"
+    Write-Host "  -SkipEnsureML     Skip auto-install of .[ml] (default: ensure)"
+    Write-Host "  -SkipEnsureCUDA   Skip torch 2.10 CUDA repair (default: ensure)"
     Write-Host "  -Help             Show this help"
     Write-Host ""
+    Write-Host "Forwards to build.ps1, which by default ensures .[ml] and torch 2.10+CUDA." -ForegroundColor Yellow
     Write-Host "Coverage gates: FAIL <65%, WARN <75% (applied post-pytest)" -ForegroundColor Yellow
     Write-Host ""
     Write-Host "Examples:"
@@ -62,6 +67,8 @@ if ($NoFix) { $buildParams['NoFix'] = $true }
 if ($SkipLaunch) { $buildParams['SkipLaunch'] = $true }
 if ($FastLaunch) { $buildParams['FastLaunch'] = $true }
 if ($Fast) { $buildParams['Fast'] = $true }
+if ($SkipEnsureML) { $buildParams['SkipEnsureML'] = $true }
+if ($SkipEnsureCUDA) { $buildParams['SkipEnsureCUDA'] = $true }
 
 # Handle remaining arguments (forwarded via --)
 $dashdashIndex = $args.IndexOf("--")

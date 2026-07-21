@@ -124,7 +124,7 @@ def test_gigaam_chunking_for_long_audio(
 
 
 def test_gigaam_missing_extra_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Missing optional deps surface an install hint for ``.[gigaam]``."""
+    """Missing ML deps surface an install hint for ``.[ml]``."""
 
     def _ensure_raises(_self: GigaAMCtcWrapper) -> tuple[Any, Any]:
         try:
@@ -135,7 +135,7 @@ def test_gigaam_missing_extra_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(GigaAMCtcWrapper, "_ensure_deps", _ensure_raises)
     wrapper = GigaAMCtcWrapper(device="cpu")
-    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[gigaam\]\"") as ei:
+    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[ml\]\"") as ei:
         wrapper._load_model()  # noqa: SLF001
     assert "Missing module: torch" in str(ei.value)
     assert ei.value.__cause__ is not None
@@ -157,7 +157,7 @@ def test_gigaam_from_pretrained_import_error_without_module_name(
         GigaAMCtcWrapper, "_ensure_deps", lambda _self: (_FakeAutoModel, object())
     )
     wrapper = GigaAMCtcWrapper(device="cpu")
-    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[gigaam\]\"") as ei:
+    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[ml\]\"") as ei:
         wrapper._load_model()  # noqa: SLF001
     assert "Missing module:" not in str(ei.value)
     assert isinstance(ei.value.__cause__, ImportError)
@@ -166,7 +166,7 @@ def test_gigaam_from_pretrained_import_error_without_module_name(
 def test_gigaam_from_pretrained_remote_code_import_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Remote-code ImportError on load maps to the same ``.[gigaam]`` install hint."""
+    """Remote-code ImportError on load maps to the same ``.[ml]`` install hint."""
 
     class _FakeAutoModel:
         @staticmethod
@@ -178,7 +178,7 @@ def test_gigaam_from_pretrained_remote_code_import_error(
         GigaAMCtcWrapper, "_ensure_deps", lambda _self: (_FakeAutoModel, object())
     )
     wrapper = GigaAMCtcWrapper(device="cpu")
-    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[gigaam\]\"") as ei:
+    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[ml\]\"") as ei:
         wrapper._load_model()  # noqa: SLF001
     msg = str(ei.value)
     assert "Missing module: sentencepiece" in msg
@@ -211,7 +211,7 @@ def test_gigaam_transcribe_remote_code_import_error(
         GigaAMCtcWrapper, "_ensure_deps", lambda _self: (_FakeAutoModel, object())
     )
     wrapper = GigaAMCtcWrapper(device="cpu")
-    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[gigaam\]\"") as ei:
+    with pytest.raises(RuntimeError, match=r"pip install -e \"\.\[ml\]\"") as ei:
         wrapper.transcribe(audio)
     assert "Missing module: pyannote" in str(ei.value)
     assert isinstance(ei.value.__cause__, ModuleNotFoundError)

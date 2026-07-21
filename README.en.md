@@ -34,11 +34,10 @@ cd AskVLM
 # Core dependencies
 pip install -e .
 
-# ML dependencies (transcription, diarization, LLM formatting)
+# ML dependencies (transcription, diarization, LLM, GigaAM CTC)
 pip install -e .[ml]
-
-# Optional: GigaAM Multilingual CTC (CPU-only STT for external-transcribe)
-pip install -e .[gigaam]
+# GPU: run.ps1 / build.ps1 repair torch to 2.10+CUDA by default (cu128/cu126)
+.\run.ps1 -SkipLaunch -Fast
 
 # Development tools (linting, testing)
 pip install -e .[dev]
@@ -112,7 +111,7 @@ python cli.py external-transcribe PATH_TO_MEDIA
 Prints plain transcript text to stdout. Designed as a machine-friendly endpoint for external applications.
 
 - Default provider: `--stt-provider whisper` (model `small`).
-- Optional: `--stt-provider gigaam-ctc` (CPU-only; extra `pip install -e .[gigaam]`; ~2.5 GB RAM, no VRAM).
+- Optional: `--stt-provider gigaam-ctc` (CPU-only; included in `.[ml]`; ~2.5 GB RAM, no VRAM).
 - JIT model loading: Whisper/GigaAM loads at transcription start and unloads before exit (`--no-daemon`; resident in daemon mode).
 - CUDA safety (Whisper): on Windows, if the GPU child process crashes (OOM), AskVLM retries on CPU automatically in an isolated subprocess. GigaAM does not use CUDA, Whisper CUDA fallbacks, or Windows GPU isolation.
 - A live daemon with a different `--stt-provider` → unavailable/mismatch (singleton is not silently replaced; restart the daemon).
@@ -247,12 +246,12 @@ PyTorch was installed without CUDA wheels. Reinstall with an explicit CUDA suffi
 pip uninstall torch torchvision torchaudio -y
 pip cache purge
 pip install --no-cache-dir `
-  torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 `
+  torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128 `
   --index-url https://download.pytorch.org/whl/cu128 `
   --extra-index-url https://pypi.org/simple
 ```
 
-Or use the build script: `.\build.ps1 -EnsureCUDA`
+Or use the build script (CUDA is repaired by default): `.\run.ps1 -SkipLaunch -Fast`
 
 Verify:
 

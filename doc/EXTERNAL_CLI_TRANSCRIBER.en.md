@@ -37,7 +37,7 @@ Start the daemon manually (optional — the client starts it automatically):
 python cli.py external-transcribe-daemon --workers 1 --whisper-model small --device cuda
 ```
 
-GigaAM CTC (CPU, optional extra):
+GigaAM CTC (CPU; deps already in `.[ml]`):
 
 ```powershell
 python cli.py external-transcribe-daemon --stt-provider gigaam-ctc --device cpu
@@ -54,31 +54,26 @@ python cli.py external-transcribe "C:\media\call.wav" --no-daemon
 
 ## Installation
 
-First install the project and ML dependencies:
+First install the project and ML dependencies (Whisper + GigaAM CTC share one extra):
 
 ```powershell
 pip install -e .
 pip install -e .[ml]
+# * run.ps1/build.ps1 repair CUDA torch 2.10 by default (bare pip often leaves a CPU wheel)
+.\run.ps1 -SkipLaunch -Fast
 ```
 
-Optional GigaAM Multilingual CTC provider (separate dependency tree; Whisper-only installs do not get it):
+The `[ml]` stack includes torch/torchaudio **2.10** (CUDA wheels repaired by `run.ps1`/`build.ps1` by default: cu128 → cu126), transformers 5, hydra-core, omegaconf, **sentencepiece**, and **pyannote.audio**. The last two are required by remote-code modeling even for short-form `.transcribe` (no longform/VAD). On CPU, GigaAM uses roughly ~2.5 GB RAM (vs compact Whisper Small CPU) but no VRAM, with speed comparable to Whisper Small on GPU.
 
-```powershell
-pip install -e .[gigaam]
-```
+Model load uses Hugging Face Transformers with `trust_remote_code=True` **only** for repo `ai-sage/GigaAM-Multilingual` at revision `ctc` (the card's official remote-code API). That trust is scoped to this model/revision, not to arbitrary HF repos. If remote code raises `ImportError`/`ModuleNotFoundError` because `[ml]` is incomplete, the wrapper surfaces `pip install -e ".[ml]"` and keeps the missing module name.
 
-The `gigaam` extra requires torch/torchaudio 2.10, transformers 5, hydra-core, omegaconf, **sentencepiece**, and **pyannote.audio**. The last two are pulled in by remote-code modeling even for short-form `.transcribe` (no longform/VAD). On CPU, GigaAM uses roughly ~2.5 GB RAM (vs compact Whisper Small CPU) but no VRAM, with speed comparable to Whisper Small on GPU.
-
-Model load uses Hugging Face Transformers with `trust_remote_code=True` **only** for repo `ai-sage/GigaAM-Multilingual` at revision `ctc` (the card's official remote-code API). That trust is scoped to this model/revision, not to arbitrary HF repos. If remote code raises `ImportError`/`ModuleNotFoundError` because the extra is incomplete, the wrapper surfaces the same `pip install -e ".[gigaam]"` guidance and keeps the missing module name.
-
-Installing both `[ml]` (Whisper/`faster-whisper`, typically a broader `torch` range) and `[gigaam]` (pinned torch/torchaudio 2.10) in one environment can force a single torch resolution and may conflict or pull an unexpected CUDA/CPU wheel. Prefer a dedicated GigaAM venv for production integrations, or verify with `pip` / `pip check` after a combined install.
+Do not install `torch` from PyPI on top of a CUDA build without a follow-up `run.ps1`/`build.ps1`: bare `pip install -e .[ml]` often leaves CPU `torch 2.10.0`. Opt out with `-SkipEnsureCUDA`. See `doc/CUDA_SETUP.md`.
 
 If using a virtual environment on Windows:
 
 ```powershell
 . .\.venv\Scripts\Activate.ps1
 ```
-
 ## Basic Usage
 
 Return transcript text to `stdout`:

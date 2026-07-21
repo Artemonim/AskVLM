@@ -10,6 +10,10 @@ CUDA is required for ML processing, but no compatible GPU is available.
 
 This happens when PyTorch is installed with CPU-only support instead of CUDA-enabled wheels.
 
+AskVLM's `[ml]` extra (Whisper + GigaAM CTC) targets **torch/torchaudio 2.10**. A bare `pip install -e ".[ml]"` often resolves `torch` from PyPI as **CPU** `2.10.0`.
+
+**Default fix:** `run.ps1` / `build.ps1` ensure the CUDA 2.10 stack on every run (opt out with `-SkipEnsureCUDA`). You do not need a separate `-EnsureCUDA` flag anymore.
+
 ## Root Cause
 
 PyTorch provides different binary distributions:
@@ -22,87 +26,76 @@ By default, `pip install torch` often installs the CPU-only version, especially 
 
 ### Quick Fix (Automatic)
 
-Use the build script with the `-EnsureCUDA` flag:
+`run.ps1` / `build.ps1` already ensure CUDA torch 2.10 by default:
 
 ```powershell
 .\.venv\Scripts\Activate.ps1
-.\build.ps1 -EnsureCUDA
+.\run.ps1 -SkipLaunch -Fast
 ```
 
+Or only repair the torch stack (same default path inside `build.ps1`):
+
+```powershell
+.\build.ps1 -SkipLaunch -Fast
+```
+
+Opt out when you intentionally want to skip repair: `-SkipEnsureCUDA` / `-SkipEnsureML`.
+
 This will:
-1. Detect if CUDA is available
-2. Try to install CUDA-enabled PyTorch wheels from multiple repositories (cu124, cu121, cu118)
+1. Check that torch is **2.10.*** **and** CUDA is available
+2. Install CUDA-enabled PyTorch 2.10 wheels (cu128 → cu126) when the stack is wrong
 3. Verify installation
 4. Display success/failure status
 
+Legacy `-EnsureCUDA` / `-EnsureML` switches are still accepted but redundant (the behavior is already on).
+
 ### Manual Installation
 
-Choose the CUDA version matching your system. To find your CUDA version:
+Choose the CUDA version matching your driver. To inspect the driver:
 
 ```powershell
 nvidia-smi
 ```
 
-Look for "CUDA Capability Major/Minor version" or "CUDA Version" in the output.
+Look for "CUDA Version" in the output (driver capability; PyTorch ships its own runtime).
 
-#### Option 1: CUDA 12.8 (Latest, Recommended for RTX 30/40 series)
+#### Option 1: CUDA 12.8 (Recommended)
 
 ```powershell
 pip uninstall torch torchvision torchaudio -y
 pip cache purge
 pip install --no-cache-dir `
-  torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 `
+  torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128 `
   --index-url https://download.pytorch.org/whl/cu128 `
   --extra-index-url https://pypi.org/simple
 ```
 
-#### Option 2: CUDA 12.4
+#### Option 2: CUDA 12.6
 
 ```powershell
 pip uninstall torch torchvision torchaudio -y
 pip cache purge
 pip install --no-cache-dir `
-  torch==2.6.0+cu124 torchvision==0.21.0+cu124 torchaudio==2.6.0+cu124 `
-  --index-url https://download.pytorch.org/whl/cu124 `
+  torch==2.10.0+cu126 torchvision==0.25.0+cu126 torchaudio==2.10.0+cu126 `
+  --index-url https://download.pytorch.org/whl/cu126 `
   --extra-index-url https://pypi.org/simple
 ```
 
-#### Option 3: CUDA 12.1
-
-```powershell
-pip uninstall torch torchvision torchaudio -y
-pip cache purge
-pip install --no-cache-dir `
-  torch==2.5.1+cu121 torchvision==0.20.1+cu121 torchaudio==2.5.1+cu121 `
-  --index-url https://download.pytorch.org/whl/cu121 `
-  --extra-index-url https://pypi.org/simple
-```
-
-#### Option 4: CUDA 11.8 (Older Systems)
-
-```powershell
-pip uninstall torch torchvision torchaudio -y
-pip cache purge
-pip install --no-cache-dir `
-  torch==2.5.1+cu118 torchvision==0.20.1+cu118 torchaudio==2.5.1+cu118 `
-  --index-url https://download.pytorch.org/whl/cu118 `
-  --extra-index-url https://pypi.org/simple
-```
-
-**Note:** CUDA 12.4+ wheels are backward compatible with CUDA 12.8 drivers. If you have CUDA 12.8 installed, using cu124 wheels will work fine, but cu128 provides the best compatibility.
+**Note:** CUDA 12.6/12.8 wheels work with recent NVIDIA drivers that report CUDA 12.x. PyTorch 2.10 no longer publishes cu124/cu121 wheels in the same line — do not mix an old `2.5.1+cu124` stack with AskVLM `[ml]` (GigaAM needs 2.10).
 
 ## Verification
 
 After installation, verify CUDA is properly configured:
 
 ```powershell
-python -c "import torch; print('CUDA available:', torch.cuda.is_available()); print('CUDA version:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
+python -c "import torch; print('torch:', torch.__version__); print('CUDA available:', torch.cuda.is_available()); print('CUDA version:', torch.version.cuda); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'N/A')"
 ```
 
-Expected output:
+Expected output (example):
 ```
+torch: 2.10.0+cu128
 CUDA available: True
-CUDA version: 12.1
+CUDA version: 12.8
 GPU: NVIDIA GeForce RTX XXXX
 ```
 
@@ -112,12 +105,12 @@ GPU: NVIDIA GeForce RTX XXXX
 
 **Symptom:**
 ```powershell
-pip install torch --index-url https://download.pytorch.org/whl/cu124
+pip install torch --index-url https://download.pytorch.org/whl/cu128
 ```
-Results in `torch.__version__` showing `2.9.0+cpu` instead of `2.9.0+cu124`.
+Results in `torch.__version__` showing `2.10.0` / `2.10.0+cpu` instead of `2.10.0+cu128`.
 
 **Root Cause:**
-When pip cannot find the exact CUDA wheel or encounters network issues (DNS resolution failures, SSL errors), it falls back to the CPU-only version from the default PyPI index.
+When pip cannot find the exact CUDA wheel or encounters network issues (DNS resolution failures, SSL errors), it falls back to the CPU-only version from the default PyPI index. The same happens after `pip install -e ".[ml]"` without `-EnsureCUDA`.
 
 **Solution:**
 Explicitly specify the CUDA version suffix in the package name:
@@ -129,7 +122,7 @@ pip cache purge
 
 # * Install with explicit CUDA version suffix
 pip install --no-cache-dir `
-  torch==2.9.0+cu128 torchvision==0.24.0+cu128 torchaudio==2.9.0+cu128 `
+  torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128 `
   --index-url https://download.pytorch.org/whl/cu128 `
   --extra-index-url https://pypi.org/simple
 ```
@@ -141,7 +134,7 @@ pip install --no-cache-dir `
 - `--extra-index-url` allows dependencies to be downloaded from PyPI
 
 **Automated Fix:**
-The `build.ps1 -EnsureCUDA` script now automatically uses this method with fallback to multiple CUDA versions (cu128 → cu124 → cu121 → cu118).
+The `build.ps1 -EnsureCUDA` script uses this method with fallback cu128 → cu126, and reinstalls when CUDA is missing **or** torch is not `2.10.*`.
 
 ### Network Issues with PyTorch Downloads
 
@@ -170,12 +163,12 @@ The `build.ps1 -EnsureCUDA` script now automatically uses this method with fallb
    # https://download.pytorch.org/whl/cu128/torchaudio/
    
    # Look for cp311-cp311-win_amd64.whl files with +cu128 suffix
-   # Example: torch-2.9.0+cu128-cp311-cp311-win_amd64.whl
+   # Example: torch-2.10.0+cu128-cp311-cp311-win_amd64.whl
    
    # Save to wheels/ directory, then install:
-   pip install --no-deps .\wheels\torch-2.9.0+cu128-cp311-cp311-win_amd64.whl
-   pip install --no-deps .\wheels\torchvision-0.24.0+cu128-cp311-cp311-win_amd64.whl
-   pip install --no-deps .\wheels\torchaudio-2.9.0+cu128-cp311-cp311-win_amd64.whl
+   pip install --no-deps .\wheels\torch-2.10.0+cu128-cp311-cp311-win_amd64.whl
+   pip install --no-deps .\wheels\torchvision-0.25.0+cu128-cp311-cp311-win_amd64.whl
+   pip install --no-deps .\wheels\torchaudio-2.10.0+cu128-cp311-cp311-win_amd64.whl
    ```
 
 3. **Verify installation** after any method:
@@ -205,6 +198,7 @@ The application requires:
 - Whisper model: 1-4 GB depending on model size
 - Diarization: 2-3 GB
 - LLM formatter: 2-3 GB for 7B model
+- GigaAM CTC: ~2.5 GB **RAM** (CPU path; no VRAM)
 
 If VRAM is insufficient, use smaller models or reduce batch sizes.
 
@@ -216,7 +210,10 @@ If you have multiple CUDA versions or toolkits installed, PyTorch might use the 
 ```powershell
 pip uninstall torch torchvision torchaudio
 pip cache purge
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121 --no-cache-dir
+pip install --no-cache-dir `
+  torch==2.10.0+cu128 torchvision==0.25.0+cu128 torchaudio==2.10.0+cu128 `
+  --index-url https://download.pytorch.org/whl/cu128 `
+  --extra-index-url https://pypi.org/simple
 ```
 
 ## System Information
@@ -233,8 +230,9 @@ python -c "import torch; props = torch.cuda.get_device_properties(0); print(f'GP
 |---|---|---|---|
 | GPU | GTX 960 (Maxwell) | RTX 2070+ | RTX 30/40 series |
 | VRAM | 6 GB | 8-12 GB | 8+ GB |
-| CUDA Version | 11.8 | 12.1-12.4 | 12.4+ |
-| Driver Version | 450+ | Latest | Check with nvidia-smi |
+| CUDA (driver) | 12.x | 12.6+ | 12.8+ |
+| PyTorch | 2.10.+cu126 | 2.10.+cu128 | 2.10.+cu128 |
+| Driver Version | Recent enough for cu126/cu128 | Latest | Check with nvidia-smi |
 
 ## References
 

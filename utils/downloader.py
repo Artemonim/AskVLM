@@ -1,7 +1,7 @@
 import contextlib
 import json
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 try:
     import requests
@@ -11,9 +11,9 @@ except ImportError:
     tqdm = None  # type: ignore[assignment, misc]
 
 try:
-    from huggingface_hub import snapshot_download  # type: ignore[import-untyped]
+    from huggingface_hub import snapshot_download as _snapshot_download
 except ImportError:
-    snapshot_download = None
+    _snapshot_download = None  # type: ignore[assignment]
 
 
 def ensure_models_dir(models_path: Path) -> None:
@@ -65,6 +65,7 @@ def download_model(model_name: str, source: str, models_path: Path) -> None:
     """Download a model from a given source."""
     # * Handle Hugging Face models (folder download)
     if source == "huggingface":
+        snapshot_download: Any = _snapshot_download
         if snapshot_download is None:
             return
 
@@ -73,10 +74,9 @@ def download_model(model_name: str, source: str, models_path: Path) -> None:
         sanitized_name = model_name.replace("/", "--")
         target_dir = models_path / sanitized_name
 
+        # * huggingface_hub 1.x dropped local_dir_use_symlinks; local_dir is enough.
         with contextlib.suppress(Exception):
-            snapshot_download(
-                repo_id=model_name, local_dir=target_dir, local_dir_use_symlinks=False
-            )
+            snapshot_download(repo_id=model_name, local_dir=target_dir)
         return
 
     # * Handle direct URL downloads (single file)

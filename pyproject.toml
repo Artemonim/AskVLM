@@ -44,8 +44,11 @@ dev = [
     "pip-audit>=2.6.0",
 ]
 ml = [
-    # * Torch is installed via build.ps1 -EnsureCUDA to ensure GPU wheel (cu128/cu124/cu121)
-    "torch>=2.5.0",
+    # * Torch/torchaudio CUDA wheels are repaired by run.ps1/build.ps1 by default (2.10 + cu128/cu126).
+    # * Declaring the same major here keeps pip/metadata aligned with GigaAM + Whisper.
+    # ! Do not rely on bare `pip install torch` from PyPI — it resolves to CPU wheels.
+    "torch>=2.10.0,<2.11",
+    "torchaudio>=2.10.0,<2.11",
     "openai-whisper>=20231117",
     "faster-whisper>=1.0.0",
     "pyannote.audio>=3.3.0",
@@ -54,20 +57,13 @@ ml = [
     "python-docx>=1.1.0",
     "odfpy>=1.4.0",
     "nvidia-ml-py3>=7.352.0",
-]
-gigaam = [
-    # * Optional GigaAM Multilingual CTC STT (CPU-only path in AskVLM).
-    # * Official compatibility: torch/torchaudio 2.10 + transformers 5 + hydra/omegaconf.
-    # * Remote-code modeling also imports sentencepiece + pyannote.audio even for
-    # * short-form .transcribe (no longform VAD); keep them in this extra so
-    # * `pip install -e ".[gigaam]"` is sufficient on Windows.
-    "torch>=2.10.0,<2.11",
-    "torchaudio>=2.10.0,<2.11",
+    # * GigaAM Multilingual CTC (CPU path) shares this ML stack; not a separate extra.
+    # * Official card: transformers 5 + hydra/omegaconf; remote-code also needs
+    # * sentencepiece (+ pyannote.audio, already listed above).
     "transformers>=5.0.0,<6",
     "hydra-core",
     "omegaconf",
     "sentencepiece",
-    "pyannote.audio>=3.3.0",
 ]
 
 # ! Ruff configuration - comprehensive linting and formatting
