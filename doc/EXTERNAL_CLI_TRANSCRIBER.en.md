@@ -7,11 +7,13 @@
 The flow is designed for machine interaction:
 
 - Default Whisper model is `small`.
+- Default STT provider is `whisper` (`--stt-provider whisper`). Optional CPU-only `gigaam-ctc` (GigaAM Multilingual, revision `ctc`) is available.
 - By default the command writes only the transcript text to `stdout`.
 - Speaker diarization and LLM dialog formatting are disabled by default.
-- Whisper is loaded on demand and unloaded after the command finishes.
+- The model is loaded on demand and unloaded after the command finishes (legacy `--no-daemon`; resident in daemon mode).
 - If CUDA is available but VRAM allocation for Whisper fails, AskVLM automatically retries Whisper on CPU.
-- On Windows with `--device` other than `cpu`, the command runs in an isolated child process to reduce the impact of upstream crash-on-exit bugs (`faster-whisper`/`ctranslate2`) on the calling process (legacy `--no-daemon` mode only).
+- GigaAM CTC does not use CUDA, Whisper CUDA fallbacks, or Windows GPU child isolation: CPU only.
+- On Windows with `--device` other than `cpu` (Whisper only), the command runs in an isolated child process to reduce the impact of upstream crash-on-exit bugs (`faster-whisper`/`ctranslate2`) on the calling process (legacy `--no-daemon` mode only).
 
 ## Daemon orchestrator and file queue (default mode)
 
@@ -35,6 +37,15 @@ Start the daemon manually (optional — the client starts it automatically):
 python cli.py external-transcribe-daemon --workers 1 --whisper-model small --device cuda
 ```
 
+GigaAM CTC (CPU, optional extra):
+
+```powershell
+python cli.py external-transcribe-daemon --stt-provider gigaam-ctc --device cpu
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc
+```
+
+If a daemon is already live with a different `--stt-provider`, the client will **not** submit the job to the wrong resident model: it returns unavailable / mismatch. The singleton is preserved — restart the daemon with the desired provider.
+
 Legacy one-shot run without the daemon (old "model in this same process" behavior):
 
 ```powershell
@@ -49,6 +60,18 @@ First install the project and ML dependencies:
 pip install -e .
 pip install -e .[ml]
 ```
+
+Optional GigaAM Multilingual CTC provider (separate dependency tree; Whisper-only installs do not get it):
+
+```powershell
+pip install -e .[gigaam]
+```
+
+The `gigaam` extra requires torch/torchaudio 2.10, transformers 5, hydra-core, omegaconf, **sentencepiece**, and **pyannote.audio**. The last two are pulled in by remote-code modeling even for short-form `.transcribe` (no longform/VAD). On CPU, GigaAM uses roughly ~2.5 GB RAM (vs compact Whisper Small CPU) but no VRAM, with speed comparable to Whisper Small on GPU.
+
+Model load uses Hugging Face Transformers with `trust_remote_code=True` **only** for repo `ai-sage/GigaAM-Multilingual` at revision `ctc` (the card's official remote-code API). That trust is scoped to this model/revision, not to arbitrary HF repos. If remote code raises `ImportError`/`ModuleNotFoundError` because the extra is incomplete, the wrapper surfaces the same `pip install -e ".[gigaam]"` guidance and keeps the missing module name.
+
+Installing both `[ml]` (Whisper/`faster-whisper`, typically a broader `torch` range) and `[gigaam]` (pinned torch/torchaudio 2.10) in one environment can force a single torch resolution and may conflict or pull an unexpected CUDA/CPU wheel. Prefer a dedicated GigaAM venv for production integrations, or verify with `pip` / `pip check` after a combined install.
 
 If using a virtual environment on Windows:
 
@@ -91,6 +114,12 @@ Explicitly specify language:
 python cli.py external-transcribe "C:\media\call.wav" --language ru
 ```
 
+Select GigaAM CTC (CPU):
+
+```powershell
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc --device cpu
+```
+
 ## Command Contract
 
 Command:
@@ -125,6 +154,7 @@ Empty transcript: if `get_full_text()` returns a string that is empty after `str
 
 The external CLI uses these defaults unless overridden:
 
+- `--stt-provider whisper`
 - `--whisper-model small`
 - `--device auto`
 - `--compute-type auto`
@@ -132,15 +162,17 @@ The external CLI uses these defaults unless overridden:
 - `--no-dialog-blocks`
 - `--stdout`
 
-Behavior of `--device auto`:
+Behavior of `--device auto` for Whisper:
 
 1. AskVLM first tries CUDA if it is available.
 2. If model loading or GPU inference fails due to insufficient GPU memory, AskVLM unloads Whisper and retries on CPU.
 3. The CPU fallback automatically picks a safe compute type for CPU.
 
+For `--stt-provider gigaam-ctc` the device is always CPU (`auto` → `cpu`); `cuda` is rejected before model load. Whisper-only parameters (`--compute-type`, beam/VAD) are not sent to GigaAM.
+
 This way an overloaded GPU does not block local integration as long as there is enough RAM in the system.
 
-The fallback guarantee applies to the standard single-pass Whisper path. Options like diarization may require additional GPU capacity.
+The fallback guarantee applies to the standard single-pass Whisper path. Options like diarization may require additional GPU capacity. GigaAM does not participate in Whisper CUDA→CPU recovery.
 
 In addition to OOM fallback inside the Whisper path, daemon mode adds an external bounded CPU fallback at the client level: on timeout or GPU daemon unavailability, one in-process CPU pass is performed (see step 4 above). This covers cases where the GPU daemon hung or crashed and can no longer unload or switch to CPU on its own.
 

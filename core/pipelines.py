@@ -14,6 +14,12 @@ from .diarization import DiarizationPipeline
 from .ffmpeg import get_media_duration_seconds
 from .llm_formatter import LLMFormatter
 from .settings import configure_ml_caches, get_project_cache_dir
+from .stt_providers import (
+    STT_PROVIDER_GIGAAM_CTC,
+    STT_PROVIDER_WHISPER,
+    normalize_stt_provider,
+    resolve_gigaam_device,
+)
 from .whisperx_wrapper import WhisperXWrapper
 
 if TYPE_CHECKING:
@@ -27,7 +33,11 @@ class CancelledError(RuntimeError):
 
 # * Orchestrate local speech-to-text processing pipeline
 class LocalPipeline:
-    """Pipeline for local processing: FFmpeg -> STT (Whisper/WhisperX) -> Diarization -> LLM formatting."""
+    """Pipeline for local processing: FFmpeg -> STT -> Diarization -> LLM formatting.
+
+    Default STT provider is Whisper/faster-whisper. Optional ``gigaam-ctc`` uses
+    GigaAM Multilingual CTC on CPU only.
+    """
 
     def __init__(  # noqa: PLR0913
         self,
@@ -36,6 +46,7 @@ class LocalPipeline:
         llm_model: str = "gguf-q4_0",
         *,
         engine: str = "auto",  # whisper | whisperx | auto
+        stt_provider: str = STT_PROVIDER_WHISPER,
         enable_diarization: bool = False,
         enable_dialog_blocks: bool = False,
         language: str | None = None,
@@ -50,17 +61,30 @@ class LocalPipeline:
         # Prefer explicit model_root if provided, else use project cache/models
         self.model_root = model_root or (cache_root / "models")
         self.engine = engine
+        self.stt_provider = normalize_stt_provider(stt_provider)
         self.language = language
-        self.device = device
         self.compute_type = compute_type
-        # STT engine (Faster-Whisper via WhisperX)
-        w_device = device if device in {"auto", "cuda", "cpu"} else "auto"
-        self.whisperx = WhisperXWrapper(
-            model_name="large-v3" if whisper_model == "auto" else whisper_model,
-            model_root=self.model_root,
-            device=w_device,
-            compute_type=compute_type,
-        )
+        self.whisperx: WhisperXWrapper | None = None
+        self.gigaam: Any | None = None
+        if self.stt_provider == STT_PROVIDER_GIGAAM_CTC:
+            # * Reject CUDA/non-CPU before any GigaAM import or weight download.
+            self.device = resolve_gigaam_device(device)
+            from . import gigaam_ctc_wrapper as gigaam_mod  # noqa: PLC0415
+
+            self.gigaam = gigaam_mod.GigaAMCtcWrapper(
+                device=self.device,
+                cache_dir=cache_root / "huggingface",
+            )
+        else:
+            self.device = device
+            # STT engine (Faster-Whisper via WhisperX)
+            w_device = device if device in {"auto", "cuda", "cpu"} else "auto"
+            self.whisperx = WhisperXWrapper(
+                model_name="large-v3" if whisper_model == "auto" else whisper_model,
+                model_root=self.model_root,
+                device=w_device,
+                compute_type=compute_type,
+            )
         # Diarization & LLM
         self.enable_diarization = enable_diarization
         self.enable_dialog_blocks = enable_dialog_blocks
@@ -68,6 +92,79 @@ class LocalPipeline:
         self.diarizer: DiarizationPipeline | None = None
         self._llm_model = llm_model
         self.formatter: LLMFormatter | None = None
+
+    def require_whisperx(self) -> WhisperXWrapper:
+        """Return the Whisper backend or raise when this pipeline uses GigaAM.
+
+        Returns:
+            The configured :class:`WhisperXWrapper`.
+
+        Raises:
+            RuntimeError: When the pipeline was created for ``gigaam-ctc``.
+
+        """
+        if self.whisperx is None:
+            msg = "Whisper backend is not configured for this STT provider"
+            raise RuntimeError(msg)
+        return self.whisperx
+
+    def _transcribe_audio(
+        self,
+        audio_path: Path,
+        *,
+        on_segment: Callable[[dict[str, object]], None],
+        subtitle_max_line_width: int | None,
+        subtitle_max_lines: int | None,
+    ) -> tuple[dict[str, Any], str]:
+        """Dispatch ASR to the selected provider without cross-wiring kwargs.
+
+        Args:
+            audio_path: Prepared WAV path.
+            on_segment: Segment streaming callback.
+            subtitle_max_line_width: Whisper subtitle layout hint.
+            subtitle_max_lines: Whisper subtitle layout hint.
+
+        Returns:
+            ``(transcript_dict, asr_label)`` for progress reporting.
+
+        """
+        if self.stt_provider == STT_PROVIDER_GIGAAM_CTC:
+            if self.gigaam is None:
+                msg = "GigaAM CTC backend is not configured"
+                raise RuntimeError(msg)
+            # * Do not forward Whisper-only beam/VAD/compute kwargs to GigaAM.
+            return (
+                cast(
+                    "dict[str, Any]",
+                    self.gigaam.transcribe(
+                        audio_path=audio_path,
+                        language=self.language,
+                        on_segment=on_segment,
+                        progress=None,
+                    ),
+                ),
+                "gigaam-ctc",
+            )
+        whisper = self.require_whisperx()
+        wx_kwargs: dict[str, object] = {
+            "beam_size": 10,
+            "vad_filter": True,
+            "word_timestamps": True,
+        }
+        if subtitle_max_line_width is not None:
+            wx_kwargs["max_line_width"] = int(subtitle_max_line_width)
+        if subtitle_max_lines is not None:
+            wx_kwargs["max_line_count"] = int(subtitle_max_lines)
+        return (
+            whisper.transcribe(
+                audio_path=audio_path,
+                language=self.language,
+                on_segment=on_segment,
+                progress=None,
+                **wx_kwargs,
+            ),
+            "whisperx",
+        )
 
     def _get_formatter(self) -> LLMFormatter:
         if self.formatter is None:
@@ -81,7 +178,10 @@ class LocalPipeline:
 
     def close(self, *, aggressive: bool = False) -> None:
         """Release loaded ML backends held by the pipeline."""
-        self.whisperx.unload(safe=not aggressive)
+        if self.whisperx is not None:
+            self.whisperx.unload(safe=not aggressive)
+        if self.gigaam is not None:
+            self.gigaam.unload(safe=not aggressive)
         if self.diarizer is not None:
             with contextlib.suppress(Exception):
                 self.diarizer.close()
@@ -120,8 +220,8 @@ class LocalPipeline:
             input_path: Path to media file (audio/video).
             work_dir: Working directory for intermediate artifacts.
             progress: Optional callback reporting (message, 0..1) progress.
-            subtitle_max_line_width: Desired max chars per subtitle line (hint for WhisperX).
-            subtitle_max_lines: Desired max lines per subtitle cue (hint for WhisperX).
+            subtitle_max_line_width: Max chars per subtitle line (Whisper hint).
+            subtitle_max_lines: Max lines per subtitle cue (Whisper hint).
             should_cancel: Optional callback; when returns True, processing cancels.
 
         """
@@ -148,16 +248,6 @@ class LocalPipeline:
         raw_text = ""
         transcript_segments: list[dict[str, object]] = []
         report("Transcribing", 0.2)
-        wx_kwargs: dict[str, object] = {}
-        # * Default extreme recognition profile (fits on 8 GiB VRAM empirically)
-        # * Higher quality / VRAM usage: beam search and word-level timestamps
-        wx_kwargs["beam_size"] = 10
-        wx_kwargs["vad_filter"] = True
-        wx_kwargs["word_timestamps"] = True
-        if subtitle_max_line_width is not None:
-            wx_kwargs["max_line_width"] = int(subtitle_max_line_width)
-        if subtitle_max_lines is not None:
-            wx_kwargs["max_line_count"] = int(subtitle_max_lines)
 
         # * Optional streaming output of partial transcript
         partial_txt: Path | None = None
@@ -204,22 +294,24 @@ class LocalPipeline:
                 except OSError:
                     pass
 
-        # Use WhisperX (Faster-Whisper) exclusively for ASR with segment callback
-        # Help type checker via explicit expansion to avoid kwargs mis-binding
         try:
-            tx = self.whisperx.transcribe(
-                audio_path=audio_path,
-                language=self.language,
+            tx, asr_label = self._transcribe_audio(
+                audio_path,
                 on_segment=_on_segment,
-                progress=None,
-                **wx_kwargs,
+                subtitle_max_line_width=subtitle_max_line_width,
+                subtitle_max_lines=subtitle_max_lines,
             )
         except Exception as exc:
             report(f"ASR failed: {exc}", 0.6)
             raise
-        raw_text = tx.get("text", "")
-        transcript_segments = list(tx.get("segments", []) or [])
-        report("Transcription complete (whisperx)", 0.6)
+        raw_text = str(tx.get("text", "") or "")
+        segments_raw = tx.get("segments", [])
+        transcript_segments = (
+            list(cast("list[dict[str, object]]", segments_raw))
+            if isinstance(segments_raw, list)
+            else []
+        )
+        report(f"Transcription complete ({asr_label})", 0.6)
 
         # * Step 3: Perform speaker diarization (optional)
         diarization_segments: list[Segment] = []
@@ -270,7 +362,8 @@ def create_default_local_pipeline() -> LocalPipeline:
 
     Defaults are aligned with the GUI/CLI behavior:
     - engine="auto" (prefer Faster-Whisper; WhisperX alignment when available)
-    - device="auto" (prefer CUDA when available)
+    - stt_provider="whisper" (optional external path: gigaam-ctc)
+    - device="auto" (prefer CUDA when available; GigaAM forces CPU)
     - enable_diarization=False
     - enable_dialog_blocks=False
     - whisper_model="auto" (resolves to "large-v3")

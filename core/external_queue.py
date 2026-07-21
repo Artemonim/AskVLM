@@ -68,6 +68,8 @@ class TranscribeJob:
         submitted_at: Unix timestamp when the job was submitted.
         deadline_at: Unix timestamp after which the job may be dropped, or
             ``None`` for no deadline.
+        stt_provider: STT backend id (``whisper`` or ``gigaam-ctc``). Missing
+            values in older queued jobs default to Whisper.
 
     """
 
@@ -81,6 +83,7 @@ class TranscribeJob:
     dialog_blocks: bool
     submitted_at: float
     deadline_at: float | None
+    stt_provider: str = "whisper"
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable mapping for this job.
@@ -100,6 +103,7 @@ class TranscribeJob:
             "dialog_blocks": self.dialog_blocks,
             "submitted_at": self.submitted_at,
             "deadline_at": self.deadline_at,
+            "stt_provider": self.stt_provider,
         }
 
     @classmethod
@@ -124,6 +128,8 @@ class TranscribeJob:
             dialog_blocks=bool(payload.get("dialog_blocks", False)),
             submitted_at=float(payload.get("submitted_at", 0.0)),
             deadline_at=_optional_float(payload.get("deadline_at")),
+            # * Legacy queued jobs without a provider keep Whisper semantics.
+            stt_provider=str(payload.get("stt_provider", "whisper")),
         )
 
 

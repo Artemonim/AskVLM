@@ -932,7 +932,7 @@ class MainWindow(QMainWindow):
                 output_dir=out_dir,
                 context_window_tokens=self.video_qa_panel.context_window_tokens(),
                 frame_sample_fps=self.video_qa_panel.frame_sample_fps(),
-                whisper=self.pipeline.whisperx,
+                whisper=self.pipeline.require_whisperx(),
                 chunk_lm=lm.chunk,
                 final_lm=lm.final_answer,
                 video_chunking_enabled=self.video_qa_panel.video_chunking_enabled(),
@@ -2272,15 +2272,15 @@ class MainWindow(QMainWindow):
         model = "large-v3" if self._quality_mode == "good" else "small"
         try:
             # Update underlying wrapper and force reload next time
-            self.pipeline.whisperx.model_name = model
-            if force_reload and isinstance(self.pipeline.whisperx, WhisperXWrapper):
+            whisper = self.pipeline.require_whisperx()
+            whisper.model_name = model
+            if force_reload and isinstance(whisper, WhisperXWrapper):
                 # Recreate the wrapper to ensure a clean reload.
-                wx_old = self.pipeline.whisperx
                 self.pipeline.whisperx = WhisperXWrapper(
-                    model_name=wx_old.model_name,
-                    device=wx_old.device,
-                    compute_type=wx_old.compute_type,
-                    model_root=wx_old.model_root,
+                    model_name=whisper.model_name,
+                    device=whisper.device,
+                    compute_type=whisper.compute_type,
+                    model_root=whisper.model_root,
                 )
         except Exception:  # noqa: BLE001
             # Fallback: rebuild pipeline with desired model
@@ -2468,7 +2468,7 @@ class PipelineWorker(QObject):
                 # * independent model instances per job.
                 return LocalPipeline(
                     model_root=base.model_root,
-                    whisper_model=base.whisperx.model_name,
+                    whisper_model=base.require_whisperx().model_name,
                     llm_model=base.llm_model_name,
                     engine=base.engine,
                     enable_diarization=base.enable_diarization,

@@ -116,6 +116,71 @@ def test_process_claimed_job_deadline_is_cancelled(tmp_path: Path) -> None:
     assert calls["n"] == 0
 
 
+def test_process_claimed_job_rejects_provider_mismatch(tmp_path: Path) -> None:
+    """A claimed job with the wrong provider never reaches the transcribe fn."""
+    calls = {"n": 0}
+
+    def _fn(
+        job: q.TranscribeJob, should_cancel: Callable[[], bool]
+    ) -> q.TranscribeResult:
+        calls["n"] += 1
+        return q.TranscribeResult(job.job_id, "ok", "wrong", None, None, 1.0)
+
+    # * Default job is whisper; resident daemon expects gigaam-ctc.
+    result = process_claimed_job(
+        tmp_path,
+        _job(),
+        _fn,
+        expected_stt_provider="gigaam-ctc",
+        clock=lambda: 0.0,
+    )
+    assert result.status == "error"
+    assert result.error_kind == "stt_provider_mismatch"
+    assert "gigaam-ctc" in (result.error_detail or "")
+    assert calls["n"] == 0
+    stored = q.read_result(tmp_path, "j")
+    assert stored is not None
+    assert stored.status == "error"
+    assert stored.error_kind == "stt_provider_mismatch"
+
+
+def test_process_claimed_job_rejects_gigaam_job_on_whisper_daemon(
+    tmp_path: Path,
+) -> None:
+    """Whisper-resident daemon rejects a queued gigaam-ctc job without work."""
+    calls = {"n": 0}
+
+    def _fn(
+        job: q.TranscribeJob, should_cancel: Callable[[], bool]
+    ) -> q.TranscribeResult:
+        calls["n"] += 1
+        return q.TranscribeResult(job.job_id, "ok", "wrong", None, None, 1.0)
+
+    job = q.TranscribeJob(
+        job_id="giga",
+        input_path="input.wav",
+        language=None,
+        device="cpu",
+        compute_type="auto",
+        whisper_model="small",
+        diarization=False,
+        dialog_blocks=False,
+        submitted_at=0.0,
+        deadline_at=None,
+        stt_provider="gigaam-ctc",
+    )
+    result = process_claimed_job(
+        tmp_path,
+        job,
+        _fn,
+        expected_stt_provider="whisper",
+        clock=lambda: 0.0,
+    )
+    assert result.status == "error"
+    assert result.error_kind == "stt_provider_mismatch"
+    assert calls["n"] == 0
+
+
 def test_run_daemon_exits_when_already_running(tmp_path: Path) -> None:
     """A second daemon exits immediately while the first is alive."""
     q.ensure_layout(tmp_path)

@@ -12,6 +12,7 @@
 | Text mode | ✅ ready | Stable base workflow. |
 | Subtitle mode | ✅ ready | Stable preview/export/burn-in workflow. |
 | Whisper/WhisperX | ✅ ready for subtitle-first base, ✅ Video QA local run wired | Subtitle pipeline unchanged; Video QA uses ASR via `WhisperXWrapper` + `prepare_audio` without diarization/dialog formatting by default in the local run path. VRAM hand-off Whisper → LM phase not enforced yet (see §6). |
+| GigaAM CTC (optional) | ✅ ready for `external-transcribe` | CPU-only `--stt-provider gigaam-ctc` (`ai-sage/GigaAM-Multilingual` revision `ctc`); optional extra `.[gigaam]`; not used for CUDA / Whisper CUDA fallbacks / Windows GPU child isolation; daemon provider mismatch → unavailable. |
 | Chunking | ✅ ready at planning level | Chunk planning exists in backend orchestration. |
 | Representative frames | ✅ ready for local GUI run | `core/video_qa_local_run.VideoQAFFmpegFrameMaterializer` uses `extract_frame_to_file`. |
 | LM Studio / VLM | 🟡 partial | GUI launch path runs chunk inferencer + LM Studio client; overflow vs live server behaviour still needs verification. |
@@ -150,6 +151,7 @@
 
 ## 12. Расширение (post-MVP)
 
+- **GigaAM CTC (сделано для external CLI):** опциональный CPU-only `--stt-provider gigaam-ctc` в `external-transcribe` / daemon / queue; Whisper остаётся default. Возможные follow-up: GUI picker, native longform вместо внешнего чанкинга, отдельный A/B quality gate на живых RU-записях.
 - Блок задач по **загрузке видео из сети** (не только YouTube): унифицировать URL providers, политики temp/cleanup, UX импорта и ToS/лицензии в одном workstream, чтобы не размазывать сетевой ввод по разным §.
 - **Чат с финальным ответом Video QA**, а не только read-only просмотр: возможность уточнять ответ в диалоге (контекст: evidence, manifest, вопрос), с отдельным контрактом от subtitle-first. Опциональное подключение Filesystem MCP.
 - **Другие локальные LLM-провайдеры** помимо LM Studio: абстракция над OpenAI-compatible HTTP (base URL, auth, capabilities), плюс опциональные адаптеры (ollama, llama.cpp server, …) без смешения с subtitle pipeline.

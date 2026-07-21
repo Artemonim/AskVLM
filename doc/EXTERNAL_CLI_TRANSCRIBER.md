@@ -7,11 +7,13 @@
 Поток заточен под машинное взаимодействие:
 
 - Модель Whisper по умолчанию — `small`.
+- Провайдер STT по умолчанию — `whisper` (`--stt-provider whisper`). Опционально доступен CPU-only `gigaam-ctc` (GigaAM Multilingual, revision `ctc`).
 - Команда по умолчанию пишет только текст транскрипта в `stdout`.
 - Диаризация спикеров и LLM-форматирование диалога по умолчанию выключены.
-- Whisper подгружается по требованию и выгружается после завершения команды.
+- Модель подгружается по требованию и выгружается после завершения команды (в legacy `--no-daemon`; в режиме демона — резидентно).
 - Если CUDA доступна, но выделение VRAM для Whisper не удаётся, AskVLM автоматически повторяет запуск Whisper на CPU.
-- На Windows при `--device` отличном от `cpu` команда использует изолированный child-процесс, чтобы снизить влияние upstream crash-on-exit (`faster-whisper`/`ctranslate2`) на вызывающий процесс (только legacy-режим `--no-daemon`).
+- GigaAM CTC не использует CUDA, CUDA-fallback Whisper и Windows GPU child-isolation: только CPU.
+- На Windows при `--device` отличном от `cpu` (только Whisper) команда использует изолированный child-процесс, чтобы снизить влияние upstream crash-on-exit (`faster-whisper`/`ctranslate2`) на вызывающий процесс (только legacy-режим `--no-daemon`).
 
 ## Демон-оркестратор и файловая очередь (режим по умолчанию)
 
@@ -35,6 +37,15 @@
 python cli.py external-transcribe-daemon --workers 1 --whisper-model small --device cuda
 ```
 
+GigaAM CTC (CPU, опциональный extra):
+
+```powershell
+python cli.py external-transcribe-daemon --stt-provider gigaam-ctc --device cpu
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc
+```
+
+Если уже жив демон с другим `--stt-provider`, клиент **не** отправит задание в «чужую» резидентную модель: вернётся unavailable / mismatch. Singleton сохраняется — перезапустите демон с нужным провайдером.
+
 Legacy одноразовый запуск без демона (старое поведение «модель в этом же процессе»):
 
 ```powershell
@@ -49,6 +60,18 @@ python cli.py external-transcribe "C:\media\call.wav" --no-daemon
 pip install -e .
 pip install -e .[ml]
 ```
+
+Опциональный провайдер GigaAM Multilingual CTC (отдельное дерево зависимостей; Whisper-only установки его не получают):
+
+```powershell
+pip install -e .[gigaam]
+```
+
+Требования extra `gigaam`: torch/torchaudio 2.10, transformers 5, hydra-core, omegaconf, **sentencepiece**, **pyannote.audio**. Последние две нужны remote-code modeling даже для short-form `.transcribe` (без longform/VAD). GigaAM на CPU занимает порядка ~2.5 ГБ RAM (против компактного Whisper Small CPU), зато не занимает VRAM и по скорости сопоставим с Whisper Small на GPU (см. бенчмарки вне репозитория).
+
+Загрузка модели идёт через Hugging Face Transformers с `trust_remote_code=True` **только** для репозитория `ai-sage/GigaAM-Multilingual` на revision `ctc` (официальный remote-code API карточки). Это доверие относится к коду этой модели/ревизии, а не к произвольным HF-репозиториям. Если remote-code поднимает `ImportError`/`ModuleNotFoundError` из‑за незакрытого extra, обёртка подсказывает тот же `pip install -e ".[gigaam]"` и сохраняет имя недостающего модуля.
+
+Если ставить вместе `[ml]` (Whisper/`faster-whisper`, обычно более широкий диапазон `torch`) и `[gigaam]` (жёстче: torch/torchaudio 2.10), pip может выбрать одну версию torch на всё окружение — возможны конфликты резолва или неожиданный CUDA/CPU wheel. Для продакшен-интеграций надёжнее отдельный venv под GigaAM либо явная проверка `pip`/`pip check` после совместной установки.
 
 Если используете виртуальное окружение в Windows:
 
@@ -91,6 +114,12 @@ python cli.py external-transcribe "C:\media\call.wav" --device cpu
 python cli.py external-transcribe "C:\media\call.wav" --language ru
 ```
 
+Выбрать GigaAM CTC (CPU):
+
+```powershell
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc --device cpu
+```
+
 ## Контракт команды
 
 Команда:
@@ -125,6 +154,7 @@ python cli.py external-transcribe INPUT_PATH [options]
 
 Внешний CLI использует эти значения по умолчанию, пока вы их не переопределите:
 
+- `--stt-provider whisper`
 - `--whisper-model small`
 - `--device auto`
 - `--compute-type auto`
@@ -132,15 +162,17 @@ python cli.py external-transcribe INPUT_PATH [options]
 - `--no-dialog-blocks`
 - `--stdout`
 
-Поведение `--device auto`:
+Поведение `--device auto` для Whisper:
 
 1. AskVLM сначала пробует CUDA, если она доступна.
 2. Если загрузка модели или инференс на GPU падают из‑за нехватки памяти GPU, AskVLM выгружает Whisper и повторяет запуск на CPU.
 3. Fallback на CPU сам подбирает безопасный для CPU тип вычислений.
 
+Для `--stt-provider gigaam-ctc` устройство всегда CPU (`auto` → `cpu`); `cuda` отклоняется до загрузки модели. Параметры Whisper (`--compute-type`, beam/VAD) в GigaAM не передаются.
+
 Так перегруженный GPU не блокирует локальную интеграцию, пока в системе ещё достаточно RAM.
 
-Гарантия fallback относится к стандартному одноразовому пути Whisper. Опции вроде диаризации могут потребовать дополнительной ёмкости GPU.
+Гарантия fallback относится к стандартному одноразовому пути Whisper. Опции вроде диаризации могут потребовать дополнительной ёмкости GPU. GigaAM не участвует в CUDA→CPU recovery Whisper.
 
 Помимо OOM-fallback внутри пути Whisper, режим демона добавляет внешний bounded CPU-fallback на уровне клиента: при таймауте или недоступности GPU-демона выполняется один встроенный проход на CPU (см. шаг 4 выше). Это покрывает случаи, когда GPU-демон завис или аварийно завершился и сам выгрузиться/переключиться на CPU уже не может.
 

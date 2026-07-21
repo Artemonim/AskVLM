@@ -46,6 +46,43 @@ def test_job_roundtrip_via_dict() -> None:
     assert q.TranscribeJob.from_dict(job.to_dict()) == job
 
 
+def test_job_legacy_payload_defaults_stt_provider_to_whisper() -> None:
+    """Queued jobs without ``stt_provider`` keep Whisper semantics."""
+    payload = {
+        "job_id": "legacy",
+        "input_path": "input.wav",
+        "language": None,
+        "device": "cpu",
+        "compute_type": "auto",
+        "whisper_model": "small",
+        "diarization": False,
+        "dialog_blocks": False,
+        "submitted_at": 1.0,
+        "deadline_at": None,
+    }
+    job = q.TranscribeJob.from_dict(payload)
+    assert job.stt_provider == "whisper"
+    assert "stt_provider" in job.to_dict()
+
+
+def test_job_roundtrip_preserves_gigaam_provider() -> None:
+    """Explicit gigaam-ctc provider survives serialization."""
+    job = q.TranscribeJob(
+        job_id="g1",
+        input_path="input.wav",
+        language="ru",
+        device="cpu",
+        compute_type="auto",
+        whisper_model="small",
+        diarization=False,
+        dialog_blocks=False,
+        submitted_at=1.0,
+        deadline_at=None,
+        stt_provider="gigaam-ctc",
+    )
+    assert q.TranscribeJob.from_dict(job.to_dict()).stt_provider == "gigaam-ctc"
+
+
 def test_result_roundtrip_and_unknown_status_falls_back_to_error() -> None:
     """Results roundtrip, and an unknown status decodes as ``error``."""
     result = q.TranscribeResult("j", "ok", "text", None, None, 1.0)

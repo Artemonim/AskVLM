@@ -55,6 +55,20 @@ ml = [
     "odfpy>=1.4.0",
     "nvidia-ml-py3>=7.352.0",
 ]
+gigaam = [
+    # * Optional GigaAM Multilingual CTC STT (CPU-only path in AskVLM).
+    # * Official compatibility: torch/torchaudio 2.10 + transformers 5 + hydra/omegaconf.
+    # * Remote-code modeling also imports sentencepiece + pyannote.audio even for
+    # * short-form .transcribe (no longform VAD); keep them in this extra so
+    # * `pip install -e ".[gigaam]"` is sufficient on Windows.
+    "torch>=2.10.0,<2.11",
+    "torchaudio>=2.10.0,<2.11",
+    "transformers>=5.0.0,<6",
+    "hydra-core",
+    "omegaconf",
+    "sentencepiece",
+    "pyannote.audio>=3.3.0",
+]
 
 # ! Ruff configuration - comprehensive linting and formatting
 [tool.ruff]
@@ -132,6 +146,8 @@ module = [
     "llama_cpp.*",
     "torch.*",
     "torchaudio.*",
+    "transformers",
+    "transformers.*",
     "nvidia_ml_py.*",
     "docx.*",
     "odf.*",

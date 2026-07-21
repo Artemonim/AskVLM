@@ -27,17 +27,20 @@ from core.external_queue import (
     is_daemon_alive,
     is_windows,
     new_job_id,
+    read_heartbeat,
     read_result,
     request_cancel,
     resolve_queue_dir,
     submit_job,
 )
+from core.stt_providers import STT_PROVIDER_WHISPER, normalize_stt_provider
 
 ClientStatus = Literal["ok", "empty", "error", "timeout", "unavailable"]
 
 # * Maximum time to wait for a freshly spawned daemon to publish a heartbeat.
 _DAEMON_START_TIMEOUT_SECONDS = 30.0
 _POLL_INTERVAL_SECONDS = 0.25
+_PROVIDER_MISMATCH_MARKER = "ASKVLM_DAEMON_PROVIDER_MISMATCH"
 
 SpawnFn = Callable[[], None]
 
@@ -54,6 +57,7 @@ class ClientRequest:
         whisper_model: Preferred Whisper model name (advisory).
         client_timeout_s: How long the client waits before giving up.
         daemon_workers: Worker count to request when spawning a new daemon.
+        stt_provider: STT backend id (``whisper`` default, or ``gigaam-ctc``).
 
     """
 
@@ -64,6 +68,7 @@ class ClientRequest:
     whisper_model: str
     client_timeout_s: float
     daemon_workers: int
+    stt_provider: str = STT_PROVIDER_WHISPER
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +114,8 @@ def _build_daemon_command(request: ClientRequest, queue_dir: Path) -> list[str]:
         "external-transcribe-daemon",
         "--workers",
         str(request.daemon_workers),
+        "--stt-provider",
+        normalize_stt_provider(request.stt_provider),
         "--whisper-model",
         request.whisper_model,
         "--device",
@@ -121,6 +128,47 @@ def _build_daemon_command(request: ClientRequest, queue_dir: Path) -> list[str]:
     if request.language:
         command.extend(["--language", request.language])
     return command
+
+
+def _daemon_provider(queue_dir: Path) -> str | None:
+    """Return the STT provider advertised by a live daemon heartbeat.
+
+    Args:
+        queue_dir: The queue root directory.
+
+    Returns:
+        Provider id from the heartbeat, defaulting to Whisper when the field is
+        absent (legacy daemons), or ``None`` when no heartbeat exists.
+
+    """
+    beacon = read_heartbeat(queue_dir)
+    if beacon is None:
+        return None
+    raw = beacon.get("stt_provider")
+    if raw is None or not str(raw).strip():
+        return STT_PROVIDER_WHISPER
+    try:
+        return normalize_stt_provider(str(raw))
+    except ValueError:
+        return str(raw)
+
+
+def _provider_mismatch_detail(*, daemon_provider: str, requested: str) -> str:
+    """Build a clear operational error for a live daemon with the wrong provider.
+
+    Args:
+        daemon_provider: Provider id currently resident in the daemon.
+        requested: Provider id requested by the client.
+
+    Returns:
+        Human-readable mismatch detail including the restart hint.
+
+    """
+    return (
+        f"{_PROVIDER_MISMATCH_MARKER}: live daemon stt_provider={daemon_provider!r} "
+        f"does not match requested {requested!r}; keep the singleton daemon and "
+        f"restart it with --stt-provider {requested}"
+    )
 
 
 def _daemon_creationflags() -> int:
@@ -247,7 +295,20 @@ def run_client_transcribe(
     """
     resolved = resolve_queue_dir(queue_dir)
     ensure_layout(resolved)
-    if not ensure_daemon_running(
+    requested_provider = normalize_stt_provider(request.stt_provider)
+    if is_daemon_alive(resolved, now=clock()):
+        live_provider = _daemon_provider(resolved) or STT_PROVIDER_WHISPER
+        if live_provider != requested_provider:
+            # * Do not submit to the wrong resident model; keep the singleton.
+            return ClientOutcome(
+                "unavailable",
+                "",
+                _provider_mismatch_detail(
+                    daemon_provider=live_provider,
+                    requested=requested_provider,
+                ),
+            )
+    elif not ensure_daemon_running(
         resolved, request, spawn=spawn, clock=clock, sleeper=sleeper
     ):
         return ClientOutcome("unavailable", "", "transcription daemon unavailable")
@@ -268,6 +329,7 @@ def run_client_transcribe(
             dialog_blocks=False,
             submitted_at=submitted_at,
             deadline_at=deadline_at,
+            stt_provider=requested_provider,
         ),
     )
 

@@ -19,6 +19,13 @@ import typer
 
 from core.external_client import ClientRequest, run_client_transcribe
 from core.external_daemon import DaemonConfig, run_daemon
+from core.stt_providers import (
+    STT_PROVIDER_CHOICES,
+    STT_PROVIDER_GIGAAM_CTC,
+    STT_PROVIDER_WHISPER,
+    normalize_stt_provider,
+    resolve_gigaam_device,
+)
 
 app = typer.Typer(
     help=(
@@ -58,12 +65,14 @@ def _create_local_pipeline(  # noqa: PLR0913
     language: Optional[str],
     device: str,
     compute_type: str,
+    stt_provider: str = STT_PROVIDER_WHISPER,
 ) -> Any:
     runtime = _load_cli_runtime()
     local_pipeline_cls = runtime["LocalPipeline"]
     return local_pipeline_cls(
         whisper_model=whisper_model,
         engine=engine,
+        stt_provider=stt_provider,
         enable_diarization=diarization,
         enable_dialog_blocks=dialog_blocks,
         language=language,
@@ -122,6 +131,28 @@ def _read_child_success_result(path: Path) -> Optional[str]:
     return _normalize_transcript_text(text)
 
 
+def _resolve_external_device(*, stt_provider: str, device: str) -> str:
+    """Resolve ``--device`` for the selected STT provider.
+
+    Args:
+        stt_provider: Canonical provider id.
+        device: Raw ``--device`` token from the CLI.
+
+    Returns:
+        Device token safe for the selected provider.
+
+    Raises:
+        typer.BadParameter: When GigaAM is requested with a non-CPU device.
+
+    """
+    if stt_provider != STT_PROVIDER_GIGAAM_CTC:
+        return device
+    try:
+        return resolve_gigaam_device(device)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
 def _run_external_transcribe_once(  # noqa: PLR0913
     *,
     input_path: Path,
@@ -132,6 +163,7 @@ def _run_external_transcribe_once(  # noqa: PLR0913
     diarization: bool,
     dialog_blocks: bool,
     work_dir: Optional[Path],
+    stt_provider: str = STT_PROVIDER_WHISPER,
     before_close: Optional[Callable[[str], None]] = None,
 ) -> str:
     pipeline = _create_local_pipeline(
@@ -142,6 +174,7 @@ def _run_external_transcribe_once(  # noqa: PLR0913
         language=language,
         device=device,
         compute_type=compute_type,
+        stt_provider=stt_provider,
     )
     try:
         if work_dir is None:
@@ -169,12 +202,15 @@ def _build_external_child_command(  # noqa: PLR0913
     dialog_blocks: bool,
     work_dir: Optional[Path],
     child_result_file: Path,
+    stt_provider: str = STT_PROVIDER_WHISPER,
 ) -> list[str]:
     command = [
         sys.executable,
         str(Path(__file__).resolve()),
         "external-transcribe",
         str(input_path),
+        "--stt-provider",
+        stt_provider,
         "--whisper-model",
         whisper_model,
         "--device",
@@ -205,6 +241,7 @@ def _run_external_transcribe_isolated_attempt(  # noqa: PLR0913
     diarization: bool,
     dialog_blocks: bool,
     work_dir: Optional[Path],
+    stt_provider: str = STT_PROVIDER_WHISPER,
 ) -> _ExternalChildAttemptResult:
     with tempfile.TemporaryDirectory(prefix="askvlm-ext-ipc-") as ipc_dir:
         child_result_file = Path(ipc_dir) / "child_result.json"
@@ -218,6 +255,7 @@ def _run_external_transcribe_isolated_attempt(  # noqa: PLR0913
             dialog_blocks=dialog_blocks,
             work_dir=work_dir,
             child_result_file=child_result_file,
+            stt_provider=stt_provider,
         )
         completed = subprocess.run(
             command,
@@ -328,15 +366,15 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
     daemon_workers: int,
     output_file: Optional[Path],
     stdout: bool,
+    stt_provider: str = STT_PROVIDER_WHISPER,
     cpu_fallback: Optional[Callable[[], str]] = None,
 ) -> None:
     """Transcribe through the shared daemon and map the outcome to CLI rules.
 
     When the daemon is reachable-but-degraded (client timeout or no daemon) on a
-    GPU-seeded request, a bounded in-process CPU fallback is attempted before the
-    degraded exit code is surfaced. This restores the documented CUDA→CPU
-    recovery for the default daemon path, so a stuck/unavailable GPU daemon no
-    longer silently loses the transcript.
+    GPU-seeded Whisper request, a bounded in-process CPU fallback is attempted
+    before the degraded exit code is surfaced. GigaAM CTC is CPU-only and is
+    never used as a CUDA fallback path.
 
     Args:
         input_path: Media file to transcribe.
@@ -348,8 +386,9 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
         daemon_workers: Worker count requested when spawning a new daemon.
         output_file: Optional plain-text file to also write.
         stdout: Whether to echo the transcript to stdout.
+        stt_provider: STT backend id (``whisper`` or ``gigaam-ctc``).
         cpu_fallback: Optional callable performing one in-process CPU
-            transcription, used only on a degraded GPU-seeded outcome.
+            transcription, used only on a degraded GPU-seeded Whisper outcome.
 
     Raises:
         typer.Exit: With code ``0`` on success, ``1`` on error,
@@ -366,6 +405,7 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
             whisper_model=whisper_model,
             client_timeout_s=client_timeout,
             daemon_workers=daemon_workers,
+            stt_provider=stt_provider,
         )
     )
     if outcome.status in {"ok", "empty"}:
@@ -373,8 +413,10 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
             text=outcome.text, output_file=output_file, stdout=stdout
         )
         return
+    # * Whisper-only CUDA→CPU recovery; never route GigaAM into this path.
     if (
-        outcome.status in _DAEMON_DEGRADED_STATUSES
+        stt_provider == STT_PROVIDER_WHISPER
+        and outcome.status in _DAEMON_DEGRADED_STATUSES
         and cpu_fallback is not None
         and _device_prefers_gpu(device)
     ):
@@ -559,6 +601,14 @@ def external_transcribe(  # noqa: PLR0913
         "small",
         help="Whisper model name for the external one-shot flow (default: small).",
     ),
+    stt_provider: str = typer.Option(
+        STT_PROVIDER_WHISPER,
+        "--stt-provider",
+        help=(
+            "Speech-to-text provider: whisper (default) or gigaam-ctc "
+            "(CPU-only optional extra)."
+        ),
+    ),
     language: Optional[str] = typer.Option(
         None, help="Optional language code, for example: en, ru, de."
     ),
@@ -566,14 +616,15 @@ def external_transcribe(  # noqa: PLR0913
         "auto",
         help=(
             "Preferred device: auto|cuda|cpu. When CUDA memory is exhausted, "
-            "the command retries on CPU automatically."
+            "Whisper retries on CPU automatically. GigaAM CTC accepts only cpu "
+            "(auto resolves to cpu)."
         ),
     ),
     compute_type: str = typer.Option(
         "auto",
         help=(
             "Compute type: auto|float16|int8|int8_float16. 'auto' uses float16 "
-            "on CUDA and int8 on CPU."
+            "on CUDA and int8 on CPU. Ignored for gigaam-ctc."
         ),
     ),
     diarization: bool = typer.Option(
@@ -645,6 +696,16 @@ def external_transcribe(  # noqa: PLR0913
         raise typer.BadParameter(
             "Either keep --stdout enabled or provide --output-file."
         )
+    try:
+        provider = normalize_stt_provider(stt_provider)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if provider not in STT_PROVIDER_CHOICES:
+        raise typer.BadParameter(
+            f"Unsupported --stt-provider {stt_provider!r}; "
+            f"expected one of: {', '.join(STT_PROVIDER_CHOICES)}"
+        )
+    device = _resolve_external_device(stt_provider=provider, device=device)
     # * Env-var fallback: recover IPC path if CLI arg was not parsed
     if _internal_child_mode and _internal_result_file is None:
         _env_path = os.environ.get("_ASKVLM_CHILD_RESULT_FILE")
@@ -666,6 +727,7 @@ def external_transcribe(  # noqa: PLR0913
                 diarization=diarization,
                 dialog_blocks=dialog_blocks,
                 work_dir=work_dir,
+                stt_provider=provider,
                 before_close=lambda text: _write_json_atomic(
                     _internal_result_file,
                     {"status": "ok", "text": text},
@@ -696,23 +758,33 @@ def external_transcribe(  # noqa: PLR0913
             daemon_workers=daemon_workers,
             output_file=output_file,
             stdout=stdout,
-            # * Bounded recovery when the resident GPU daemon is stuck/unavailable:
-            # * one in-process CPU pass on the same file. CPU Whisper does not need
-            # * the Windows subprocess isolation that the GPU path relies on.
-            cpu_fallback=lambda: _run_external_transcribe_once(
-                input_path=input_path,
-                whisper_model=whisper_model,
-                language=language,
-                device="cpu",
-                compute_type=compute_type,
-                diarization=diarization,
-                dialog_blocks=dialog_blocks,
-                work_dir=work_dir,
+            stt_provider=provider,
+            # * Bounded Whisper CUDA→CPU recovery only. GigaAM is CPU-only and
+            # * must not participate in CUDA fallbacks or Windows GPU isolation.
+            cpu_fallback=(
+                None
+                if provider != STT_PROVIDER_WHISPER
+                else lambda: _run_external_transcribe_once(
+                    input_path=input_path,
+                    whisper_model=whisper_model,
+                    language=language,
+                    device="cpu",
+                    compute_type=compute_type,
+                    diarization=diarization,
+                    dialog_blocks=dialog_blocks,
+                    work_dir=work_dir,
+                    stt_provider=STT_PROVIDER_WHISPER,
+                )
             ),
         )
         return
 
-    windows_non_cpu = sys.platform.startswith("win") and device.lower() != "cpu"
+    # * Windows GPU child isolation is Whisper-only; GigaAM always runs in-process CPU.
+    windows_non_cpu = (
+        provider == STT_PROVIDER_WHISPER
+        and sys.platform.startswith("win")
+        and device.lower() != "cpu"
+    )
     if windows_non_cpu:
         first_attempt = _run_external_transcribe_isolated_attempt(
             input_path=input_path,
@@ -723,6 +795,7 @@ def external_transcribe(  # noqa: PLR0913
             diarization=diarization,
             dialog_blocks=dialog_blocks,
             work_dir=work_dir,
+            stt_provider=provider,
         )
         if first_attempt.success_text is not None:
             _emit_external_transcribe_outputs(
@@ -747,6 +820,7 @@ def external_transcribe(  # noqa: PLR0913
             diarization=diarization,
             dialog_blocks=dialog_blocks,
             work_dir=work_dir,
+            stt_provider=provider,
         )
         if retry_attempt.success_text is not None:
             _emit_external_transcribe_outputs(
@@ -766,6 +840,7 @@ def external_transcribe(  # noqa: PLR0913
         diarization=diarization,
         dialog_blocks=dialog_blocks,
         work_dir=work_dir,
+        stt_provider=provider,
         before_close=lambda text: _emit_external_transcribe_outputs(
             text=text,
             output_file=output_file,
@@ -797,11 +872,21 @@ def external_transcribe_daemon(
     workers: int = typer.Option(
         1, "--workers", min=1, max=8, help="Concurrent resident workers (default: 1)."
     ),
+    stt_provider: str = typer.Option(
+        STT_PROVIDER_WHISPER,
+        "--stt-provider",
+        help="Resident STT provider: whisper (default) or gigaam-ctc (CPU-only).",
+    ),
     whisper_model: str = typer.Option(
         "small", "--whisper-model", help="Resident Whisper model (default: small)."
     ),
     device: str = typer.Option(
-        "auto", "--device", help="Device for the resident model: auto|cuda|cpu."
+        "auto",
+        "--device",
+        help=(
+            "Device for the resident model: auto|cuda|cpu. "
+            "GigaAM CTC accepts only cpu (auto→cpu)."
+        ),
     ),
     compute_type: str = typer.Option(
         "auto", "--compute-type", help="faster-whisper compute type (default: auto)."
@@ -823,8 +908,15 @@ def external_transcribe_daemon(
 
     Only one daemon serves a given queue; a second invocation exits immediately
     when the queue is already owned. The daemon loads the model once and serves
-    every ``external-transcribe`` client through the file-based queue.
+    every ``external-transcribe`` client through the file-based queue. A live
+    daemon with a different ``--stt-provider`` is a mismatch: clients must
+    restart the singleton rather than silently using the wrong resident model.
     """
+    try:
+        provider = normalize_stt_provider(stt_provider)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    device = _resolve_external_device(stt_provider=provider, device=device)
     config = DaemonConfig(
         max_workers=workers,
         whisper_model=whisper_model,
@@ -832,6 +924,7 @@ def external_transcribe_daemon(
         compute_type=compute_type,
         language=language,
         idle_shutdown_s=idle_shutdown,
+        stt_provider=provider,
     )
     stop_event = threading.Event()
     _install_stop_handlers(stop_event)

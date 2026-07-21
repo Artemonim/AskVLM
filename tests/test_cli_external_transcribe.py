@@ -79,6 +79,7 @@ def test_external_transcribe_uses_small_and_stdout_by_default(
         "language": None,
         "device": "auto",
         "compute_type": "auto",
+        "stt_provider": "whisper",
     }
     assert calls["process_input"] == input_path
     assert calls["process_work_dir"] == work_dir
@@ -529,6 +530,132 @@ def test_external_transcribe_daemon_timeout_cpu_fallback_failure_surfaces_exit_c
     assert "ASKVLM_CLIENT_TIMEOUT" in (result.stderr or "")
 
 
+@pytest.mark.parametrize("degraded_status", ["timeout", "unavailable"])
+def test_gigaam_degraded_daemon_skips_cpu_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, degraded_status: str
+) -> None:
+    """GigaAM CTC never uses Whisper's degraded-daemon CPU fallback path."""
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    created = {"n": 0}
+
+    def _fake_client(_request: object) -> ClientOutcome:
+        return ClientOutcome(degraded_status, "", "degraded")
+
+    def _fake_create_local_pipeline(**_kwargs: object) -> object:
+        created["n"] += 1
+        msg = "pipeline must not be built for GigaAM CPU fallback"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(cli, "run_client_transcribe", _fake_client)
+    monkeypatch.setattr(cli, "_create_local_pipeline", _fake_create_local_pipeline)
+
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(input_path),
+            "--stt-provider",
+            "gigaam-ctc",
+            "--device",
+            "auto",
+        ],
+    )
+    assert created["n"] == 0
+    if degraded_status == "timeout":
+        assert result.exit_code == cli.EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT
+        assert "ASKVLM_CLIENT_TIMEOUT" in (result.stderr or "")
+    else:
+        assert result.exit_code == cli.EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT
+        assert "ASKVLM_DAEMON_UNAVAILABLE" in (result.stderr or "")
+    assert "ASKVLM_CPU_FALLBACK_FAILED" not in (result.stderr or "")
+
+
+def test_gigaam_no_daemon_on_windows_skips_child_isolation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GigaAM CTC --no-daemon on Windows stays in-process (no GPU child path)."""
+    monkeypatch.setattr(cli.sys, "platform", "win32")
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    isolated_calls = {"n": 0}
+    once_calls: list[dict[str, object]] = []
+
+    def _fake_isolated(**_kwargs: object) -> object:
+        isolated_calls["n"] += 1
+        msg = "Windows child isolation must not run for gigaam-ctc"
+        raise AssertionError(msg)
+
+    def _fake_once(**kwargs: object) -> str:
+        once_calls.append(dict(kwargs))
+        before_close = kwargs.get("before_close")
+        text = "gigaam in-process"
+        if callable(before_close):
+            before_close(text)
+        return text
+
+    monkeypatch.setattr(
+        cli, "_run_external_transcribe_isolated_attempt", _fake_isolated
+    )
+    monkeypatch.setattr(cli, "_run_external_transcribe_once", _fake_once)
+
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(input_path),
+            "--no-daemon",
+            "--stt-provider",
+            "gigaam-ctc",
+            "--device",
+            "auto",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout == "gigaam in-process\n"
+    assert isolated_calls["n"] == 0
+    assert len(once_calls) == 1
+    assert once_calls[0]["stt_provider"] == "gigaam-ctc"
+    assert once_calls[0]["device"] == "cpu"
+
+
+def test_build_external_child_command_includes_stt_provider(tmp_path: Path) -> None:
+    """Windows child argv carries ``--stt-provider`` for Whisper isolation."""
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    command = cli._build_external_child_command(  # noqa: SLF001
+        input_path=input_path,
+        whisper_model="small",
+        language=None,
+        device="cuda",
+        compute_type="auto",
+        diarization=False,
+        dialog_blocks=False,
+        work_dir=None,
+        child_result_file=tmp_path / "child_result.json",
+        stt_provider="whisper",
+    )
+    assert "--stt-provider" in command
+    idx = command.index("--stt-provider")
+    assert command[idx + 1] == "whisper"
+
+    gigaam_command = cli._build_external_child_command(  # noqa: SLF001
+        input_path=input_path,
+        whisper_model="small",
+        language=None,
+        device="cpu",
+        compute_type="auto",
+        diarization=False,
+        dialog_blocks=False,
+        work_dir=None,
+        child_result_file=tmp_path / "child_result.json",
+        stt_provider="gigaam-ctc",
+    )
+    assert "--stt-provider" in gigaam_command
+    gidx = gigaam_command.index("--stt-provider")
+    assert gigaam_command[gidx + 1] == "gigaam-ctc"
+
+
 def test_external_transcribe_daemon_command_invokes_run_daemon(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -549,3 +676,107 @@ def test_external_transcribe_daemon_command_invokes_run_daemon(
     config = captured["config"]
     assert isinstance(config, cli.DaemonConfig)
     assert config.max_workers == 2
+    assert config.stt_provider == "whisper"
+
+
+def test_external_transcribe_propagates_gigaam_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--stt-provider gigaam-ctc`` reaches LocalPipeline and forces CPU."""
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    calls: dict[str, object] = {}
+
+    class _StubPipeline:
+        def process(self, _input_media: Path, _process_work_dir: Path) -> _StubDocument:
+            return _StubDocument("gigaam ok")
+
+        def close(self, *, aggressive: bool = False) -> None:
+            calls["closed"] = aggressive
+
+    def _fake_create_local_pipeline(**kwargs: object) -> _StubPipeline:
+        calls["pipeline_kwargs"] = kwargs
+        return _StubPipeline()
+
+    monkeypatch.setattr(cli, "_create_local_pipeline", _fake_create_local_pipeline)
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(input_path),
+            "--no-daemon",
+            "--stt-provider",
+            "gigaam-ctc",
+            "--device",
+            "auto",
+            "--work-dir",
+            str(tmp_path / "work"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert result.stdout == "gigaam ok\n"
+    kwargs = calls["pipeline_kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["stt_provider"] == "gigaam-ctc"
+    assert kwargs["device"] == "cpu"
+
+
+def test_external_transcribe_rejects_gigaam_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GigaAM with ``--device cuda`` fails before pipeline construction."""
+    monkeypatch.setattr(cli.sys, "platform", "linux")
+    input_path = tmp_path / "clip.wav"
+    input_path.write_text("stub", encoding="utf-8")
+    created = {"n": 0}
+
+    def _boom(**_kwargs: object) -> object:
+        created["n"] += 1
+        msg = "should not create"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(cli, "_create_local_pipeline", _boom)
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(input_path),
+            "--no-daemon",
+            "--stt-provider",
+            "gigaam-ctc",
+            "--device",
+            "cuda",
+        ],
+    )
+    assert result.exit_code != 0
+    assert created["n"] == 0
+    assert "CPU only" in (result.output or "") or "CPU only" in (result.stderr or "")
+
+
+def test_external_transcribe_daemon_gigaam_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Daemon CLI accepts gigaam-ctc and stores it on DaemonConfig."""
+    captured: dict[str, object] = {}
+
+    def _fake_run_daemon(queue_dir: object, **kwargs: object) -> int:
+        captured["config"] = kwargs.get("config")
+        return 0
+
+    monkeypatch.setattr(cli, "run_daemon", _fake_run_daemon)
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe-daemon",
+            "--stt-provider",
+            "gigaam-ctc",
+            "--device",
+            "auto",
+        ],
+    )
+    assert result.exit_code == 0
+    config = captured["config"]
+    assert isinstance(config, cli.DaemonConfig)
+    assert config.stt_provider == "gigaam-ctc"
+    assert config.device == "cpu"

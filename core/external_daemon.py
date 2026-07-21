@@ -39,6 +39,7 @@ from core.external_queue import (
     write_heartbeat,
     write_result,
 )
+from core.stt_providers import STT_PROVIDER_WHISPER, normalize_stt_provider
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
@@ -68,6 +69,7 @@ class DaemonConfig:
         device: Device the resident model is loaded on.
         compute_type: faster-whisper compute type.
         language: Optional fixed language hint for the resident model.
+        stt_provider: Resident STT backend (``whisper`` or ``gigaam-ctc``).
 
     """
 
@@ -80,6 +82,7 @@ class DaemonConfig:
     device: str = "auto"
     compute_type: str = "auto"
     language: str | None = None
+    stt_provider: str = STT_PROVIDER_WHISPER
 
 
 def process_claimed_job(
@@ -87,6 +90,7 @@ def process_claimed_job(
     job: TranscribeJob,
     transcribe_fn: TranscribeFn,
     *,
+    expected_stt_provider: str = STT_PROVIDER_WHISPER,
     clock: Callable[[], float] = time,
 ) -> TranscribeResult:
     """Run one claimed job to a terminal result and publish it.
@@ -95,10 +99,15 @@ def process_claimed_job(
     *transcribe_fn* is captured and recorded as a terminal ``error`` (or
     ``cancelled`` when a drop/deadline was already in effect).
 
+    A job whose ``stt_provider`` does not match *expected_stt_provider* (the
+    resident daemon config) is rejected as a terminal ``error`` and never
+    handed to *transcribe_fn*, so the wrong resident model cannot run it.
+
     Args:
         queue_dir: The queue root directory.
         job: The claimed job to process.
         transcribe_fn: Callable performing the actual transcription.
+        expected_stt_provider: STT provider loaded by this daemon process.
         clock: Monotonic-ish wall-clock source (injected for tests).
 
     Returns:
@@ -121,18 +130,38 @@ def process_claimed_job(
             finished_at=clock(),
         )
     else:
+        expected = normalize_stt_provider(expected_stt_provider)
+        job_provider: str
         try:
-            result = transcribe_fn(job, should_cancel)
-        except Exception as exc:  # noqa: BLE001 - one job must never kill the daemon
-            status: ResultStatus = "cancelled" if should_cancel() else "error"
+            job_provider = normalize_stt_provider(job.stt_provider)
+        except ValueError:
+            job_provider = str(job.stt_provider)
+        if job_provider != expected:
+            # * Never run the resident model against a mismatched queue job.
             result = TranscribeResult(
                 job_id=job.job_id,
-                status=status,
+                status="error",
                 text="",
-                error_kind=type(exc).__name__,
-                error_detail=str(exc)[:500],
+                error_kind="stt_provider_mismatch",
+                error_detail=(
+                    f"job stt_provider={job_provider!r} does not match "
+                    f"resident daemon stt_provider={expected!r}"
+                )[:500],
                 finished_at=clock(),
             )
+        else:
+            try:
+                result = transcribe_fn(job, should_cancel)
+            except Exception as exc:  # noqa: BLE001 - one job must never kill the daemon
+                status: ResultStatus = "cancelled" if should_cancel() else "error"
+                result = TranscribeResult(
+                    job_id=job.job_id,
+                    status=status,
+                    text="",
+                    error_kind=type(exc).__name__,
+                    error_detail=str(exc)[:500],
+                    finished_at=clock(),
+                )
     write_result(queue_dir, result)
     return result
 
@@ -155,6 +184,8 @@ def _claim_and_submit(
     executor: ThreadPoolExecutor,
     capacity: int,
     clock: Callable[[], float],
+    *,
+    expected_stt_provider: str,
 ) -> int:
     """Claim up to *capacity* incoming jobs and submit them to the pool.
 
@@ -165,6 +196,7 @@ def _claim_and_submit(
         executor: The worker thread pool.
         capacity: Maximum number of new jobs to start this pass.
         clock: Wall-clock source passed through to job processing.
+        expected_stt_provider: Resident STT provider enforced per claimed job.
 
     Returns:
         The number of jobs newly submitted.
@@ -180,7 +212,12 @@ def _claim_and_submit(
         if job is None:
             continue
         future = executor.submit(
-            process_claimed_job, queue_dir, job, transcribe_fn, clock=clock
+            process_claimed_job,
+            queue_dir,
+            job,
+            transcribe_fn,
+            expected_stt_provider=expected_stt_provider,
+            clock=clock,
         )
         in_flight[job_id] = future
         submitted += 1
@@ -212,6 +249,7 @@ def _serve_loop(
     in_flight: dict[str, Future[TranscribeResult]] = {}
     last_activity = clock()
     last_heartbeat = 0.0
+    resident_provider = normalize_stt_provider(config.stt_provider)
     while not stop_event.is_set():
         now = clock()
         if now - last_heartbeat >= config.heartbeat_interval_s:
@@ -221,6 +259,7 @@ def _serve_loop(
                     "model": config.whisper_model,
                     "device": config.device,
                     "workers": config.max_workers,
+                    "stt_provider": resident_provider,
                 },
             )
             last_heartbeat = now
@@ -229,7 +268,13 @@ def _serve_loop(
         _reap_finished(in_flight)
         capacity = config.max_workers - len(in_flight)
         if capacity > 0 and _claim_and_submit(
-            queue_dir, transcribe_fn, in_flight, executor, capacity, clock
+            queue_dir,
+            transcribe_fn,
+            in_flight,
+            executor,
+            capacity,
+            clock,
+            expected_stt_provider=resident_provider,
         ):
             last_activity = now
         if in_flight:
@@ -272,8 +317,10 @@ def run_daemon(
     event = stop_event or threading.Event()
     worker = transcribe_fn or build_local_transcribe_fn(resolved_config)
     logger.info(
-        "external-transcribe daemon starting: queue=%s model=%s device=%s workers=%d",
+        "external-transcribe daemon starting: queue=%s provider=%s model=%s "
+        "device=%s workers=%d",
         resolved,
+        normalize_stt_provider(resolved_config.stt_provider),
         resolved_config.whisper_model,
         resolved_config.device,
         resolved_config.max_workers,
@@ -322,6 +369,7 @@ def build_local_transcribe_fn(config: DaemonConfig) -> TranscribeFn:  # pragma: 
         pipeline = LocalPipeline(
             whisper_model=config.whisper_model,
             engine="whisperx",
+            stt_provider=normalize_stt_provider(config.stt_provider),
             enable_diarization=False,
             enable_dialog_blocks=False,
             language=config.language,

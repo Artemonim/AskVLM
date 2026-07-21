@@ -37,6 +37,9 @@ pip install -e .
 # ML-зависимости (транскрипция, диаризация, LLM-форматирование)
 pip install -e .[ml]
 
+# Опционально: GigaAM Multilingual CTC (CPU-only STT для external-transcribe)
+pip install -e .[gigaam]
+
 # Инструменты разработки (линтеры, тесты)
 pip install -e .[dev]
 ```
@@ -108,9 +111,11 @@ python cli.py external-transcribe PATH_TO_MEDIA
 
 Выводит текст транскрипции в stdout. Предназначен как машинно-читаемый endpoint для внешних приложений.
 
-- Whisper-модель по умолчанию: `small`.
-- JIT-загрузка модели: Whisper загружается при старте транскрипции и выгружается перед выходом.
-- Безопасность CUDA: на Windows, если дочерний GPU-процесс падает (OOM), AskVLM автоматически повторяет на CPU в изолированном подпроцессе.
+- Провайдер по умолчанию: `--stt-provider whisper` (модель `small`).
+- Опционально: `--stt-provider gigaam-ctc` (CPU-only; extra `pip install -e .[gigaam]`; ~2.5 ГБ RAM, без VRAM).
+- JIT-загрузка модели: Whisper/GigaAM загружается при старте транскрипции и выгружается перед выходом (в `--no-daemon`; в демоне — резидентно).
+- Безопасность CUDA (Whisper): на Windows, если дочерний GPU-процесс падает (OOM), AskVLM автоматически повторяет на CPU в изолированном подпроцессе. GigaAM в CUDA/fallback/Windows GPU-isolation не участвует.
+- Живой демон с другим `--stt-provider` → unavailable/mismatch (singleton не подменяется молча; нужен рестарт демона).
 - Опциональный файловый вывод: `--output-file transcript.txt`.
 - Диаризация отключена по умолчанию (экономия VRAM).
 
@@ -170,6 +175,8 @@ core/           Ядро обработки
   ffmpeg.py             Конвертация аудио/видео через FFmpeg
   whisper_wrapper.py    Бэкенд OpenAI Whisper
   whisperx_wrapper.py   Бэкенд WhisperX (пословные таймстемпы)
+  gigaam_ctc_wrapper.py Опциональный CPU-only GigaAM Multilingual CTC
+  stt_providers.py      Идентификаторы STT-провайдеров (whisper / gigaam-ctc)
   diarization.py        Диаризация говорящих через PyAnnote
   llm_formatter.py      LLM-форматирование текста
   pipelines.py          Оркестрация LocalPipeline

@@ -37,6 +37,9 @@ pip install -e .
 # ML dependencies (transcription, diarization, LLM formatting)
 pip install -e .[ml]
 
+# Optional: GigaAM Multilingual CTC (CPU-only STT for external-transcribe)
+pip install -e .[gigaam]
+
 # Development tools (linting, testing)
 pip install -e .[dev]
 ```
@@ -108,9 +111,11 @@ python cli.py external-transcribe PATH_TO_MEDIA
 
 Prints plain transcript text to stdout. Designed as a machine-friendly endpoint for external applications.
 
-- Default Whisper model: `small`.
-- JIT model loading: Whisper loads at transcription start and unloads before exit.
-- CUDA safety: on Windows, if the GPU child process crashes (OOM), AskVLM retries on CPU automatically in an isolated subprocess.
+- Default provider: `--stt-provider whisper` (model `small`).
+- Optional: `--stt-provider gigaam-ctc` (CPU-only; extra `pip install -e .[gigaam]`; ~2.5 GB RAM, no VRAM).
+- JIT model loading: Whisper/GigaAM loads at transcription start and unloads before exit (`--no-daemon`; resident in daemon mode).
+- CUDA safety (Whisper): on Windows, if the GPU child process crashes (OOM), AskVLM retries on CPU automatically in an isolated subprocess. GigaAM does not use CUDA, Whisper CUDA fallbacks, or Windows GPU isolation.
+- A live daemon with a different `--stt-provider` → unavailable/mismatch (singleton is not silently replaced; restart the daemon).
 - Optional file output: `--output-file transcript.txt`.
 - Diarization is off by default (saves VRAM).
 
@@ -170,6 +175,8 @@ core/           Core processing modules
   ffmpeg.py             FFmpeg audio/video conversion
   whisper_wrapper.py    OpenAI Whisper backend
   whisperx_wrapper.py   WhisperX backend (word-level timestamps)
+  gigaam_ctc_wrapper.py Optional CPU-only GigaAM Multilingual CTC
+  stt_providers.py      STT provider ids (whisper / gigaam-ctc)
   diarization.py        PyAnnote speaker diarization
   llm_formatter.py      LLM-based text formatting
   pipelines.py          LocalPipeline orchestration

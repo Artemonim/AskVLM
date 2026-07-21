@@ -2,15 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING
+
+import pytest
 
 from core import external_client as ec
 from core import external_queue as q
 
 if TYPE_CHECKING:
     from pathlib import Path
-
-    import pytest
 
 
 def _request(tmp_path: Path, *, client_timeout_s: float = 5.0) -> ec.ClientRequest:
@@ -197,6 +198,76 @@ def test_ensure_daemon_running_gives_up(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("daemon_provider", "requested_provider"),
+    [
+        ("whisper", "gigaam-ctc"),
+        ("gigaam-ctc", "whisper"),
+    ],
+)
+def test_run_client_transcribe_provider_mismatch_is_unavailable(
+    tmp_path: Path,
+    daemon_provider: str,
+    requested_provider: str,
+) -> None:
+    """A live daemon with a different STT provider is an explicit mismatch."""
+    now = time.time()
+    q.ensure_layout(tmp_path)
+    q.write_heartbeat(
+        tmp_path,
+        {"model": "small", "device": "cpu", "stt_provider": daemon_provider},
+    )
+    media = tmp_path / "clip.wav"
+    media.write_text("stub", encoding="utf-8")
+    request = ec.ClientRequest(
+        input_path=media,
+        language=None,
+        device="cpu",
+        compute_type="auto",
+        whisper_model="small",
+        client_timeout_s=5.0,
+        daemon_workers=1,
+        stt_provider=requested_provider,
+    )
+
+    spawned = {"n": 0}
+
+    def _spawn() -> None:
+        spawned["n"] += 1
+
+    outcome = ec.run_client_transcribe(
+        request,
+        queue_dir=tmp_path,
+        spawn=_spawn,
+        clock=lambda: now,
+        sleeper=lambda _s: None,
+        poll_interval_s=0.0,
+    )
+    assert outcome.status == "unavailable"
+    assert "ASKVLM_DAEMON_PROVIDER_MISMATCH" in (outcome.detail or "")
+    assert daemon_provider in (outcome.detail or "")
+    assert requested_provider in (outcome.detail or "")
+    assert spawned["n"] == 0
+    assert q.list_incoming_job_ids(tmp_path) == []
+
+
+def test_build_daemon_command_includes_stt_provider(tmp_path: Path) -> None:
+    """The daemon spawn command carries ``--stt-provider``."""
+    request = ec.ClientRequest(
+        input_path=tmp_path / "a.wav",
+        language=None,
+        device="cpu",
+        compute_type="auto",
+        whisper_model="small",
+        client_timeout_s=10.0,
+        daemon_workers=1,
+        stt_provider="gigaam-ctc",
+    )
+    command = ec._build_daemon_command(request, tmp_path)  # noqa: SLF001
+    assert "--stt-provider" in command
+    assert "gigaam-ctc" in command
+
+
 def test_build_daemon_command_includes_options(tmp_path: Path) -> None:
     """The daemon command carries model, device, and queue settings."""
     request = ec.ClientRequest(
@@ -214,6 +285,8 @@ def test_build_daemon_command_includes_options(tmp_path: Path) -> None:
     assert "2" in command
     assert "--language" in command
     assert "ru" in command
+    assert "--stt-provider" in command
+    assert command[command.index("--stt-provider") + 1] == "whisper"
 
 
 def test_spawn_detached_daemon_invokes_popen(
