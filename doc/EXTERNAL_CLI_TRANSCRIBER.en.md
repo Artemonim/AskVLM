@@ -324,6 +324,25 @@ frame_paths = manifest["frames"]
 fps_used    = manifest["fps_used"]
 ```
 
+## Long media (GigaAM CTC)
+
+GigaAM Multilingual CTC at revision `ctc` rejects files strictly longer than 400000 samples (~25.0 s at 16 kHz) with `ValueError("Too long wav file, use 'transcribe_longform' method.")`. AskVLM does not use native `transcribe_longform` (pyannote VAD, needs `HF_TOKEN`).
+
+Instead of a duration gate and a short-form branch, the wrapper **always** streams the WAV in 20-second windows (in samples of the source file):
+
+- the first window shorter than 20 s (EOF) — a single `model.transcribe` call on the original path;
+- otherwise each window is written to a temporary `chunk_NNN.wav`, transcribed separately, texts joined with a space; segments carry absolute `start`/`end` (frame offset / sample rate);
+- a file of exactly 20.0 s may go through the chunked path (one temp chunk);
+- a non-standard WAV header (`wave.Error` / `EOFError`, including WAVE_FORMAT_EXTENSIBLE on Python 3.11) — one ffmpeg re-encode to PCM 16 kHz mono, then the same window loop.
+
+Cancel of a long job is cooperative: the pipeline raises `CancelledError` from `on_segment` between chunks, not inside a single model call.
+
+### `--client-timeout` for long files
+
+In daemon mode the job deadline is `submitted_at + client_timeout` (default 300 s). When it expires, the client sets a cancel marker; the daemon stops at a 20-second window boundary.
+
+Callers need to scale `--client-timeout` with media duration. For files longer than a few minutes the default may be insufficient: hours of audio on CPU GigaAM will not fit in 300 s. After timeout, cancel is cooperative between windows, not instantaneous inside `model.transcribe`.
+
 ## Notes
 
 - AskVLM stores model caches in the project's `.cache/` directory.

@@ -151,7 +151,7 @@
 
 ## 12. Расширение (post-MVP)
 
-- **GigaAM CTC (сделано для external CLI):** опциональный CPU-only `--stt-provider gigaam-ctc` в `external-transcribe` / daemon / queue; Whisper остаётся default. Возможные follow-up: GUI picker, native longform вместо внешнего чанкинга, отдельный A/B quality gate на живых RU-записях.
+- **GigaAM CTC (сделано для external CLI):** опциональный CPU-only `--stt-provider gigaam-ctc` в `external-transcribe` / daemon / queue; Whisper остаётся default. Длинные файлы: зафиксировано решение — внешний потоковый чанкинг (окна 20 с, без short-form ветки). Native `transcribe_longform` (pyannote VAD, требует `HF_TOKEN`) отложен до доказанной потребности в качестве границ. Возможные follow-up: GUI picker, отдельный A/B quality gate на живых RU-записях.
 - Блок задач по **загрузке видео из сети** (не только YouTube): унифицировать URL providers, политики temp/cleanup, UX импорта и ToS/лицензии в одном workstream, чтобы не размазывать сетевой ввод по разным §.
 - **Чат с финальным ответом Video QA**, а не только read-only просмотр: возможность уточнять ответ в диалоге (контекст: evidence, manifest, вопрос), с отдельным контрактом от subtitle-first. Опциональное подключение Filesystem MCP.
 - **Другие локальные LLM-провайдеры** помимо LM Studio: абстракция над OpenAI-compatible HTTP (base URL, auth, capabilities), плюс опциональные адаптеры (ollama, llama.cpp server, …) без смешения с subtitle pipeline.

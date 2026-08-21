@@ -2,13 +2,13 @@ r"""Lazy CPU-only wrapper for GigaAM Multilingual CTC speech-to-text.
 
 Uses the official Transformers API::
 
-    AutoModel.from_pretrained(..., revision=\"ctc\", trust_remote_code=True)
+    AutoModel.from_pretrained(..., revision="ctc", trust_remote_code=True)
     model.transcribe(path)
 
-Results are normalized to the pipeline contract ``{\"text\", \"segments\"}``.
-Upstream short-form ``.transcribe`` is limited to ~25 s; longer WAV files are
-split into fixed external chunks so long-form media still works without
-pyannote longform.
+Results are normalized to the pipeline contract ``{"text", "segments"}``.
+Upstream ``.transcribe`` rejects more than 400_000 samples (~25 s at 16 kHz).
+This wrapper streams the WAV in 20 s windows so files of any length stay
+under that limit without native ``transcribe_longform``.
 """
 
 from __future__ import annotations
@@ -18,9 +18,11 @@ import gc as _gc
 import importlib
 import logging
 import tempfile
+import time
 import wave
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NoReturn
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
 from core.stt_providers import (
     GIGAAM_HF_REPO_ID,
@@ -33,9 +35,10 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# * Upstream short-form limit for model.transcribe (~25 s).
-_SHORTFORM_LIMIT_S = 25.0
-_CHUNK_S = 20.0
+# * Window length in seconds of the source file's sample rate. After the model
+# * resamples to 16 kHz, 20 s is 320_000 samples — below the 400_000 hard cap.
+_WINDOW_S = 20.0
+_CHUNK_LOG_INTERVAL = 10
 
 _MISSING_EXTRA_MSG = (
     "GigaAM Multilingual CTC requires the AskVLM ML extra "
@@ -43,6 +46,56 @@ _MISSING_EXTRA_MSG = (
     "(torch/torchaudio 2.10 via run.ps1/build.ps1 CUDA ensure, transformers 5, "
     "hydra-core, omegaconf, sentencepiece, pyannote.audio)."
 )
+
+
+class _UnparseableWavError(Exception):
+    """Stdlib ``wave`` cannot stream this file (bad rate or header fields)."""
+
+
+class _WavFormat(NamedTuple):
+    """PCM stream parameters used by the 20 s window loop."""
+
+    rate: int
+    sample_width: int
+    channels: int
+    window_frames: int
+
+
+@dataclass(slots=True)
+class _TranscriptAccumulator:
+    """Collects window transcripts, segment callbacks, and optional progress."""
+
+    on_segment: Callable[[dict[str, Any]], None] | None
+    progress: Callable[[float, str], None] | None
+    duration_s: float | None
+    segments_out: list[dict[str, Any]] = field(default_factory=list)
+    text_parts: list[str] = field(default_factory=list)
+
+    def emit(self, start: float, end: float, text: str) -> None:
+        """Append one window segment and notify optional callers.
+
+        Args:
+            start: Absolute window start in seconds.
+            end: Absolute window end in seconds.
+            text: Transcript text for this window.
+
+        """
+        seg = {"start": start, "end": end, "text": text}
+        self.segments_out.append(seg)
+        if text:
+            self.text_parts.append(text)
+        if self.on_segment is not None:
+            self.on_segment(seg)
+        duration_s = self.duration_s
+        if self.progress is not None and duration_s is not None and duration_s > 0:
+            self.progress(max(0.0, min(1.0, end / duration_s)), "transcribe")
+
+    def as_result(self) -> dict[str, Any]:
+        """Return the pipeline ``{text, segments}`` mapping."""
+        return {
+            "text": " ".join(self.text_parts).strip(),
+            "segments": self.segments_out,
+        }
 
 
 def _raise_missing_extra(exc: BaseException) -> NoReturn:
@@ -64,6 +117,86 @@ def _raise_missing_extra(exc: BaseException) -> NoReturn:
         detail = ""
     msg = f"{_MISSING_EXTRA_MSG}{detail}"
     raise RuntimeError(msg) from exc
+
+
+def _pcm_frame_count(pcm: bytes, *, sample_width: int, channels: int) -> int:
+    """Return the number of complete PCM frames in *pcm*."""
+    frame_size = sample_width * channels
+    if frame_size <= 0:
+        return 0
+    return len(pcm) // frame_size
+
+
+def _header_duration_seconds(reader: wave.Wave_read) -> float | None:
+    """Best-effort duration from the WAV header of an already open reader."""
+    try:
+        n_frames = reader.getnframes()
+        rate = reader.getframerate()
+    except (wave.Error, EOFError, OSError):
+        return None
+    if rate <= 0 or n_frames < 0:
+        return None
+    return float(n_frames) / float(rate)
+
+
+def _format_from_reader(reader: wave.Wave_read) -> _WavFormat:
+    """Read stream format or mark the WAV as unparseable.
+
+    Raises:
+        _UnparseableWavError: When sample rate, width, or channel count is invalid.
+
+    """
+    rate = reader.getframerate()
+    sample_width = reader.getsampwidth()
+    channels = reader.getnchannels()
+    if rate <= 0 or sample_width < 1 or channels < 1:
+        msg = (
+            f"WAV header is not streamable (rate={rate}, "
+            f"sample_width={sample_width}, channels={channels})"
+        )
+        raise _UnparseableWavError(msg)
+    return _WavFormat(
+        rate=rate,
+        sample_width=sample_width,
+        channels=channels,
+        window_frames=int(_WINDOW_S * rate),
+    )
+
+
+def _write_pcm_wav(
+    path: Path,
+    pcm: bytes,
+    *,
+    rate: int,
+    sample_width: int,
+    channels: int,
+) -> None:
+    """Write a PCM WAV with the same format as the source stream."""
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(channels)
+        writer.setsampwidth(sample_width)
+        writer.setframerate(rate)
+        writer.writeframes(pcm)
+
+
+def _log_chunk_progress(
+    *,
+    idx: int,
+    offset_s: float,
+    started_at: float,
+    processed_s: float,
+) -> None:
+    """Log window progress: info on the first and every 10th window, debug otherwise."""
+    elapsed_s = time.perf_counter() - started_at
+    rtf = elapsed_s / processed_s if processed_s > 0 else 0.0
+    log = logger.info if idx % _CHUNK_LOG_INTERVAL == 0 else logger.debug
+    log(
+        "GigaAM CTC window idx=%s offset_s=%.2f elapsed_s=%.2f rtf=%.2f",
+        idx,
+        offset_s,
+        elapsed_s,
+        rtf,
+    )
 
 
 class GigaAMCtcWrapper:
@@ -156,49 +289,6 @@ class GigaAMCtcWrapper:
         self.unload(safe=False)
 
     @staticmethod
-    def _wav_duration_seconds(path: Path) -> float:
-        """Return WAV duration in seconds via the stdlib wave module.
-
-        Args:
-            path: Path to a PCM WAV file.
-
-        Returns:
-            Duration in seconds (0.0 when the file has no frames).
-
-        """
-        with wave.open(str(path), "rb") as reader:
-            frames = reader.getnframes()
-            rate = reader.getframerate()
-        if rate <= 0:
-            return 0.0
-        return float(frames) / float(rate)
-
-    @staticmethod
-    def _slice_wav(src: Path, dst: Path, start_s: float, dur_s: float) -> None:
-        """Cut a mono/stereo PCM WAV slice into *dst*.
-
-        Args:
-            src: Source WAV path.
-            dst: Destination WAV path.
-            start_s: Slice start in seconds.
-            dur_s: Slice duration in seconds.
-
-        """
-        with wave.open(str(src), "rb") as reader:
-            rate = reader.getframerate()
-            width = reader.getsampwidth()
-            channels = reader.getnchannels()
-            start_frame = int(start_s * rate)
-            n_frames = max(0, int(dur_s * rate))
-            reader.setpos(start_frame)
-            frames = reader.readframes(n_frames)
-        with wave.open(str(dst), "wb") as writer:
-            writer.setnchannels(channels)
-            writer.setsampwidth(width)
-            writer.setframerate(rate)
-            writer.writeframes(frames)
-
-    @staticmethod
     def _coerce_text(raw: object) -> str:
         """Normalize a GigaAM ``.transcribe`` return value to plain text.
 
@@ -217,7 +307,7 @@ class GigaAMCtcWrapper:
         return str(raw).strip()
 
     def _transcribe_file(self, audio_path: Path) -> str:
-        """Run one short-form ``model.transcribe`` call.
+        """Run one window-sized ``model.transcribe`` call.
 
         Args:
             audio_path: Audio file path accepted by GigaAM.
@@ -237,6 +327,141 @@ class GigaAMCtcWrapper:
         except ImportError as exc:
             _raise_missing_extra(exc)
 
+    def _fast_path_original(
+        self,
+        audio_path: Path,
+        *,
+        n_frames: int,
+        rate: int,
+        acc: _TranscriptAccumulator,
+    ) -> dict[str, Any]:
+        """Transcribe a file shorter than one window via the original path."""
+        started_at = time.perf_counter()
+        text = self._transcribe_file(audio_path)
+        actual_s = n_frames / float(rate)
+        acc.emit(0.0, actual_s, text)
+        _log_chunk_progress(
+            idx=0,
+            offset_s=0.0,
+            started_at=started_at,
+            processed_s=actual_s,
+        )
+        return acc.as_result()
+
+    def _transcribe_chunked_windows(
+        self,
+        reader: wave.Wave_read,
+        *,
+        first_pcm: bytes,
+        first_frames: int,
+        fmt: _WavFormat,
+        acc: _TranscriptAccumulator,
+    ) -> dict[str, Any]:
+        """Transcribe successive 20 s windows from an already open reader."""
+        started_at = time.perf_counter()
+        with tempfile.TemporaryDirectory(prefix="askvlm-gigaam-") as tmp:
+            work = Path(tmp)
+            pcm = first_pcm
+            n_frames = first_frames
+            start_frame = 0
+            idx = 0
+            while pcm:
+                chunk_path = work / f"chunk_{idx:03d}.wav"
+                _write_pcm_wav(
+                    chunk_path,
+                    pcm,
+                    rate=fmt.rate,
+                    sample_width=fmt.sample_width,
+                    channels=fmt.channels,
+                )
+                piece = self._transcribe_file(chunk_path)
+                start_s = start_frame / float(fmt.rate)
+                end_s = (start_frame + n_frames) / float(fmt.rate)
+                acc.emit(start_s, end_s, piece)
+                _log_chunk_progress(
+                    idx=idx,
+                    offset_s=start_s,
+                    started_at=started_at,
+                    processed_s=end_s,
+                )
+                start_frame += n_frames
+                idx += 1
+                pcm = reader.readframes(fmt.window_frames)
+                n_frames = _pcm_frame_count(
+                    pcm,
+                    sample_width=fmt.sample_width,
+                    channels=fmt.channels,
+                )
+            return acc.as_result()
+
+    def _stream_transcribe(
+        self,
+        audio_path: Path,
+        *,
+        on_segment: Callable[[dict[str, Any]], None] | None,
+        progress: Callable[[float, str], None] | None,
+    ) -> dict[str, Any]:
+        """Run the unified 20 s window loop on *audio_path*."""
+        with wave.open(str(audio_path), "rb") as reader:
+            fmt = _format_from_reader(reader)
+            acc = _TranscriptAccumulator(
+                on_segment=on_segment,
+                progress=progress,
+                duration_s=_header_duration_seconds(reader),
+            )
+            first_pcm = reader.readframes(fmt.window_frames)
+            first_frames = _pcm_frame_count(
+                first_pcm,
+                sample_width=fmt.sample_width,
+                channels=fmt.channels,
+            )
+            # * First window hitting EOF means the whole file is shorter than 20 s.
+            if first_frames < fmt.window_frames:
+                return self._fast_path_original(
+                    audio_path,
+                    n_frames=first_frames,
+                    rate=fmt.rate,
+                    acc=acc,
+                )
+            return self._transcribe_chunked_windows(
+                reader,
+                first_pcm=first_pcm,
+                first_frames=first_frames,
+                fmt=fmt,
+                acc=acc,
+            )
+
+    def _stream_after_reencode(
+        self,
+        audio_path: Path,
+        *,
+        on_segment: Callable[[dict[str, Any]], None] | None,
+        progress: Callable[[float, str], None] | None,
+    ) -> dict[str, Any]:
+        """Re-encode *audio_path* once to PCM WAV and retry the window loop."""
+        # * Lazy import so `import core.gigaam_ctc_wrapper` does not require ffmpeg-python.
+        from core.ffmpeg import extract_audio  # noqa: PLC0415
+
+        logger.warning(
+            "GigaAM CTC could not stream %s as WAV; re-encoding to PCM 16 kHz mono",
+            audio_path,
+        )
+        with tempfile.TemporaryDirectory(prefix="askvlm-gigaam-reencode-") as tmp:
+            dst = Path(tmp) / "reencoded.wav"
+            extract_audio(audio_path, dst, sample_rate=16000, channels=1)
+            try:
+                return self._stream_transcribe(
+                    dst,
+                    on_segment=on_segment,
+                    progress=progress,
+                )
+            except (wave.Error, EOFError, _UnparseableWavError) as exc:
+                msg = (
+                    "GigaAM CTC could not parse WAV after re-encoding to "
+                    "PCM 16-bit 16 kHz mono"
+                )
+                raise RuntimeError(msg) from exc
+
     def transcribe(
         self,
         audio_path: Path,
@@ -251,6 +476,11 @@ class GigaAMCtcWrapper:
         accepted here. *language* is ignored: GigaAM Multilingual CTC does not
         take a language hint on the official short-form API.
 
+        The WAV is streamed in 20 s windows. A file shorter than one window is
+        sent to the model on the original path; longer files are split into
+        temporary window WAVs. Stdlib ``wave`` failures trigger one ffmpeg
+        re-encode and a single retry.
+
         Args:
             audio_path: Prepared WAV (or other path accepted by GigaAM).
             language: Unused; retained for call-site compatibility.
@@ -261,35 +491,15 @@ class GigaAMCtcWrapper:
             Mapping with ``text`` and ``segments`` (list of start/end/text).
 
         """
-        duration_s = self._wav_duration_seconds(audio_path)
-        segments_out: list[dict[str, Any]] = []
-        text_parts: list[str] = []
-
-        def _emit(start: float, end: float, text: str) -> None:
-            seg = {"start": start, "end": end, "text": text}
-            segments_out.append(seg)
-            if text:
-                text_parts.append(text)
-            if on_segment is not None:
-                on_segment(seg)
-            if progress is not None and duration_s > 0:
-                progress(max(0.0, min(1.0, end / duration_s)), "transcribe")
-
-        if duration_s <= _SHORTFORM_LIMIT_S + 0.05:
-            text = self._transcribe_file(audio_path)
-            _emit(0.0, duration_s, text)
-        else:
-            with tempfile.TemporaryDirectory(prefix="askvlm-gigaam-") as tmp:
-                work = Path(tmp)
-                start = 0.0
-                idx = 0
-                while start < duration_s - 1e-6:
-                    dur = min(_CHUNK_S, duration_s - start)
-                    chunk_path = work / f"chunk_{idx:03d}.wav"
-                    self._slice_wav(audio_path, chunk_path, start, dur)
-                    piece = self._transcribe_file(chunk_path)
-                    _emit(start, start + dur, piece)
-                    start += _CHUNK_S
-                    idx += 1
-
-        return {"text": " ".join(text_parts).strip(), "segments": segments_out}
+        try:
+            return self._stream_transcribe(
+                audio_path,
+                on_segment=on_segment,
+                progress=progress,
+            )
+        except (wave.Error, EOFError, _UnparseableWavError):
+            return self._stream_after_reencode(
+                audio_path,
+                on_segment=on_segment,
+                progress=progress,
+            )

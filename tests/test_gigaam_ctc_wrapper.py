@@ -3,31 +3,111 @@
 from __future__ import annotations
 
 import wave
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 
 import pytest
 
+from core import gigaam_ctc_wrapper as gigaam_mod
 from core.gigaam_ctc_wrapper import (
     _MISSING_EXTRA_MSG,
+    _WINDOW_S,
     GigaAMCtcWrapper,
     _raise_missing_extra,
 )
 from core.stt_providers import GIGAAM_HF_REPO_ID, GIGAAM_HF_REVISION
 
-if TYPE_CHECKING:
-    from pathlib import Path
+
+def _write_pcm_silence(
+    path: Path,
+    *,
+    n_frames: int,
+    sample_rate: int = 16000,
+    channels: int = 1,
+) -> None:
+    """Write a 16-bit PCM WAV with the given frame count, rate, and channel count."""
+    frame = b"\x00\x00" * channels
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(channels)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(frame * n_frames)
 
 
 def _write_silent_wav(
-    path: Path, *, duration_s: float, sample_rate: int = 16000
+    path: Path,
+    *,
+    duration_s: float,
+    sample_rate: int = 16000,
+    channels: int = 1,
 ) -> None:
-    """Write a mono 16-bit silent WAV of the requested duration."""
-    n_frames = int(duration_s * sample_rate)
-    with wave.open(str(path), "wb") as writer:
-        writer.setnchannels(1)
-        writer.setsampwidth(2)
-        writer.setframerate(sample_rate)
-        writer.writeframes(b"\x00\x00" * n_frames)
+    """Write a 16-bit silent WAV of the requested duration."""
+    _write_pcm_silence(
+        path,
+        n_frames=int(duration_s * sample_rate),
+        sample_rate=sample_rate,
+        channels=channels,
+    )
+
+
+def _write_zero_rate_wav(path: Path, *, n_frames: int = 16000) -> None:
+    """Write a PCM WAV whose header sample rate is 0 (unparseable for streaming)."""
+    _write_pcm_silence(path, n_frames=n_frames, sample_rate=16000)
+    data = bytearray(path.read_bytes())
+    # * PCM WAV sample rate is a little-endian uint32 at offset 24.
+    data[24:28] = b"\x00\x00\x00\x00"
+    path.write_bytes(data)
+
+
+def _wav_duration_s(path: str | Path) -> float:
+    """Return PCM WAV duration in seconds via stdlib wave."""
+    with wave.open(str(path), "rb") as reader:
+        rate = reader.getframerate()
+        frames = reader.getnframes()
+    if rate <= 0:
+        return 0.0
+    return frames / float(rate)
+
+
+def _patch_gigaam_model(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    texts: list[str] | None = None,
+    transcribed_paths: list[str] | None = None,
+    transcribed_durations: list[float] | None = None,
+) -> None:
+    """Install a fake GigaAM model that records paths and rejects long windows."""
+    pieces = list(texts) if texts is not None else None
+
+    class _FakeModel:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def eval(self) -> _FakeModel:
+            return self
+
+        def transcribe(self, path: str) -> str:
+            if transcribed_paths is not None:
+                transcribed_paths.append(path)
+            duration_s = _wav_duration_s(path)
+            # * No streaming path may send the model more than one 20 s window.
+            assert duration_s <= _WINDOW_S
+            if transcribed_durations is not None:
+                transcribed_durations.append(duration_s)
+            text = f"chunk-{self.n}" if pieces is None else pieces[self.n]
+            self.n += 1
+            return text
+
+    class _FakeAutoModel:
+        @staticmethod
+        def from_pretrained(*_args: object, **_kwargs: object) -> _FakeModel:
+            return _FakeModel()
+
+    monkeypatch.setattr(
+        GigaAMCtcWrapper,
+        "_ensure_deps",
+        lambda _self: (_FakeAutoModel, object()),
+    )
 
 
 def test_gigaam_rejects_cuda_before_load() -> None:
@@ -45,7 +125,7 @@ def test_gigaam_auto_resolves_to_cpu() -> None:
 def test_gigaam_transcribe_normalizes_text_and_segments(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Short-form results become ``{text, segments}`` and unload clears the model."""
+    """Short-file results become ``{text, segments}`` and unload clears the model."""
     audio = tmp_path / "short.wav"
     _write_silent_wav(audio, duration_s=1.0)
     calls: dict[str, Any] = {}
@@ -77,6 +157,7 @@ def test_gigaam_transcribe_normalizes_text_and_segments(
     assert len(result["segments"]) == 1
     assert result["segments"][0]["text"] == "hello world"
     assert emitted[0]["text"] == "hello world"
+    assert calls["path"] == str(audio)
     assert calls["repo_id"] == GIGAAM_HF_REPO_ID
     assert calls["kwargs"]["revision"] == GIGAAM_HF_REVISION
     assert calls["kwargs"]["trust_remote_code"] is True
@@ -86,41 +167,295 @@ def test_gigaam_transcribe_normalizes_text_and_segments(
     assert wrapper._model is None  # noqa: SLF001
 
 
-def test_gigaam_chunking_for_long_audio(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("duration_s", [0.5, 19.9])
+def test_gigaam_fast_path_uses_original_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, duration_s: float
 ) -> None:
-    """Audio longer than the short-form limit is split into timed segments."""
+    """Files shorter than 20 s call the model once on the original path."""
+    audio = tmp_path / "short.wav"
+    _write_silent_wav(audio, duration_s=duration_s)
+    transcribed: list[str] = []
+    _patch_gigaam_model(monkeypatch, texts=["hello"], transcribed_paths=transcribed)
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert transcribed == [str(audio)]
+    assert result["text"] == "hello"
+    assert len(result["segments"]) == 1
+    assert result["segments"][0]["start"] == 0.0
+    assert result["segments"][0]["end"] == pytest.approx(duration_s)
+    assert result["segments"][0]["text"] == "hello"
+
+
+@pytest.mark.parametrize(
+    ("duration_s", "expected_starts"),
+    [
+        (20.0, [0.0]),
+        (20.1, [0.0, 20.0]),
+        (24.9, [0.0, 20.0]),
+        (25.0, [0.0, 20.0]),
+        (25.05, [0.0, 20.0]),
+        (45.0, [0.0, 20.0, 40.0]),
+    ],
+)
+def test_gigaam_chunked_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    duration_s: float,
+    expected_starts: list[float],
+) -> None:
+    """Files at or above 20 s are split into ≤20 s windows with absolute offsets."""
     audio = tmp_path / "long.wav"
-    _write_silent_wav(audio, duration_s=45.0)
-    pieces = ["one", "two", "three"]
-
-    class _FakeModel:
-        def __init__(self) -> None:
-            self.n = 0
-
-        def eval(self) -> _FakeModel:
-            return self
-
-        def transcribe(self, _path: str) -> str:
-            text = pieces[self.n]
-            self.n += 1
-            return text
-
-    class _FakeAutoModel:
-        @staticmethod
-        def from_pretrained(*_args: object, **_kwargs: object) -> _FakeModel:
-            return _FakeModel()
-
-    monkeypatch.setattr(
-        GigaAMCtcWrapper, "_ensure_deps", lambda _self: (_FakeAutoModel, object())
+    _write_silent_wav(audio, duration_s=duration_s)
+    texts = [f"p{idx}" for idx in range(len(expected_starts))]
+    transcribed: list[str] = []
+    durations: list[float] = []
+    _patch_gigaam_model(
+        monkeypatch,
+        texts=texts,
+        transcribed_paths=transcribed,
+        transcribed_durations=durations,
     )
     wrapper = GigaAMCtcWrapper(device="cpu")
     result = wrapper.transcribe(audio)
-    assert result["text"] == "one two three"
-    assert len(result["segments"]) == 3
+    assert result["text"] == " ".join(texts)
+    assert [seg["start"] for seg in result["segments"]] == expected_starts
+    assert result["segments"][-1]["end"] == pytest.approx(duration_s)
+    assert [seg["text"] for seg in result["segments"]] == texts
+    assert str(audio) not in transcribed
+    assert len(transcribed) == len(expected_starts)
+    assert len(durations) == len(expected_starts)
+    for full_window_s in durations[:-1]:
+        assert full_window_s == pytest.approx(_WINDOW_S)
+    remainder_s = duration_s - _WINDOW_S * (len(durations) - 1)
+    assert durations[-1] == pytest.approx(remainder_s)
+    for chunk_path in transcribed:
+        assert not Path(chunk_path).exists()
+
+
+def test_gigaam_progress_uses_header_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Progress fraction is derived from the WAV header when it is available."""
+    audio = tmp_path / "short.wav"
+    _write_silent_wav(audio, duration_s=1.0)
+    _patch_gigaam_model(monkeypatch, texts=["ok"])
+    seen: list[tuple[float, str]] = []
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    wrapper.transcribe(audio, progress=lambda frac, stage: seen.append((frac, stage)))
+    assert seen
+    assert seen[-1][0] == pytest.approx(1.0)
+    assert seen[-1][1] == "transcribe"
+
+
+def test_gigaam_unreadable_wav_reencodes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``wave.Error`` on the original file triggers one ffmpeg re-encode."""
+    audio = tmp_path / "bad.wav"
+    audio.write_bytes(b"not a wav")
+    extract_calls: list[tuple[Path, Path, int, int]] = []
+
+    def _fake_extract(
+        src: str | Path,
+        dst: str | Path,
+        sample_rate: int = 16000,
+        channels: int = 1,
+    ) -> None:
+        extract_calls.append((Path(src), Path(dst), sample_rate, channels))
+        _write_silent_wav(Path(dst), duration_s=1.0)
+
+    monkeypatch.setattr("core.ffmpeg.extract_audio", _fake_extract)
+    transcribed: list[str] = []
+    _patch_gigaam_model(monkeypatch, texts=["reencoded"], transcribed_paths=transcribed)
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert result["text"] == "reencoded"
+    assert len(extract_calls) == 1
+    assert extract_calls[0][0] == audio
+    assert extract_calls[0][2] == 16000
+    assert extract_calls[0][3] == 1
+    assert transcribed == [str(extract_calls[0][1])]
+
+
+def test_gigaam_reencode_still_unreadable_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second parse failure after re-encode becomes a clear RuntimeError."""
+    audio = tmp_path / "bad.wav"
+    audio.write_bytes(b"not a wav")
+
+    def _fake_extract(
+        src: str | Path,
+        dst: str | Path,
+        sample_rate: int = 16000,
+        channels: int = 1,
+    ) -> None:
+        Path(dst).write_bytes(b"still not a wav")
+
+    monkeypatch.setattr("core.ffmpeg.extract_audio", _fake_extract)
+    _patch_gigaam_model(monkeypatch, texts=["unused"])
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    with pytest.raises(
+        RuntimeError, match="could not parse WAV after re-encoding"
+    ) as ei:
+        wrapper.transcribe(audio)
+    assert "Too long wav file" not in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    ("sample_rate", "channels"),
+    [
+        (16000, 2),
+        (44100, 1),
+        (48000, 1),
+    ],
+)
+@pytest.mark.parametrize(
+    ("duration_s", "expected_starts"),
+    [
+        (1.0, [0.0]),
+        (21.0, [0.0, 20.0]),
+    ],
+)
+def test_gigaam_nonstandard_wav_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    sample_rate: int,
+    channels: int,
+    duration_s: float,
+    expected_starts: list[float],
+) -> None:
+    """Stereo 16 kHz and mono 44.1/48 kHz follow the same 20 s window rule."""
+    audio = tmp_path / "nonstd.wav"
+    _write_silent_wav(
+        audio, duration_s=duration_s, sample_rate=sample_rate, channels=channels
+    )
+    texts = [f"p{idx}" for idx in range(len(expected_starts))]
+    transcribed: list[str] = []
+    durations: list[float] = []
+    _patch_gigaam_model(
+        monkeypatch,
+        texts=texts,
+        transcribed_paths=transcribed,
+        transcribed_durations=durations,
+    )
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert [seg["start"] for seg in result["segments"]] == expected_starts
+    assert result["segments"][-1]["end"] == pytest.approx(duration_s)
+    assert len(transcribed) == len(expected_starts)
+    if len(expected_starts) > 1:
+        assert str(audio) not in transcribed
+        assert durations[0] == pytest.approx(_WINDOW_S)
+        assert durations[-1] == pytest.approx(duration_s - _WINDOW_S)
+    else:
+        assert transcribed == [str(audio)]
+        assert durations == [pytest.approx(duration_s)]
+
+
+@pytest.mark.parametrize("n_frames", [0, 1])
+def test_gigaam_tiny_wav_fast_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_frames: int
+) -> None:
+    """Empty and 1-frame WAVs take the original-path fast path."""
+    audio = tmp_path / "tiny.wav"
+    _write_pcm_silence(audio, n_frames=n_frames)
+    transcribed: list[str] = []
+    _patch_gigaam_model(monkeypatch, texts=["tiny"], transcribed_paths=transcribed)
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert transcribed == [str(audio)]
+    assert result["text"] == "tiny"
+    assert len(result["segments"]) == 1
     assert result["segments"][0]["start"] == 0.0
-    assert result["segments"][1]["start"] == 20.0
-    assert result["segments"][2]["start"] == 40.0
+    assert result["segments"][0]["end"] == pytest.approx(n_frames / 16000.0)
+
+
+def test_gigaam_zero_rate_wav_reencodes_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``getframerate() == 0`` raises ``_UnparseableWavError`` and re-encodes once."""
+    audio = tmp_path / "zero_rate.wav"
+    _write_zero_rate_wav(audio)
+    extract_calls: list[tuple[Path, Path, int, int]] = []
+
+    def _fake_extract(
+        src: str | Path,
+        dst: str | Path,
+        sample_rate: int = 16000,
+        channels: int = 1,
+    ) -> None:
+        extract_calls.append((Path(src), Path(dst), sample_rate, channels))
+        _write_silent_wav(Path(dst), duration_s=1.0)
+
+    monkeypatch.setattr("core.ffmpeg.extract_audio", _fake_extract)
+    transcribed: list[str] = []
+    _patch_gigaam_model(monkeypatch, texts=["reencoded"], transcribed_paths=transcribed)
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert result["text"] == "reencoded"
+    assert len(extract_calls) == 1
+    assert extract_calls[0][0] == audio
+    assert extract_calls[0][2] == 16000
+    assert extract_calls[0][3] == 1
+    assert transcribed == [str(extract_calls[0][1])]
+
+
+def test_gigaam_zero_rate_reencode_still_unparseable_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A second ``_UnparseableWavError`` after re-encode becomes RuntimeError."""
+    audio = tmp_path / "zero_rate.wav"
+    _write_zero_rate_wav(audio)
+
+    def _fake_extract(
+        src: str | Path,
+        dst: str | Path,
+        sample_rate: int = 16000,
+        channels: int = 1,
+    ) -> None:
+        _write_zero_rate_wav(Path(dst))
+
+    monkeypatch.setattr("core.ffmpeg.extract_audio", _fake_extract)
+    _patch_gigaam_model(monkeypatch, texts=["unused"])
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    with pytest.raises(
+        RuntimeError, match="could not parse WAV after re-encoding"
+    ) as ei:
+        wrapper.transcribe(audio)
+    assert "Too long wav file" not in str(ei.value)
+
+
+def test_gigaam_wrapper_import_does_not_bind_extract_audio() -> None:
+    """Importing the wrapper does not require a module-level ffmpeg binding."""
+    assert getattr(gigaam_mod, "extract_audio", None) is None
+
+
+def test_gigaam_cancel_stops_before_third_chunk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``on_segment`` raising on the second window skips the remaining windows."""
+    audio = tmp_path / "long.wav"
+    _write_silent_wav(audio, duration_s=45.0)
+    transcribed: list[str] = []
+    _patch_gigaam_model(
+        monkeypatch,
+        texts=["one", "two", "three"],
+        transcribed_paths=transcribed,
+    )
+
+    class _CancelError(RuntimeError):
+        """Simulates pipeline CancelledError between windows."""
+
+    def _on_segment(_seg: dict[str, Any]) -> None:
+        if len(transcribed) >= 2:
+            msg = "Canceled"
+            raise _CancelError(msg)
+
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    with pytest.raises(_CancelError, match="Canceled"):
+        wrapper.transcribe(audio, on_segment=_on_segment)
+    assert len(transcribed) == 2
 
 
 def test_gigaam_missing_extra_error(monkeypatch: pytest.MonkeyPatch) -> None:
