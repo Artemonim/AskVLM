@@ -68,8 +68,9 @@ class TranscribeJob:
         submitted_at: Unix timestamp when the job was submitted.
         deadline_at: Unix timestamp after which the job may be dropped, or
             ``None`` for no deadline.
-        stt_provider: STT backend id (``whisper`` or ``gigaam-ctc``). Missing
-            values in older queued jobs default to Whisper.
+        stt_provider: STT backend id (``whisper``, ``gigaam-ctc``, or
+            ``gigaam-e2e-ctc``). Missing values in older queued jobs default
+            to Whisper.
 
     """
 

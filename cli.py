@@ -21,8 +21,8 @@ from core.external_client import ClientRequest, run_client_transcribe
 from core.external_daemon import DaemonConfig, run_daemon
 from core.stt_providers import (
     STT_PROVIDER_CHOICES,
-    STT_PROVIDER_GIGAAM_CTC,
     STT_PROVIDER_WHISPER,
+    is_cpu_only_gigaam_provider,
     normalize_stt_provider,
     resolve_gigaam_device,
 )
@@ -145,7 +145,7 @@ def _resolve_external_device(*, stt_provider: str, device: str) -> str:
         typer.BadParameter: When GigaAM is requested with a non-CPU device.
 
     """
-    if stt_provider != STT_PROVIDER_GIGAAM_CTC:
+    if not is_cpu_only_gigaam_provider(stt_provider):
         return device
     try:
         return resolve_gigaam_device(device)
@@ -373,8 +373,8 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
 
     When the daemon is reachable-but-degraded (client timeout or no daemon) on a
     GPU-seeded Whisper request, a bounded in-process CPU fallback is attempted
-    before the degraded exit code is surfaced. GigaAM CTC is CPU-only and is
-    never used as a CUDA fallback path.
+    before the degraded exit code is surfaced. GigaAM providers are CPU-only and
+    are never used as a CUDA fallback path.
 
     Args:
         input_path: Media file to transcribe.
@@ -386,7 +386,8 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
         daemon_workers: Worker count requested when spawning a new daemon.
         output_file: Optional plain-text file to also write.
         stdout: Whether to echo the transcript to stdout.
-        stt_provider: STT backend id (``whisper`` or ``gigaam-ctc``).
+        stt_provider: STT backend id (``whisper``, ``gigaam-ctc``, or
+            ``gigaam-e2e-ctc``).
         cpu_fallback: Optional callable performing one in-process CPU
             transcription, used only on a degraded GPU-seeded Whisper outcome.
 
@@ -605,8 +606,8 @@ def external_transcribe(  # noqa: PLR0913
         STT_PROVIDER_WHISPER,
         "--stt-provider",
         help=(
-            "Speech-to-text provider: whisper (default) or gigaam-ctc "
-            "(CPU-only; included in .[ml])."
+            "Speech-to-text provider: whisper (default), gigaam-ctc, or "
+            "gigaam-e2e-ctc (GigaAM providers are CPU-only; included in .[ml])."
         ),
     ),
     language: Optional[str] = typer.Option(
@@ -616,15 +617,15 @@ def external_transcribe(  # noqa: PLR0913
         "auto",
         help=(
             "Preferred device: auto|cuda|cpu. When CUDA memory is exhausted, "
-            "Whisper retries on CPU automatically. GigaAM CTC accepts only cpu "
-            "(auto resolves to cpu)."
+            "Whisper retries on CPU automatically. GigaAM providers accept only "
+            "cpu (auto resolves to cpu)."
         ),
     ),
     compute_type: str = typer.Option(
         "auto",
         help=(
             "Compute type: auto|float16|int8|int8_float16. 'auto' uses float16 "
-            "on CUDA and int8 on CPU. Ignored for gigaam-ctc."
+            "on CUDA and int8 on CPU. Ignored for GigaAM providers."
         ),
     ),
     diarization: bool = typer.Option(
@@ -875,7 +876,10 @@ def external_transcribe_daemon(
     stt_provider: str = typer.Option(
         STT_PROVIDER_WHISPER,
         "--stt-provider",
-        help="Resident STT provider: whisper (default) or gigaam-ctc (CPU-only).",
+        help=(
+            "Resident STT provider: whisper (default), gigaam-ctc, or "
+            "gigaam-e2e-ctc (GigaAM providers are CPU-only)."
+        ),
     ),
     whisper_model: str = typer.Option(
         "small", "--whisper-model", help="Resident Whisper model (default: small)."
@@ -885,7 +889,7 @@ def external_transcribe_daemon(
         "--device",
         help=(
             "Device for the resident model: auto|cuda|cpu. "
-            "GigaAM CTC accepts only cpu (auto→cpu)."
+            "GigaAM providers accept only cpu (auto→cpu)."
         ),
     ),
     compute_type: str = typer.Option(

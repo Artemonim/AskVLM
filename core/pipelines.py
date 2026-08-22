@@ -15,8 +15,9 @@ from .ffmpeg import get_media_duration_seconds
 from .llm_formatter import LLMFormatter
 from .settings import configure_ml_caches, get_project_cache_dir
 from .stt_providers import (
-    STT_PROVIDER_GIGAAM_CTC,
+    STT_PROVIDER_GIGAAM_E2E_CTC,
     STT_PROVIDER_WHISPER,
+    is_cpu_only_gigaam_provider,
     normalize_stt_provider,
     resolve_gigaam_device,
 )
@@ -35,8 +36,8 @@ class CancelledError(RuntimeError):
 class LocalPipeline:
     """Pipeline for local processing: FFmpeg -> STT -> Diarization -> LLM formatting.
 
-    Default STT provider is Whisper/faster-whisper. Optional ``gigaam-ctc`` uses
-    GigaAM Multilingual CTC on CPU only.
+    Default STT provider is Whisper/faster-whisper. Optional GigaAM providers
+    (``gigaam-ctc``, ``gigaam-e2e-ctc``) run on CPU only.
     """
 
     def __init__(  # noqa: PLR0913
@@ -66,15 +67,24 @@ class LocalPipeline:
         self.compute_type = compute_type
         self.whisperx: WhisperXWrapper | None = None
         self.gigaam: Any | None = None
-        if self.stt_provider == STT_PROVIDER_GIGAAM_CTC:
+        if is_cpu_only_gigaam_provider(self.stt_provider):
             # * Reject CUDA/non-CPU before any GigaAM import or weight download.
             self.device = resolve_gigaam_device(device)
-            from . import gigaam_ctc_wrapper as gigaam_mod  # noqa: PLC0415
+            hf_cache = cache_root / "huggingface"
+            if self.stt_provider == STT_PROVIDER_GIGAAM_E2E_CTC:
+                from . import gigaam_e2e_ctc_wrapper as gigaam_e2e_mod  # noqa: PLC0415
 
-            self.gigaam = gigaam_mod.GigaAMCtcWrapper(
-                device=self.device,
-                cache_dir=cache_root / "huggingface",
-            )
+                self.gigaam = gigaam_e2e_mod.GigaAME2ECtcWrapper(
+                    device=self.device,
+                    cache_dir=hf_cache,
+                )
+            else:
+                from . import gigaam_ctc_wrapper as gigaam_mod  # noqa: PLC0415
+
+                self.gigaam = gigaam_mod.GigaAMCtcWrapper(
+                    device=self.device,
+                    cache_dir=hf_cache,
+                )
         else:
             self.device = device
             # STT engine (Faster-Whisper via WhisperX)
@@ -100,7 +110,7 @@ class LocalPipeline:
             The configured :class:`WhisperXWrapper`.
 
         Raises:
-            RuntimeError: When the pipeline was created for ``gigaam-ctc``.
+            RuntimeError: When the pipeline was created for a GigaAM provider.
 
         """
         if self.whisperx is None:
@@ -128,7 +138,7 @@ class LocalPipeline:
             ``(transcript_dict, asr_label)`` for progress reporting.
 
         """
-        if self.stt_provider == STT_PROVIDER_GIGAAM_CTC:
+        if is_cpu_only_gigaam_provider(self.stt_provider):
             if self.gigaam is None:
                 msg = "GigaAM CTC backend is not configured"
                 raise RuntimeError(msg)
@@ -143,7 +153,7 @@ class LocalPipeline:
                         progress=None,
                     ),
                 ),
-                "gigaam-ctc",
+                self.stt_provider,
             )
         whisper = self.require_whisperx()
         wx_kwargs: dict[str, object] = {
@@ -362,7 +372,7 @@ def create_default_local_pipeline() -> LocalPipeline:
 
     Defaults are aligned with the GUI/CLI behavior:
     - engine="auto" (prefer Faster-Whisper; WhisperX alignment when available)
-    - stt_provider="whisper" (optional external path: gigaam-ctc)
+    - stt_provider="whisper" (optional external path: gigaam-ctc / gigaam-e2e-ctc)
     - device="auto" (prefer CUDA when available; GigaAM forces CPU)
     - enable_diarization=False
     - enable_dialog_blocks=False

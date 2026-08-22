@@ -129,7 +129,7 @@ pip install --no-cache-dir `
 python -c "import torch; print('VRAM available:', torch.cuda.get_device_properties(0).total_memory / 1e9, 'GB')"
 ```
 
-Ориентиры: Whisper 1–4 ГБ, диаризация 2–3 ГБ, LLM 2–3 ГБ; GigaAM CTC — ~2.5 ГБ **RAM** (CPU path, без VRAM).
+Ориентиры: Whisper 1–4 ГБ, диаризация 2–3 ГБ, LLM 2–3 ГБ; GigaAM CTC — ~2.5 ГБ **RAM**, GigaAM-v3 e2e CTC — ~2.9 ГБ **RAM** (CPU path, без VRAM).
 
 ## Системные требования
 

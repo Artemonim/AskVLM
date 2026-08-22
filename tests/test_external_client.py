@@ -203,6 +203,8 @@ def test_ensure_daemon_running_gives_up(tmp_path: Path) -> None:
     [
         ("whisper", "gigaam-ctc"),
         ("gigaam-ctc", "whisper"),
+        ("gigaam-ctc", "gigaam-e2e-ctc"),
+        ("gigaam-e2e-ctc", "gigaam-ctc"),
     ],
 )
 def test_run_client_transcribe_provider_mismatch_is_unavailable(
@@ -266,6 +268,23 @@ def test_build_daemon_command_includes_stt_provider(tmp_path: Path) -> None:
     command = ec._build_daemon_command(request, tmp_path)  # noqa: SLF001
     assert "--stt-provider" in command
     assert "gigaam-ctc" in command
+
+
+def test_build_daemon_command_includes_gigaam_e2e_ctc(tmp_path: Path) -> None:
+    """The daemon spawn command forwards ``gigaam-e2e-ctc``."""
+    request = ec.ClientRequest(
+        input_path=tmp_path / "a.wav",
+        language=None,
+        device="cpu",
+        compute_type="auto",
+        whisper_model="small",
+        client_timeout_s=10.0,
+        daemon_workers=1,
+        stt_provider="gigaam-e2e-ctc",
+    )
+    command = ec._build_daemon_command(request, tmp_path)  # noqa: SLF001
+    assert "--stt-provider" in command
+    assert command[command.index("--stt-provider") + 1] == "gigaam-e2e-ctc"
 
 
 def test_build_daemon_command_includes_options(tmp_path: Path) -> None:

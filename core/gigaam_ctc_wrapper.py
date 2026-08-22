@@ -41,7 +41,7 @@ _WINDOW_S = 20.0
 _CHUNK_LOG_INTERVAL = 10
 
 _MISSING_EXTRA_MSG = (
-    "GigaAM Multilingual CTC requires the AskVLM ML extra "
+    "GigaAM CTC providers (Multilingual ctc, v3 e2e_ctc) require the AskVLM ML extra "
     '`pip install -e ".[ml]"` '
     "(torch/torchaudio 2.10 via run.ps1/build.ps1 CUDA ensure, transformers 5, "
     "hydra-core, omegaconf, sentencepiece, pyannote.audio)."

@@ -7,8 +7,13 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 from core import gigaam_ctc_wrapper as gigaam_mod
+from core import gigaam_e2e_ctc_wrapper as gigaam_e2e_mod
 from core import pipelines as pl
-from core.stt_providers import STT_PROVIDER_GIGAAM_CTC, STT_PROVIDER_WHISPER
+from core.stt_providers import (
+    STT_PROVIDER_GIGAAM_CTC,
+    STT_PROVIDER_GIGAAM_E2E_CTC,
+    STT_PROVIDER_WHISPER,
+)
 from editing.text_model import Document
 
 if TYPE_CHECKING:
@@ -112,3 +117,54 @@ def test_local_pipeline_rejects_gigaam_cuda(
     monkeypatch.setattr(pl, "get_project_cache_dir", lambda: tmp_path)
     with pytest.raises(ValueError, match="CPU only"):
         pl.LocalPipeline(stt_provider=STT_PROVIDER_GIGAAM_CTC, device="cuda")
+
+
+def test_local_pipeline_dispatches_gigaam_e2e_ctc_without_whisper_kwargs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The v3 provider constructs ``GigaAME2ECtcWrapper`` and skips Whisper kwargs."""
+    created: list[_StubGigaAM] = []
+
+    def _factory(**kwargs: object) -> _StubGigaAM:
+        stub = _StubGigaAM(**kwargs)
+        created.append(stub)
+        return stub
+
+    def _wrong_wrapper(**_kwargs: object) -> _StubGigaAM:
+        msg = "multilingual CTC wrapper must not be used for gigaam-e2e-ctc"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(pl, "load_env_file", lambda: None)
+    monkeypatch.setattr(pl, "configure_ml_caches", lambda root: root)
+    monkeypatch.setattr(pl, "get_project_cache_dir", lambda: tmp_path)
+    monkeypatch.setattr(gigaam_e2e_mod, "GigaAME2ECtcWrapper", _factory)
+    monkeypatch.setattr(gigaam_mod, "GigaAMCtcWrapper", _wrong_wrapper)
+    monkeypatch.setattr(pl, "prepare_audio", lambda *_a, **_k: tmp_path / "a.wav")
+    monkeypatch.setattr(pl, "get_media_duration_seconds", lambda _p: 1.0)
+    monkeypatch.setattr(pl, "cleanup_intermediate_audio", lambda *_a, **_k: None)
+
+    pipeline = pl.LocalPipeline(stt_provider=STT_PROVIDER_GIGAAM_E2E_CTC, device="auto")
+    assert pipeline.stt_provider == STT_PROVIDER_GIGAAM_E2E_CTC
+    assert pipeline.whisperx is None
+    assert pipeline.device == "cpu"
+    assert created
+    gigaam = created[0]
+    assert pipeline.gigaam is gigaam
+    doc = pipeline.process(tmp_path / "in.wav", tmp_path / "work")
+    assert "gigaam text" in doc.get_full_text()
+    call = gigaam.calls[0]
+    assert "beam_size" not in call
+    assert "vad_filter" not in call
+    assert "word_timestamps" not in call
+    assert "compute_type" not in call
+
+
+def test_local_pipeline_rejects_gigaam_e2e_ctc_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CUDA is rejected before GigaAM-v3 construction."""
+    monkeypatch.setattr(pl, "load_env_file", lambda: None)
+    monkeypatch.setattr(pl, "configure_ml_caches", lambda root: root)
+    monkeypatch.setattr(pl, "get_project_cache_dir", lambda: tmp_path)
+    with pytest.raises(ValueError, match="CPU only"):
+        pl.LocalPipeline(stt_provider=STT_PROVIDER_GIGAAM_E2E_CTC, device="cuda")

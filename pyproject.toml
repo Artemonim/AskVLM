@@ -57,7 +57,8 @@ ml = [
     "python-docx>=1.1.0",
     "odfpy>=1.4.0",
     "nvidia-ml-py3>=7.352.0",
-    # * GigaAM Multilingual CTC (CPU path) shares this ML stack; not a separate extra.
+    # * GigaAM Multilingual CTC and GigaAM-v3 e2e CTC (CPU paths) share this
+    # * ML stack; not a separate extra.
     # * Official card: transformers 5 + hydra/omegaconf; remote-code also needs
     # * sentencepiece (+ pyannote.audio, already listed above).
     "transformers>=5.0.0,<6",
@@ -144,6 +145,8 @@ module = [
     "torchaudio.*",
     "transformers",
     "transformers.*",
+    "hydra",
+    "hydra.*",
     "nvidia_ml_py.*",
     "docx.*",
     "odf.*",

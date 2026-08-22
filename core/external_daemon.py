@@ -69,7 +69,8 @@ class DaemonConfig:
         device: Device the resident model is loaded on.
         compute_type: faster-whisper compute type.
         language: Optional fixed language hint for the resident model.
-        stt_provider: Resident STT backend (``whisper`` or ``gigaam-ctc``).
+        stt_provider: Resident STT backend (``whisper``, ``gigaam-ctc``, or
+            ``gigaam-e2e-ctc``).
 
     """
 

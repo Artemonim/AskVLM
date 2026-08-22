@@ -57,7 +57,8 @@ class ClientRequest:
         whisper_model: Preferred Whisper model name (advisory).
         client_timeout_s: How long the client waits before giving up.
         daemon_workers: Worker count to request when spawning a new daemon.
-        stt_provider: STT backend id (``whisper`` default, or ``gigaam-ctc``).
+        stt_provider: STT backend id (``whisper`` default, ``gigaam-ctc``, or
+            ``gigaam-e2e-ctc``).
 
     """
 

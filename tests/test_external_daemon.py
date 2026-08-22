@@ -6,6 +6,8 @@ import threading
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+import pytest
+
 from core import external_queue as q
 from core.external_daemon import DaemonConfig, process_claimed_job, run_daemon
 
@@ -178,6 +180,52 @@ def test_process_claimed_job_rejects_gigaam_job_on_whisper_daemon(
     )
     assert result.status == "error"
     assert result.error_kind == "stt_provider_mismatch"
+    assert calls["n"] == 0
+
+
+@pytest.mark.parametrize(
+    ("job_provider", "daemon_provider"),
+    [
+        ("gigaam-ctc", "gigaam-e2e-ctc"),
+        ("gigaam-e2e-ctc", "gigaam-ctc"),
+    ],
+)
+def test_process_claimed_job_rejects_gigaam_head_mismatch(
+    tmp_path: Path, job_provider: str, daemon_provider: str
+) -> None:
+    """Sibling GigaAM heads are distinct providers and never share a daemon."""
+    calls = {"n": 0}
+
+    def _fn(
+        job: q.TranscribeJob, should_cancel: Callable[[], bool]
+    ) -> q.TranscribeResult:
+        calls["n"] += 1
+        return q.TranscribeResult(job.job_id, "ok", "wrong", None, None, 1.0)
+
+    job = q.TranscribeJob(
+        job_id="giga-head",
+        input_path="input.wav",
+        language=None,
+        device="cpu",
+        compute_type="auto",
+        whisper_model="small",
+        diarization=False,
+        dialog_blocks=False,
+        submitted_at=0.0,
+        deadline_at=None,
+        stt_provider=job_provider,
+    )
+    result = process_claimed_job(
+        tmp_path,
+        job,
+        _fn,
+        expected_stt_provider=daemon_provider,
+        clock=lambda: 0.0,
+    )
+    assert result.status == "error"
+    assert result.error_kind == "stt_provider_mismatch"
+    assert job_provider in (result.error_detail or "")
+    assert daemon_provider in (result.error_detail or "")
     assert calls["n"] == 0
 
 

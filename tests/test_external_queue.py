@@ -83,6 +83,24 @@ def test_job_roundtrip_preserves_gigaam_provider() -> None:
     assert q.TranscribeJob.from_dict(job.to_dict()).stt_provider == "gigaam-ctc"
 
 
+def test_job_roundtrip_preserves_gigaam_e2e_ctc_provider() -> None:
+    """Explicit gigaam-e2e-ctc provider survives serialization."""
+    job = q.TranscribeJob(
+        job_id="g2",
+        input_path="input.wav",
+        language="ru",
+        device="cpu",
+        compute_type="auto",
+        whisper_model="small",
+        diarization=False,
+        dialog_blocks=False,
+        submitted_at=1.0,
+        deadline_at=None,
+        stt_provider="gigaam-e2e-ctc",
+    )
+    assert q.TranscribeJob.from_dict(job.to_dict()).stt_provider == "gigaam-e2e-ctc"
+
+
 def test_result_roundtrip_and_unknown_status_falls_back_to_error() -> None:
     """Results roundtrip, and an unknown status decodes as ``error``."""
     result = q.TranscribeResult("j", "ok", "text", None, None, 1.0)

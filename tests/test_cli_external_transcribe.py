@@ -655,6 +655,22 @@ def test_build_external_child_command_includes_stt_provider(tmp_path: Path) -> N
     gidx = gigaam_command.index("--stt-provider")
     assert gigaam_command[gidx + 1] == "gigaam-ctc"
 
+    e2e_command = cli._build_external_child_command(  # noqa: SLF001
+        input_path=input_path,
+        whisper_model="small",
+        language=None,
+        device="cpu",
+        compute_type="auto",
+        diarization=False,
+        dialog_blocks=False,
+        work_dir=None,
+        child_result_file=tmp_path / "child_result.json",
+        stt_provider="gigaam-e2e-ctc",
+    )
+    assert "--stt-provider" in e2e_command
+    eidx = e2e_command.index("--stt-provider")
+    assert e2e_command[eidx + 1] == "gigaam-e2e-ctc"
+
 
 def test_external_transcribe_daemon_command_invokes_run_daemon(
     monkeypatch: pytest.MonkeyPatch,
@@ -679,10 +695,21 @@ def test_external_transcribe_daemon_command_invokes_run_daemon(
     assert config.stt_provider == "whisper"
 
 
+@pytest.mark.parametrize(
+    ("provider", "device_flag"),
+    [
+        ("gigaam-ctc", "auto"),
+        ("gigaam-e2e-ctc", "auto"),
+        ("gigaam-e2e-ctc", "cpu"),
+    ],
+)
 def test_external_transcribe_propagates_gigaam_provider(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: str,
+    device_flag: str,
 ) -> None:
-    """``--stt-provider gigaam-ctc`` reaches LocalPipeline and forces CPU."""
+    """GigaAM ``--stt-provider`` values reach LocalPipeline and force CPU."""
     monkeypatch.setattr(cli.sys, "platform", "linux")
     input_path = tmp_path / "clip.wav"
     input_path.write_text("stub", encoding="utf-8")
@@ -707,9 +734,9 @@ def test_external_transcribe_propagates_gigaam_provider(
             str(input_path),
             "--no-daemon",
             "--stt-provider",
-            "gigaam-ctc",
+            provider,
             "--device",
-            "auto",
+            device_flag,
             "--work-dir",
             str(tmp_path / "work"),
         ],
@@ -718,12 +745,13 @@ def test_external_transcribe_propagates_gigaam_provider(
     assert result.stdout == "gigaam ok\n"
     kwargs = calls["pipeline_kwargs"]
     assert isinstance(kwargs, dict)
-    assert kwargs["stt_provider"] == "gigaam-ctc"
+    assert kwargs["stt_provider"] == provider
     assert kwargs["device"] == "cpu"
 
 
+@pytest.mark.parametrize("provider", ["gigaam-ctc", "gigaam-e2e-ctc"])
 def test_external_transcribe_rejects_gigaam_cuda(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider: str
 ) -> None:
     """GigaAM with ``--device cuda`` fails before pipeline construction."""
     monkeypatch.setattr(cli.sys, "platform", "linux")
@@ -744,7 +772,7 @@ def test_external_transcribe_rejects_gigaam_cuda(
             str(input_path),
             "--no-daemon",
             "--stt-provider",
-            "gigaam-ctc",
+            provider,
             "--device",
             "cuda",
         ],
@@ -754,10 +782,12 @@ def test_external_transcribe_rejects_gigaam_cuda(
     assert "CPU only" in (result.output or "") or "CPU only" in (result.stderr or "")
 
 
+@pytest.mark.parametrize("provider", ["gigaam-ctc", "gigaam-e2e-ctc"])
 def test_external_transcribe_daemon_gigaam_config(
     monkeypatch: pytest.MonkeyPatch,
+    provider: str,
 ) -> None:
-    """Daemon CLI accepts gigaam-ctc and stores it on DaemonConfig."""
+    """Daemon CLI accepts GigaAM providers and stores them on DaemonConfig."""
     captured: dict[str, object] = {}
 
     def _fake_run_daemon(queue_dir: object, **kwargs: object) -> int:
@@ -770,7 +800,7 @@ def test_external_transcribe_daemon_gigaam_config(
         [
             "external-transcribe-daemon",
             "--stt-provider",
-            "gigaam-ctc",
+            provider,
             "--device",
             "auto",
         ],
@@ -778,5 +808,5 @@ def test_external_transcribe_daemon_gigaam_config(
     assert result.exit_code == 0
     config = captured["config"]
     assert isinstance(config, cli.DaemonConfig)
-    assert config.stt_provider == "gigaam-ctc"
+    assert config.stt_provider == provider
     assert config.device == "cpu"

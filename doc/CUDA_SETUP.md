@@ -199,6 +199,7 @@ The application requires:
 - Diarization: 2-3 GB
 - LLM formatter: 2-3 GB for 7B model
 - GigaAM CTC: ~2.5 GB **RAM** (CPU path; no VRAM)
+- GigaAM-v3 e2e CTC: ~2.9 GB **RAM** (CPU path; no VRAM)
 
 If VRAM is insufficient, use smaller models or reduce batch sizes.
 

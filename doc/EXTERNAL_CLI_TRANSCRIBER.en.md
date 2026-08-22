@@ -7,12 +7,14 @@
 The flow is designed for machine interaction:
 
 - Default Whisper model is `small`.
-- Default STT provider is `whisper` (`--stt-provider whisper`). Optional CPU-only `gigaam-ctc` (GigaAM Multilingual, revision `ctc`) is available.
+- Default STT provider is `whisper` (`--stt-provider whisper`). Optional CPU-only GigaAM providers:
+  - `gigaam-ctc` — `ai-sage/GigaAM-Multilingual` revision `ctc`, no punctuation or capitalization;
+  - `gigaam-e2e-ctc` — `ai-sage/GigaAM-v3` revision `e2e_ctc`, **with** punctuation and capitalization (BPE + ITN).
 - By default the command writes only the transcript text to `stdout`.
 - Speaker diarization and LLM dialog formatting are disabled by default.
 - The model is loaded on demand and unloaded after the command finishes (legacy `--no-daemon`; resident in daemon mode).
 - If CUDA is available but VRAM allocation for Whisper fails, AskVLM automatically retries Whisper on CPU.
-- GigaAM CTC does not use CUDA, Whisper CUDA fallbacks, or Windows GPU child isolation: CPU only.
+- GigaAM (`gigaam-ctc` and `gigaam-e2e-ctc`) does not use CUDA, Whisper CUDA fallbacks, or Windows GPU child isolation: CPU only.
 - On Windows with `--device` other than `cpu` (Whisper only), the command runs in an isolated child process to reduce the impact of upstream crash-on-exit bugs (`faster-whisper`/`ctranslate2`) on the calling process (legacy `--no-daemon` mode only).
 
 ## Daemon orchestrator and file queue (default mode)
@@ -37,11 +39,13 @@ Start the daemon manually (optional — the client starts it automatically):
 python cli.py external-transcribe-daemon --workers 1 --whisper-model small --device cuda
 ```
 
-GigaAM CTC (CPU; deps already in `.[ml]`):
+GigaAM (CPU; deps already in `.[ml]`):
 
 ```powershell
 python cli.py external-transcribe-daemon --stt-provider gigaam-ctc --device cpu
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc
+python cli.py external-transcribe-daemon --stt-provider gigaam-e2e-ctc --device cpu
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc
 ```
 
 If a daemon is already live with a different `--stt-provider`, the client will **not** submit the job to the wrong resident model: it returns unavailable / mismatch. The singleton is preserved — restart the daemon with the desired provider.
@@ -54,7 +58,7 @@ python cli.py external-transcribe "C:\media\call.wav" --no-daemon
 
 ## Installation
 
-First install the project and ML dependencies (Whisper + GigaAM CTC share one extra):
+First install the project and ML dependencies (Whisper + both GigaAM providers share one extra):
 
 ```powershell
 pip install -e .
@@ -63,9 +67,9 @@ pip install -e .[ml]
 .\run.ps1 -SkipLaunch -Fast
 ```
 
-The `[ml]` stack includes torch/torchaudio **2.10** (CUDA wheels repaired by `run.ps1`/`build.ps1` by default: cu128 → cu126), transformers 5, hydra-core, omegaconf, **sentencepiece**, and **pyannote.audio**. The last two are required by remote-code modeling even for short-form `.transcribe` (no longform/VAD). On CPU, GigaAM uses roughly ~2.5 GB RAM (vs compact Whisper Small CPU) but no VRAM, with speed comparable to Whisper Small on GPU.
+The `[ml]` stack includes torch/torchaudio **2.10** (CUDA wheels repaired by `run.ps1`/`build.ps1` by default: cu128 → cu126), transformers 5, hydra-core, omegaconf, **sentencepiece**, and **pyannote.audio**. The last two are required by remote-code modeling even for short-form `.transcribe` (no longform/VAD). On CPU, `gigaam-ctc` uses roughly ~2.5 GB RAM and `gigaam-e2e-ctc` ~2.9 GB RAM (vs compact Whisper Small CPU); neither uses VRAM.
 
-Model load uses Hugging Face Transformers with `trust_remote_code=True` **only** for repo `ai-sage/GigaAM-Multilingual` at revision `ctc` (the card's official remote-code API). That trust is scoped to this model/revision, not to arbitrary HF repos. If remote code raises `ImportError`/`ModuleNotFoundError` because `[ml]` is incomplete, the wrapper surfaces `pip install -e ".[ml]"` and keeps the missing module name.
+Model load uses Hugging Face Transformers with `trust_remote_code=True` **only** for two pinned repos: `ai-sage/GigaAM-Multilingual` at revision `ctc` and `ai-sage/GigaAM-v3` at revision `e2e_ctc` (the cards' official remote-code API). That trust is scoped to these models/revisions, not to arbitrary HF repos. For v3 the wrapper patches `hydra.utils.instantiate` (CPU device) and `PreTrainedModel._finalize_model_loading` (transformers 5.x compat) around `from_pretrained` and **always** restores the originals in `finally`, including when load raises. If remote code raises `ImportError`/`ModuleNotFoundError` because `[ml]` is incomplete, the wrapper surfaces `pip install -e ".[ml]"` and keeps the missing module name.
 
 Do not install `torch` from PyPI on top of a CUDA build without a follow-up `run.ps1`/`build.ps1`: bare `pip install -e .[ml]` often leaves CPU `torch 2.10.0`. Opt out with `-SkipEnsureCUDA`. See `doc/CUDA_SETUP.md`.
 
@@ -109,10 +113,11 @@ Explicitly specify language:
 python cli.py external-transcribe "C:\media\call.wav" --language ru
 ```
 
-Select GigaAM CTC (CPU):
+Select GigaAM (CPU):
 
 ```powershell
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc --device cpu
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cpu
 ```
 
 ## Command Contract
@@ -163,7 +168,7 @@ Behavior of `--device auto` for Whisper:
 2. If model loading or GPU inference fails due to insufficient GPU memory, AskVLM unloads Whisper and retries on CPU.
 3. The CPU fallback automatically picks a safe compute type for CPU.
 
-For `--stt-provider gigaam-ctc` the device is always CPU (`auto` → `cpu`); `cuda` is rejected before model load. Whisper-only parameters (`--compute-type`, beam/VAD) are not sent to GigaAM.
+For `--stt-provider gigaam-ctc` and `gigaam-e2e-ctc` the device is always CPU (`auto` → `cpu`); `cuda` is rejected before model load. Whisper-only parameters (`--compute-type`, beam/VAD) are not sent to GigaAM.
 
 This way an overloaded GPU does not block local integration as long as there is enough RAM in the system.
 
@@ -326,7 +331,7 @@ fps_used    = manifest["fps_used"]
 
 ## Long media (GigaAM CTC)
 
-GigaAM Multilingual CTC at revision `ctc` rejects files strictly longer than 400000 samples (~25.0 s at 16 kHz) with `ValueError("Too long wav file, use 'transcribe_longform' method.")`. AskVLM does not use native `transcribe_longform` (pyannote VAD, needs `HF_TOKEN`).
+Both GigaAM providers (`gigaam-ctc` = Multilingual revision `ctc` and `gigaam-e2e-ctc` = v3 revision `e2e_ctc`) reject files strictly longer than 400000 samples (~25.0 s at 16 kHz) with `ValueError("Too long wav file, use 'transcribe_longform' method.")`. AskVLM does not use native `transcribe_longform` (pyannote VAD, needs `HF_TOKEN`). The same 20 s windowing applies to v3.
 
 Instead of a duration gate and a short-form branch, the wrapper **always** streams the WAV in 20-second windows (in samples of the source file):
 
