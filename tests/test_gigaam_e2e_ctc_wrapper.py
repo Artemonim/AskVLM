@@ -8,10 +8,12 @@ import threading
 import time
 import types
 import wave
-from typing import TYPE_CHECKING, Any, Self
+from pathlib import Path
+from typing import Any, Self
 
 import pytest
 
+from core.gigaam_ctc_wrapper import _MIN_AUDIO_DURATION_S
 from core.gigaam_e2e_ctc_wrapper import GigaAME2ECtcWrapper
 from core.stt_providers import (
     GIGAAM_V3_HF_REPO_ID,
@@ -20,10 +22,23 @@ from core.stt_providers import (
     normalize_stt_provider,
 )
 
-if TYPE_CHECKING:
-    from pathlib import Path
-
 _FINALIZE_ATTR = "_finalize_model_loading"
+
+
+def _write_pcm_silence(
+    path: Path,
+    *,
+    n_frames: int,
+    sample_rate: int = 16000,
+    channels: int = 1,
+) -> None:
+    """Write a 16-bit PCM WAV with the given frame count, rate, and channel count."""
+    frame = b"\x00\x00" * channels
+    with wave.open(str(path), "wb") as writer:
+        writer.setnchannels(channels)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(frame * n_frames)
 
 
 def _write_silent_wav(
@@ -34,13 +49,12 @@ def _write_silent_wav(
     channels: int = 1,
 ) -> None:
     """Write a 16-bit silent WAV of the requested duration."""
-    frame = b"\x00\x00" * channels
-    n_frames = int(duration_s * sample_rate)
-    with wave.open(str(path), "wb") as writer:
-        writer.setnchannels(channels)
-        writer.setsampwidth(2)
-        writer.setframerate(sample_rate)
-        writer.writeframes(frame * n_frames)
+    _write_pcm_silence(
+        path,
+        n_frames=int(duration_s * sample_rate),
+        sample_rate=sample_rate,
+        channels=channels,
+    )
 
 
 def _install_v3_compat_stubs(
@@ -302,6 +316,52 @@ def test_gigaam_e2e_transcribe_plain_str_fast_path(
     assert result["segments"][0]["text"] == "Hello, world."
     assert result["segments"][0]["start"] == 0.0
     assert result["segments"][0]["end"] == pytest.approx(1.0)
+
+
+def test_gigaam_e2e_tiny_wav_is_padded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inherited ``_transcribe_file`` pads tiny WAVs for the v3 e2e wrapper."""
+    _install_v3_compat_stubs(monkeypatch)
+    audio = tmp_path / "tiny.wav"
+    _write_pcm_silence(audio, n_frames=1)
+    transcribed: list[str] = []
+    durations: list[float] = []
+
+    class _FakeModel:
+        def float(self) -> _FakeModel:
+            return self
+
+        def eval(self) -> _FakeModel:
+            return self
+
+        def transcribe(self, path: str) -> str:
+            transcribed.append(path)
+            with wave.open(path, "rb") as reader:
+                rate = reader.getframerate()
+                frames = reader.getnframes()
+            durations.append(frames / float(rate) if rate > 0 else 0.0)
+            return "tiny"
+
+    class _FakeAutoModel:
+        @staticmethod
+        def from_pretrained(*_args: object, **_kwargs: object) -> _FakeModel:
+            return _FakeModel()
+
+    monkeypatch.setattr(
+        GigaAME2ECtcWrapper,
+        "_ensure_deps",
+        lambda _self: (_FakeAutoModel, object()),
+    )
+    wrapper = GigaAME2ECtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert result["text"] == "tiny"
+    assert len(transcribed) == 1
+    assert transcribed[0] != str(audio)
+    assert Path(transcribed[0]).name.startswith("pad_")
+    assert durations[0] >= _MIN_AUDIO_DURATION_S
+    assert not Path(transcribed[0]).exists()
+    assert list(tmp_path.glob("pad_*")) == []
 
 
 def test_gigaam_e2e_concurrent_loads_are_serialized(

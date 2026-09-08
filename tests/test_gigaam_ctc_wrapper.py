@@ -10,6 +10,7 @@ import pytest
 
 from core import gigaam_ctc_wrapper as gigaam_mod
 from core.gigaam_ctc_wrapper import (
+    _MIN_AUDIO_DURATION_S,
     _MISSING_EXTRA_MSG,
     _WINDOW_S,
     GigaAMCtcWrapper,
@@ -92,6 +93,8 @@ def _patch_gigaam_model(
             duration_s = _wav_duration_s(path)
             # * No streaming path may send the model more than one 20 s window.
             assert duration_s <= _WINDOW_S
+            # * GigaAM STFT requires more than 320 samples @16 kHz after resample.
+            assert duration_s >= _MIN_AUDIO_DURATION_S
             if transcribed_durations is not None:
                 transcribed_durations.append(duration_s)
             text = f"chunk-{self.n}" if pieces is None else pieces[self.n]
@@ -357,18 +360,199 @@ def test_gigaam_nonstandard_wav_windows(
 def test_gigaam_tiny_wav_fast_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, n_frames: int
 ) -> None:
-    """Empty and 1-frame WAVs take the original-path fast path."""
+    """Empty and 1-frame WAVs are silence-padded before the model call."""
     audio = tmp_path / "tiny.wav"
     _write_pcm_silence(audio, n_frames=n_frames)
     transcribed: list[str] = []
-    _patch_gigaam_model(monkeypatch, texts=["tiny"], transcribed_paths=transcribed)
+    durations: list[float] = []
+    _patch_gigaam_model(
+        monkeypatch,
+        texts=["tiny"],
+        transcribed_paths=transcribed,
+        transcribed_durations=durations,
+    )
     wrapper = GigaAMCtcWrapper(device="cpu")
     result = wrapper.transcribe(audio)
-    assert transcribed == [str(audio)]
+    assert len(transcribed) == 1
+    assert transcribed[0] != str(audio)
+    assert Path(transcribed[0]).name.startswith("pad_")
+    assert not Path(transcribed[0]).exists()
+    assert list(tmp_path.glob("pad_*")) == []
+    assert durations[0] >= _MIN_AUDIO_DURATION_S
+    assert durations[0] == pytest.approx(_MIN_AUDIO_DURATION_S)
     assert result["text"] == "tiny"
     assert len(result["segments"]) == 1
     assert result["segments"][0]["start"] == 0.0
     assert result["segments"][0]["end"] == pytest.approx(n_frames / 16000.0)
+
+
+def test_gigaam_stft_short_wav_is_padded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 216-sample 16 kHz clip (below n_fft=320) is padded to the duration floor."""
+    audio = tmp_path / "stft_short.wav"
+    _write_pcm_silence(audio, n_frames=216, sample_rate=16000)
+    transcribed: list[str] = []
+    durations: list[float] = []
+    _patch_gigaam_model(
+        monkeypatch,
+        texts=["ok"],
+        transcribed_paths=transcribed,
+        transcribed_durations=durations,
+    )
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert result["text"] == "ok"
+    assert len(transcribed) == 1
+    assert transcribed[0] != str(audio)
+    assert durations[0] >= _MIN_AUDIO_DURATION_S
+    assert durations[0] == pytest.approx(_MIN_AUDIO_DURATION_S)
+    assert not Path(transcribed[0]).exists()
+    assert list(tmp_path.glob("pad_*")) == []
+
+
+def test_gigaam_chunked_short_tail_is_padded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A 20.0135 s file pads the ~216-sample tail window, not the first 20 s."""
+    audio = tmp_path / "tail.wav"
+    _write_pcm_silence(audio, n_frames=320000 + 216, sample_rate=16000)
+    transcribed: list[str] = []
+    durations: list[float] = []
+    _patch_gigaam_model(
+        monkeypatch,
+        texts=["head", ""],
+        transcribed_paths=transcribed,
+        transcribed_durations=durations,
+    )
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert len(transcribed) == 2
+    assert str(audio) not in transcribed
+    assert durations[0] == pytest.approx(_WINDOW_S)
+    assert durations[1] >= _MIN_AUDIO_DURATION_S
+    assert durations[1] == pytest.approx(_MIN_AUDIO_DURATION_S)
+    assert result["text"] == "head"
+    assert [seg["text"] for seg in result["segments"]] == ["head", ""]
+    leftover = [path for path in tmp_path.iterdir() if path.name.startswith("pad_")]
+    assert leftover == []
+
+
+def test_gigaam_short_8khz_pads_by_duration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Padding uses duration, not a 16 kHz source-frame count (8 kHz short clip)."""
+    audio = tmp_path / "short8k.wav"
+    # * 160 frames @8 kHz = 20 ms, below 40 ms; 640 source frames would be 80 ms.
+    _write_pcm_silence(audio, n_frames=160, sample_rate=8000)
+    transcribed: list[str] = []
+    durations: list[float] = []
+    _patch_gigaam_model(
+        monkeypatch,
+        texts=["ok"],
+        transcribed_paths=transcribed,
+        transcribed_durations=durations,
+    )
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert result["text"] == "ok"
+    assert len(transcribed) == 1
+    assert transcribed[0] != str(audio)
+    assert durations[0] >= _MIN_AUDIO_DURATION_S
+    assert durations[0] == pytest.approx(_MIN_AUDIO_DURATION_S)
+    assert not Path(transcribed[0]).exists()
+
+
+def test_gigaam_unreadable_wav_skips_padding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A broken WAV header skips padding and the model still gets the original path."""
+    audio = tmp_path / "broken.wav"
+    audio.write_bytes(b"not a wav")
+    transcribed: list[str] = []
+
+    class _FakeModel:
+        def eval(self) -> _FakeModel:
+            return self
+
+        def transcribe(self, path: str) -> str:
+            transcribed.append(path)
+            return "ok"
+
+    class _FakeAutoModel:
+        @staticmethod
+        def from_pretrained(*_args: object, **_kwargs: object) -> _FakeModel:
+            return _FakeModel()
+
+    monkeypatch.setattr(
+        GigaAMCtcWrapper, "_ensure_deps", lambda _self: (_FakeAutoModel, object())
+    )
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    with caplog.at_level("DEBUG", logger="core.gigaam_ctc_wrapper"):
+        text = wrapper._transcribe_file(audio)  # noqa: SLF001
+    assert text == "ok"
+    assert transcribed == [str(audio)]
+    assert list(tmp_path.glob("pad_*")) == []
+    assert any(
+        "min-duration check skipped" in record.getMessage() for record in caplog.records
+    )
+
+
+def test_gigaam_padded_temp_cleaned_on_model_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A model RuntimeError still unlinks the silence-padded temp WAV."""
+    audio = tmp_path / "tiny.wav"
+    _write_pcm_silence(audio, n_frames=1)
+    transcribed: list[str] = []
+
+    class _FakeModel:
+        def eval(self) -> _FakeModel:
+            return self
+
+        def transcribe(self, path: str) -> str:
+            transcribed.append(path)
+            msg = "model failed after open"
+            raise RuntimeError(msg)
+
+    class _FakeAutoModel:
+        @staticmethod
+        def from_pretrained(*_args: object, **_kwargs: object) -> _FakeModel:
+            return _FakeModel()
+
+    monkeypatch.setattr(
+        GigaAMCtcWrapper, "_ensure_deps", lambda _self: (_FakeAutoModel, object())
+    )
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    with pytest.raises(RuntimeError, match="model failed after open"):
+        wrapper.transcribe(audio)
+    assert len(transcribed) == 1
+    assert transcribed[0] != str(audio)
+    assert Path(transcribed[0]).name.startswith("pad_")
+    assert not Path(transcribed[0]).exists()
+    assert list(tmp_path.glob("pad_*")) == []
+
+
+def test_gigaam_threshold_duration_uses_original_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A clip exactly at the STFT duration floor is not padded."""
+    audio = tmp_path / "threshold.wav"
+    _write_pcm_silence(audio, n_frames=640, sample_rate=16000)
+    transcribed: list[str] = []
+    durations: list[float] = []
+    _patch_gigaam_model(
+        monkeypatch,
+        texts=["ok"],
+        transcribed_paths=transcribed,
+        transcribed_durations=durations,
+    )
+    wrapper = GigaAMCtcWrapper(device="cpu")
+    result = wrapper.transcribe(audio)
+    assert result["text"] == "ok"
+    assert transcribed == [str(audio)]
+    assert durations == [pytest.approx(_MIN_AUDIO_DURATION_S)]
+    assert list(tmp_path.glob("pad_*")) == []
 
 
 def test_gigaam_zero_rate_wav_reencodes_once(

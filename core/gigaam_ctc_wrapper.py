@@ -17,6 +17,8 @@ import contextlib
 import gc as _gc
 import importlib
 import logging
+import math
+import os
 import tempfile
 import time
 import wave
@@ -38,6 +40,12 @@ logger = logging.getLogger(__name__)
 # * Window length in seconds of the source file's sample rate. After the model
 # * resamples to 16 kHz, 20 s is 320_000 samples — below the 400_000 hard cap.
 _WINDOW_S = 20.0
+# * GigaAM remote-code preprocessor uses STFT center=False, n_fft=320 at 16 kHz,
+# * so resampled PCM must be strictly longer than 320 samples (~20.06 ms).
+# * Threshold is duration (rate-invariant), not source-frame count: 8/22/48 kHz
+# * files change sample count after GigaAM's ffmpeg resample. 40 ms is 640
+# * samples @16 kHz — headroom for integer resample rounding above 321 samples.
+_MIN_AUDIO_DURATION_S = 0.04
 _CHUNK_LOG_INTERVAL = 10
 
 _MISSING_EXTRA_MSG = (
@@ -179,6 +187,86 @@ def _write_pcm_wav(
         writer.writeframes(pcm)
 
 
+def _unlink_padded_wav(path: Path) -> None:
+    """Best-effort unlink of a silence-padded temp WAV.
+
+    Windows may transiently lock the file after ``model.transcribe``; a failed
+    unlink is logged at debug and does not fail transcription.
+    """
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.debug(
+            "Could not unlink padded GigaAM WAV %s",
+            path,
+            exc_info=True,
+        )
+
+
+def _maybe_write_min_duration_wav(audio_path: Path) -> Path | None:
+    """Write a silence-padded copy when WAV duration is below the STFT floor.
+
+    Pads with zero PCM frames at the *source* sample rate until duration is at
+    least ``_MIN_AUDIO_DURATION_S``. Unparseable headers skip padding so the
+    caller can still hand the original path to the model.
+
+    Args:
+        audio_path: Source WAV path (original file or a 20 s chunk).
+
+    Returns:
+        Path of the padded WAV next to *audio_path*, or ``None`` when the
+        original is long enough or ``wave.open`` cannot read the header.
+
+    """
+    try:
+        with wave.open(str(audio_path), "rb") as reader:
+            rate = reader.getframerate()
+            n_frames = reader.getnframes()
+            sample_width = reader.getsampwidth()
+            channels = reader.getnchannels()
+            if rate <= 0 or sample_width < 1 or channels < 1 or n_frames < 0:
+                logger.debug(
+                    "GigaAM min-duration check skipped for %s: invalid WAV fields",
+                    audio_path,
+                )
+                return None
+            duration_s = n_frames / float(rate)
+            if duration_s >= _MIN_AUDIO_DURATION_S:
+                return None
+            pcm = reader.readframes(n_frames)
+            target_frames = math.ceil(_MIN_AUDIO_DURATION_S * rate)
+            pad_frames = max(0, target_frames - n_frames)
+            zero_frame = b"\x00" * (sample_width * channels)
+            padded_pcm = pcm + zero_frame * pad_frames
+    except (OSError, EOFError, wave.Error) as exc:
+        logger.debug(
+            "GigaAM min-duration check skipped for %s: %s",
+            audio_path,
+            exc,
+        )
+        return None
+
+    fd, name = tempfile.mkstemp(
+        prefix="pad_",
+        suffix=".wav",
+        dir=str(audio_path.parent),
+    )
+    padded_path = Path(name)
+    try:
+        os.close(fd)
+        _write_pcm_wav(
+            padded_path,
+            padded_pcm,
+            rate=rate,
+            sample_width=sample_width,
+            channels=channels,
+        )
+    except OSError:
+        _unlink_padded_wav(padded_path)
+        raise
+    return padded_path
+
+
 def _log_chunk_progress(
     *,
     idx: int,
@@ -309,6 +397,10 @@ class GigaAMCtcWrapper:
     def _transcribe_file(self, audio_path: Path) -> str:
         """Run one window-sized ``model.transcribe`` call.
 
+        Files shorter than ``_MIN_AUDIO_DURATION_S`` are copied with trailing
+        silence so GigaAM's ``center=False`` STFT (n_fft=320 @16 kHz) has
+        enough samples after resample.
+
         Args:
             audio_path: Audio file path accepted by GigaAM.
 
@@ -321,11 +413,17 @@ class GigaAMCtcWrapper:
         if model is None:
             msg = "GigaAM CTC model failed to load"
             raise RuntimeError(msg)
-        # * First .transcribe() can still ImportError on lazy remote-code deps.
+        padded_path = _maybe_write_min_duration_wav(audio_path)
+        transcribe_path = padded_path if padded_path is not None else audio_path
         try:
-            return self._coerce_text(model.transcribe(str(audio_path)))
-        except ImportError as exc:
-            _raise_missing_extra(exc)
+            # * First .transcribe() can still ImportError on lazy remote-code deps.
+            try:
+                return self._coerce_text(model.transcribe(str(transcribe_path)))
+            except ImportError as exc:
+                _raise_missing_extra(exc)
+        finally:
+            if padded_path is not None:
+                _unlink_padded_wav(padded_path)
 
     def _fast_path_original(
         self,
@@ -477,9 +575,10 @@ class GigaAMCtcWrapper:
         take a language hint on the official short-form API.
 
         The WAV is streamed in 20 s windows. A file shorter than one window is
-        sent to the model on the original path; longer files are split into
-        temporary window WAVs. Stdlib ``wave`` failures trigger one ffmpeg
-        re-encode and a single retry.
+        sent to the model on the original path, except clips below the STFT
+        duration floor which use a silence-padded ``pad_*.wav`` copy; longer
+        files are split into temporary window WAVs. Stdlib ``wave`` failures
+        trigger one ffmpeg re-encode and a single retry.
 
         Args:
             audio_path: Prepared WAV (or other path accepted by GigaAM).
