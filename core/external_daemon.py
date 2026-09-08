@@ -254,15 +254,23 @@ def _serve_loop(
     while not stop_event.is_set():
         now = clock()
         if now - last_heartbeat >= config.heartbeat_interval_s:
-            write_heartbeat(
-                queue_dir,
-                {
-                    "model": config.whisper_model,
-                    "device": config.device,
-                    "workers": config.max_workers,
-                    "stt_provider": resident_provider,
-                },
-            )
+            try:
+                write_heartbeat(
+                    queue_dir,
+                    {
+                        "model": config.whisper_model,
+                        "device": config.device,
+                        "workers": config.max_workers,
+                        "stt_provider": resident_provider,
+                    },
+                )
+            except OSError as exc:
+                # ! A failed beacon must not kill the serve loop (Windows share).
+                logger.warning(
+                    "failed to write daemon heartbeat: queue=%s error=%s",
+                    queue_dir,
+                    exc,
+                )
             last_heartbeat = now
         purge_expired_incoming(queue_dir, now)
         purge_stale_results(queue_dir, now, ttl_s=config.result_ttl_s)

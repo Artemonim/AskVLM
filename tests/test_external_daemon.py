@@ -4,12 +4,18 @@ from __future__ import annotations
 
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING
 
 import pytest
 
 from core import external_queue as q
-from core.external_daemon import DaemonConfig, process_claimed_job, run_daemon
+from core.external_daemon import (
+    DaemonConfig,
+    _serve_loop,
+    process_claimed_job,
+    run_daemon,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -284,3 +290,42 @@ def test_run_daemon_idle_shutdown_and_tidies_up(tmp_path: Path) -> None:
     assert code == 0
     assert q.read_heartbeat(tmp_path) is None
     assert not (tmp_path / "control" / "daemon.lock").exists()
+
+
+def test_serve_loop_survives_heartbeat_oserror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed heartbeat write does not kill the serve loop or hot-spin."""
+    q.ensure_layout(tmp_path)
+    stop = threading.Event()
+    heartbeat_calls = {"n": 0}
+
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        heartbeat_calls["n"] += 1
+        message = "share violation"
+        raise OSError(message)
+
+    monkeypatch.setattr("core.external_daemon.write_heartbeat", _boom)
+    polls = {"n": 0}
+
+    def _sleeper(_delay: float) -> None:
+        polls["n"] += 1
+        if polls["n"] >= 5:
+            stop.set()
+
+    config = DaemonConfig(
+        poll_interval_s=0.0,
+        heartbeat_interval_s=5.0,
+        idle_shutdown_s=999.0,
+    )
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        _serve_loop(
+            tmp_path,
+            config,
+            _ok_fn("unused"),
+            stop_event=stop,
+            executor=executor,
+            clock=lambda: 100.0,
+            sleeper=_sleeper,
+        )
+    assert heartbeat_calls["n"] == 1

@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import os
-from typing import TYPE_CHECKING
+from pathlib import Path
+
+import pytest
 
 from core import external_queue as q
-
-if TYPE_CHECKING:
-    from pathlib import Path
-
-    import pytest
 
 
 def _make_job(
@@ -266,3 +263,96 @@ def test_is_windows_matches_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     assert q.is_windows()
     monkeypatch.setattr(q.sys, "platform", "linux")
     assert not q.is_windows()
+
+
+def _permission_error(*, winerror: int | None) -> PermissionError:
+    """Build a ``PermissionError`` optionally tagged with a Windows winerror.
+
+    Args:
+        winerror: Windows error code, or ``None`` for POSIX-style EACCES.
+
+    Returns:
+        A ``PermissionError`` instance.
+
+    """
+    exc = PermissionError("mock")
+    if winerror is not None:
+        exc.winerror = winerror
+    return exc
+
+
+def test_atomic_write_retries_winerror_32_then_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Share violations retry, then a successful replace persists JSON."""
+    monkeypatch.setattr(q, "sleep", lambda _delay: None)
+    attempts = {"n": 0}
+    real_replace = os.replace
+
+    def _flaky(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            raise _permission_error(winerror=32)
+        real_replace(src, dst)
+
+    monkeypatch.setattr(q.os, "replace", _flaky)
+    q.write_heartbeat(tmp_path, {"model": "small"})
+    assert attempts["n"] == 3
+    beacon = q.read_heartbeat(tmp_path)
+    assert beacon is not None
+    assert beacon["model"] == "small"
+
+
+def test_atomic_write_raises_immediately_without_winerror(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """POSIX PermissionError without winerror is not retried."""
+    monkeypatch.setattr(q, "sleep", lambda _delay: None)
+    attempts = {"n": 0}
+
+    def _once(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        attempts["n"] += 1
+        raise _permission_error(winerror=None)
+
+    monkeypatch.setattr(q.os, "replace", _once)
+    with pytest.raises(PermissionError):
+        q.write_heartbeat(tmp_path, {"model": "small"})
+    assert attempts["n"] == 1
+
+
+def test_atomic_write_exhausts_winerror_32_retries_and_cleans_tmp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Persistent winerror 32 re-raises after six attempts and unlinks tmp."""
+    monkeypatch.setattr(q, "sleep", lambda _delay: None)
+    attempts = {"n": 0}
+
+    def _always(src: str | os.PathLike[str], dst: str | os.PathLike[str]) -> None:
+        attempts["n"] += 1
+        raise _permission_error(winerror=32)
+
+    monkeypatch.setattr(q.os, "replace", _always)
+    with pytest.raises(PermissionError):
+        q.write_heartbeat(tmp_path, {"model": "small"})
+    assert attempts["n"] == 6
+    assert list((tmp_path / "control").glob("*.tmp")) == []
+
+
+def test_daemon_lock_try_acquire_false_when_stale_unlink_denied(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A sharing-locked stale lock file is treated as still held."""
+    q.ensure_layout(tmp_path)
+    lock_path = tmp_path / "control" / "daemon.lock"
+    lock_path.write_text("999999", encoding="utf-8")
+    real_unlink = Path.unlink
+
+    def _blocked_unlink(self: Path, *args: object, **kwargs: object) -> None:
+        if self.resolve() == lock_path.resolve():
+            msg = "sharing violation"
+            raise PermissionError(msg)
+        real_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(q.Path, "unlink", _blocked_unlink)
+    lock = q.DaemonLock(tmp_path)
+    assert not lock.try_acquire()

@@ -21,16 +21,19 @@ single writer (one daemon) and many short-lived clients.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from time import time
+from time import sleep, time
 from typing import Any, Literal, Self
 
 from core.settings import get_project_cache_dir
+
+logger = logging.getLogger(__name__)
 
 # * Override the queue root for tests or multi-tenant deployments.
 ENV_QUEUE_DIR = "ASKVLM_EXTERNAL_QUEUE_DIR"
@@ -272,6 +275,51 @@ def ensure_layout(queue_dir: Path) -> None:
         (queue_dir / name).mkdir(parents=True, exist_ok=True)
 
 
+# * Windows sharing/access violations that are safe to retry on os.replace.
+_WINDOWS_REPLACE_RETRY_WINERRORS = (5, 32)
+_REPLACE_RETRY_ATTEMPTS = 6
+_REPLACE_RETRY_BASE_DELAY_S = 0.05
+
+
+def _replace_with_retry(tmp: Path, path: Path) -> None:
+    """Replace *path* with *tmp* via :func:`os.replace`, retrying Windows shares.
+
+    Readers on Windows may briefly hold the destination file. That surfaces as
+    ``PermissionError`` with ``winerror`` 5 or 32. Other ``OSError`` values,
+    including POSIX ``EACCES`` (no ``winerror``), are re-raised immediately.
+
+    Args:
+        tmp: Temporary file that already contains the new contents.
+        path: Destination path to replace atomically.
+
+    Raises:
+        OSError: On a non-retryable failure, or after six transient Windows
+            sharing/access violations.
+
+    """
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            # * Path.replace calls os.replace; tests monkeypatch os.replace.
+            tmp.replace(path)
+        except OSError as exc:
+            winerror = getattr(exc, "winerror", None)
+            if winerror not in _WINDOWS_REPLACE_RETRY_WINERRORS:
+                raise
+            if attempt >= _REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            delay_s = _REPLACE_RETRY_BASE_DELAY_S * (2**attempt)
+            logger.debug(
+                "atomic replace retry: path=%s winerror=%s attempt=%s delay_s=%s",
+                path,
+                winerror,
+                attempt + 1,
+                delay_s,
+            )
+            sleep(delay_s)
+        else:
+            return
+
+
 def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
     """Write *payload* as JSON to *path* atomically.
 
@@ -290,7 +338,7 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             json.dump(payload, handle, ensure_ascii=False)
             handle.flush()
             os.fsync(handle.fileno())
-        tmp_path.replace(path)
+        _replace_with_retry(tmp_path, path)
     finally:
         if tmp_path.exists():
             tmp_path.unlink(missing_ok=True)
@@ -649,7 +697,11 @@ class DaemonLock:
         ):
             return False
         # * No fresh heartbeat: the previous owner is gone. Reclaim the lock.
-        self._lock_path.unlink(missing_ok=True)
+        try:
+            self._lock_path.unlink(missing_ok=True)
+        except PermissionError:
+            # ! Windows may still hold the lock file of a live process.
+            return False
         return self._open_exclusive()
 
     def release(self) -> None:
