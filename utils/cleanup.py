@@ -7,11 +7,16 @@ to free up disk space and ensure clean development environment.
 
 import argparse
 import contextlib
+import logging
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+from core.temp_gc import purge_stale_askvlm_temp_dirs
+
+logger = logging.getLogger(__name__)
 
 
 def get_size_mb(path: str) -> float:
@@ -170,6 +175,12 @@ def clean_temp_files(*, verbose: bool = False) -> float:
     except OSError:
         if verbose:
             pass
+
+    try:
+        askvlm_gc = purge_stale_askvlm_temp_dirs(temp_root=temp_dir)
+        freed_size += askvlm_gc.freed_bytes / (1024 * 1024)
+    except Exception as exc:  # noqa: BLE001 - cleanup command must stay best-effort
+        logger.warning("cleanup askvlm temp GC failed: error=%s", exc)
 
     return freed_size
 

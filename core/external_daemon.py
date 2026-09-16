@@ -40,6 +40,7 @@ from core.external_queue import (
     write_result,
 )
 from core.stt_providers import STT_PROVIDER_WHISPER, normalize_stt_provider
+from core.temp_gc import purge_stale_askvlm_temp_dirs
 
 if TYPE_CHECKING:
     from concurrent.futures import Future
@@ -323,18 +324,28 @@ def run_daemon(
     if not lock.try_acquire():
         logger.info("external-transcribe daemon already running: queue=%s", resolved)
         return 0
-    event = stop_event or threading.Event()
-    worker = transcribe_fn or build_local_transcribe_fn(resolved_config)
-    logger.info(
-        "external-transcribe daemon starting: queue=%s provider=%s model=%s "
-        "device=%s workers=%d",
-        resolved,
-        normalize_stt_provider(resolved_config.stt_provider),
-        resolved_config.whisper_model,
-        resolved_config.device,
-        resolved_config.max_workers,
-    )
     try:
+        try:
+            gc_summary = purge_stale_askvlm_temp_dirs()
+            logger.info(
+                "external-transcribe daemon temp GC: deleted=%d skipped=%d freed_bytes=%d",
+                gc_summary.deleted_dirs,
+                gc_summary.skipped_dirs,
+                gc_summary.freed_bytes,
+            )
+        except Exception as exc:  # noqa: BLE001 - defense in depth around startup GC
+            logger.warning("external-transcribe daemon temp GC failed: error=%s", exc)
+        event = stop_event or threading.Event()
+        worker = transcribe_fn or build_local_transcribe_fn(resolved_config)
+        logger.info(
+            "external-transcribe daemon starting: queue=%s provider=%s model=%s "
+            "device=%s workers=%d",
+            resolved,
+            normalize_stt_provider(resolved_config.stt_provider),
+            resolved_config.whisper_model,
+            resolved_config.device,
+            resolved_config.max_workers,
+        )
         with ThreadPoolExecutor(
             max_workers=resolved_config.max_workers,
             thread_name_prefix="askvlm-transcribe",

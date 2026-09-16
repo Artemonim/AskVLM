@@ -16,11 +16,21 @@ from core.external_daemon import (
     process_claimed_job,
     run_daemon,
 )
+from core.temp_gc import TempGcSummary
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 TranscribeFn = Callable[[q.TranscribeJob, Callable[[], bool]], q.TranscribeResult]
+
+
+@pytest.fixture(autouse=True)
+def _stub_temp_gc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stub temp GC to keep daemon tests isolated from real system temp."""
+    monkeypatch.setattr(
+        "core.external_daemon.purge_stale_askvlm_temp_dirs",
+        lambda: TempGcSummary(),
+    )
 
 
 def _job(job_id: str = "j", *, deadline_at: float | None = None) -> q.TranscribeJob:
@@ -235,11 +245,20 @@ def test_process_claimed_job_rejects_gigaam_head_mismatch(
     assert calls["n"] == 0
 
 
-def test_run_daemon_exits_when_already_running(tmp_path: Path) -> None:
+def test_run_daemon_exits_when_already_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A second daemon exits immediately while the first is alive."""
     q.ensure_layout(tmp_path)
     (tmp_path / "control" / "daemon.lock").write_text("123", encoding="utf-8")
     q.write_heartbeat(tmp_path, {"model": "small"})
+    gc_calls = {"n": 0}
+
+    def _gc() -> TempGcSummary:
+        gc_calls["n"] += 1
+        return TempGcSummary()
+
+    monkeypatch.setattr("core.external_daemon.purge_stale_askvlm_temp_dirs", _gc)
     calls = {"n": 0}
 
     def _fn(
@@ -251,6 +270,73 @@ def test_run_daemon_exits_when_already_running(tmp_path: Path) -> None:
     code = run_daemon(tmp_path, config=DaemonConfig(), transcribe_fn=_fn)
     assert code == 0
     assert calls["n"] == 0
+    assert gc_calls["n"] == 0
+
+
+def test_run_daemon_runs_temp_gc_once_after_lock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The daemon runs startup temp GC exactly once after lock acquisition."""
+    gc_calls = {"n": 0}
+
+    def _gc() -> TempGcSummary:
+        gc_calls["n"] += 1
+        return TempGcSummary()
+
+    monkeypatch.setattr("core.external_daemon.purge_stale_askvlm_temp_dirs", _gc)
+    code = run_daemon(
+        tmp_path,
+        config=DaemonConfig(
+            poll_interval_s=0.01, heartbeat_interval_s=0.01, idle_shutdown_s=0.05
+        ),
+        transcribe_fn=_ok_fn("unused"),
+    )
+    assert code == 0
+    assert gc_calls["n"] == 1
+
+
+def test_run_daemon_survives_temp_gc_exception(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A startup GC failure never aborts the daemon lifecycle."""
+
+    def _gc_fail() -> TempGcSummary:
+        msg = "gc boom"
+        raise RuntimeError(msg)
+
+    monkeypatch.setattr("core.external_daemon.purge_stale_askvlm_temp_dirs", _gc_fail)
+    code = run_daemon(
+        tmp_path,
+        config=DaemonConfig(
+            poll_interval_s=0.01, heartbeat_interval_s=0.01, idle_shutdown_s=0.05
+        ),
+        transcribe_fn=_ok_fn("unused"),
+    )
+    assert code == 0
+
+
+def test_run_daemon_releases_lock_if_gc_gets_keyboard_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lock cleanup still runs when startup GC is interrupted."""
+
+    def _gc_interrupt() -> TempGcSummary:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        "core.external_daemon.purge_stale_askvlm_temp_dirs", _gc_interrupt
+    )
+    with pytest.raises(KeyboardInterrupt):
+        run_daemon(
+            tmp_path,
+            config=DaemonConfig(
+                poll_interval_s=0.01,
+                heartbeat_interval_s=0.01,
+                idle_shutdown_s=0.05,
+            ),
+            transcribe_fn=_ok_fn("unused"),
+        )
+    assert not (tmp_path / "control" / "daemon.lock").exists()
 
 
 def test_run_daemon_processes_queued_job(tmp_path: Path) -> None:
