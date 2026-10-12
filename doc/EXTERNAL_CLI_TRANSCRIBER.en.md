@@ -7,15 +7,15 @@
 The flow is designed for machine interaction:
 
 - Default Whisper model is `small`.
-- Default STT provider is `whisper` (`--stt-provider whisper`). Optional CPU-only GigaAM providers:
-  - `gigaam-ctc` — `ai-sage/GigaAM-Multilingual` revision `ctc`, no punctuation or capitalization;
-  - `gigaam-e2e-ctc` — `ai-sage/GigaAM-v3` revision `e2e_ctc`, **with** punctuation and capitalization (BPE + ITN).
+- Default STT provider is `whisper` (`--stt-provider whisper`). Optional GigaAM providers:
+  - `gigaam-ctc` — `ai-sage/GigaAM-Multilingual` revision `ctc`, no punctuation or capitalization; CPU only;
+  - `gigaam-e2e-ctc` — `ai-sage/GigaAM-v3` revision `e2e_ctc`, **with** punctuation and capitalization (BPE + ITN); CPU or CUDA.
 - By default the command writes only the transcript text to `stdout`.
 - Speaker diarization and LLM dialog formatting are disabled by default.
 - The model is loaded on demand and unloaded after the command finishes (legacy `--no-daemon`; resident in daemon mode).
-- If CUDA is available but VRAM allocation for Whisper fails, AskVLM automatically retries Whisper on CPU.
-- GigaAM (`gigaam-ctc` and `gigaam-e2e-ctc`) does not use CUDA, Whisper CUDA fallbacks, or Windows GPU child isolation: CPU only.
-- On Windows with `--device` other than `cpu` (Whisper only), the command runs in an isolated child process to reduce the impact of upstream crash-on-exit bugs (`faster-whisper`/`ctranslate2`) on the calling process (legacy `--no-daemon` mode only).
+- If CUDA is available but VRAM allocation for Whisper or `gigaam-e2e-ctc` fails, AskVLM automatically continues on CPU (details in the "Default Behavior" section).
+- `gigaam-ctc` does not use CUDA, CUDA→CPU recovery, or Windows GPU child isolation: CPU only.
+- On Windows with `--device` other than `cpu` (Whisper and `gigaam-e2e-ctc`), the command runs in an isolated child process to reduce the impact of upstream crash-on-exit bugs (`faster-whisper`/`ctranslate2`, the torch CUDA runtime) on the calling process (legacy `--no-daemon` mode only).
 
 ## Daemon orchestrator and file queue (default mode)
 
@@ -24,7 +24,7 @@ Starting with this version, `external-transcribe` defaults to acting as a **thin
 1. The client checks whether the daemon is alive (via heartbeat). If not, it starts one **detached** `external-transcribe-daemon` process and waits for readiness.
 2. The client enqueues a job in the file queue (default `<project>/.cache/external_queue`), waits for the result up to `--client-timeout`, prints the transcript, and exits.
 3. If `--client-timeout` expires, the client **signals the daemon to drop** the job (cancel marker) so the daemon does not waste resources on an abandoned task and the queue does not accumulate stale entries.
-4. **Bounded CPU recovery.** If the request targeted GPU (`--device` ≠ `cpu`) and the daemon was degraded (client timeout expired or daemon unavailable), the client performs one built-in (in-process) CPU transcription pass before exiting. On success it prints the transcript and exits with code `0`; only if the CPU pass also fails does the command return a degraded exit code (`10` for timeout, `11` for unavailable daemon). This prevents a stuck/unavailable GPU daemon from silently losing the transcript. For explicit `--device cpu`, no extra pass is performed (nothing to recover from).
+4. **Bounded CPU recovery.** If the request targeted GPU (`--device` ≠ `cpu`) for a CUDA-capable provider (Whisper or `gigaam-e2e-ctc`) and the daemon was degraded (client timeout expired or daemon unavailable), the client performs one built-in (in-process) CPU transcription pass with the same provider before exiting. On success it prints the transcript and exits with code `0`; only if the CPU pass also fails does the command return a degraded exit code (`10` for timeout, `11` for unavailable daemon). This prevents a stuck/unavailable GPU daemon from silently losing the transcript. For explicit `--device cpu` and for `gigaam-ctc`, no extra pass is performed (nothing to recover from). The `gigaam-e2e-ctc` CPU pass loads the model into the client process (~2.9 GB RAM for the duration of the pass); callers with a strict RAM budget should pass an explicit `--device cpu`.
 
 Why this matters:
 
@@ -39,16 +39,20 @@ Start the daemon manually (optional — the client starts it automatically):
 python cli.py external-transcribe-daemon --workers 1 --whisper-model small --device cuda
 ```
 
-GigaAM (CPU; deps already in `.[ml]`):
+GigaAM (deps already in `.[ml]`; `gigaam-ctc` — CPU, `gigaam-e2e-ctc` — CPU or CUDA):
 
 ```powershell
 python cli.py external-transcribe-daemon --stt-provider gigaam-ctc --device cpu
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc
 python cli.py external-transcribe-daemon --stt-provider gigaam-e2e-ctc --device cpu
-python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cpu
+python cli.py external-transcribe-daemon --stt-provider gigaam-e2e-ctc --device cuda
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cuda
 ```
 
-If a daemon is already live with a different `--stt-provider`, the client will **not** submit the job to the wrong resident model: it returns unavailable / mismatch. The singleton is preserved — restart the daemon with the desired provider.
+If a daemon is already live with a different `--stt-provider`, the client will **not** submit the job to the wrong resident model: it returns unavailable / mismatch. The singleton is preserved — restart the daemon with the desired provider. For a GPU request of a CUDA-capable provider (Whisper, `gigaam-e2e-ctc`), such an unavailable result triggers the bounded CPU recovery (step 4), and the built-in CPU pass produces the transcript; with `--device cpu` and for `gigaam-ctc`, the command exits with code `11`.
+
+The live daemon's device is compared with the request for diagnostics only: if the daemon heartbeat and the client's `--device` differ by class (`cpu` versus `auto`/`cuda`), the client writes a warning with the `ASKVLM_DAEMON_DEVICE_MISMATCH` marker to `stderr`, and the resident daemon still serves the job on its own device. To change the device, restart the daemon with the desired `--device`. The heartbeat carries the token requested when the daemon started (`auto`/`cpu`/`cuda`), not the actual device after selection and fallback.
 
 Legacy one-shot run without the daemon (old "model in this same process" behavior):
 
@@ -67,9 +71,9 @@ pip install -e .[ml]
 .\run.ps1 -SkipLaunch -Fast
 ```
 
-The `[ml]` stack includes torch/torchaudio **2.10** (CUDA wheels repaired by `run.ps1`/`build.ps1` by default: cu128 → cu126), transformers 5, hydra-core, omegaconf, **sentencepiece**, and **pyannote.audio**. The last two are required by remote-code modeling even for short-form `.transcribe` (no longform/VAD). On CPU, `gigaam-ctc` uses roughly ~2.5 GB RAM and `gigaam-e2e-ctc` ~2.9 GB RAM (vs compact Whisper Small CPU); neither uses VRAM.
+The `[ml]` stack includes torch/torchaudio **2.10** (CUDA wheels repaired by `run.ps1`/`build.ps1` by default: cu128 → cu126), transformers 5, hydra-core, omegaconf, **sentencepiece**, and **pyannote.audio**. The last two are required by remote-code modeling even for short-form `.transcribe` (no longform/VAD). On CPU, `gigaam-ctc` uses roughly ~2.5 GB RAM and `gigaam-e2e-ctc` ~2.9 GB RAM (vs compact Whisper Small CPU); on CPU neither uses VRAM. `gigaam-e2e-ctc` on CUDA uses about 1.5–1.65 GB VRAM per process (CUDA context, fp32 weights ~0.85 GB, 20 s window activations under fp16 autocast; nvidia-smi measurement on an RTX 3070, torch 2.10 + cu128).
 
-Model load uses Hugging Face Transformers with `trust_remote_code=True` **only** for two pinned repos: `ai-sage/GigaAM-Multilingual` at revision `ctc` and `ai-sage/GigaAM-v3` at revision `e2e_ctc` (the cards' official remote-code API). That trust is scoped to these models/revisions, not to arbitrary HF repos. For v3 the wrapper patches `hydra.utils.instantiate` (CPU device) and `PreTrainedModel._finalize_model_loading` (transformers 5.x compat) around `from_pretrained` and **always** restores the originals in `finally`, including when load raises. If remote code raises `ImportError`/`ModuleNotFoundError` because `[ml]` is incomplete, the wrapper surfaces `pip install -e ".[ml]"` and keeps the missing module name.
+Model load uses Hugging Face Transformers with `trust_remote_code=True` **only** for two pinned repos: `ai-sage/GigaAM-Multilingual` at revision `ctc` and `ai-sage/GigaAM-v3` at revision `e2e_ctc` (the cards' official remote-code API). That trust is scoped to these models/revisions, not to arbitrary HF repos. For v3 the wrapper patches `hydra.utils.instantiate` (CPU device) and `PreTrainedModel._finalize_model_loading` (transformers 5.x compat) around `from_pretrained` and **always** restores the originals in `finally`, including when load raises. The v3 weights are always loaded on CPU and cast to fp32; for `--device auto|cuda` the finished model is then moved to CUDA as a whole, after the patches are removed. The model is not converted to fp16 as a whole: the mel frontend (n_fft=320) stays fp32, and on CUDA the encoder runs under the remote code's own `torch.autocast(float16)`. If remote code raises `ImportError`/`ModuleNotFoundError` because `[ml]` is incomplete, the wrapper surfaces `pip install -e ".[ml]"` and keeps the missing module name.
 
 Do not install `torch` from PyPI on top of a CUDA build without a follow-up `run.ps1`/`build.ps1`: bare `pip install -e .[ml]` often leaves CPU `torch 2.10.0`. Opt out with `-SkipEnsureCUDA`. See `doc/CUDA_SETUP.md`.
 
@@ -113,11 +117,12 @@ Explicitly specify language:
 python cli.py external-transcribe "C:\media\call.wav" --language ru
 ```
 
-Select GigaAM (CPU):
+Select GigaAM:
 
 ```powershell
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc --device cpu
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cpu
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cuda
 ```
 
 ## Command Contract
@@ -168,17 +173,30 @@ Behavior of `--device auto` for Whisper:
 2. If model loading or GPU inference fails due to insufficient GPU memory, AskVLM unloads Whisper and retries on CPU.
 3. The CPU fallback automatically picks a safe compute type for CPU.
 
-For `--stt-provider gigaam-ctc` and `gigaam-e2e-ctc` the device is always CPU (`auto` → `cpu`); `cuda` is rejected before model load. Whisper-only parameters (`--compute-type`, beam/VAD) are not sent to GigaAM.
+For `--stt-provider gigaam-ctc` the device is always CPU (`auto` → `cpu`); `cuda` is rejected before model load.
+
+For `--stt-provider gigaam-e2e-ctc` the `--device` token (`auto`/`cpu`/`cuda`) is validated without importing torch and resolved at model load:
+
+1. `cpu` — the model stays on CPU, CUDA is not touched.
+2. `cuda` — the model is moved to CUDA if CUDA is available; otherwise it runs on CPU with a warning in the log (the command does not fail).
+3. `auto` — CUDA is chosen only if CUDA is available and `torch.cuda.mem_get_info` reports at least 2.5 GiB of free VRAM (`GIGAAM_AUTO_CUDA_MIN_FREE_VRAM_BYTES` in `core/gigaam_device.py`: the process peak of ~1.6 GiB plus headroom for a GPU neighbor, such as a resident Whisper daemon); otherwise CPU with a warning. The free-VRAM query creates the process's CUDA context; if `auto` then stays on CPU, the context (a few hundred MiB) is held until the process exits.
+4. A GPU out-of-memory error while moving the model returns the whole model to CPU (no mixed weight placement) and releases the CUDA cache.
+5. A GPU out-of-memory error on a given 20-second window moves the model to CPU, releases the CUDA cache, and retries that same window on CPU; subsequent windows and jobs of the resident daemon stay on CPU until the process restarts.
+6. Unloading the model (`close`/`unload`) after CUDA work releases the CUDA cache (`torch.cuda.empty_cache`).
+
+On CUDA the encoder runs under fp16 autocast, so the text may differ slightly from a CPU run (on the 5-minute test file — 2 words out of 453). The resident daemon on CUDA processes a 5-minute file about 3.5× faster than on CPU (RTX 3070 measurement: about 2.9 s versus 10 s per job, including client startup); in one-shot `--no-daemon` mode on short files CUDA is slower than CPU because of CUDA initialization and the child process.
+
+Whisper-only parameters (`--compute-type`, beam/VAD) are not sent to GigaAM.
 
 This way an overloaded GPU does not block local integration as long as there is enough RAM in the system.
 
-The fallback guarantee applies to the standard single-pass Whisper path. Options like diarization may require additional GPU capacity. GigaAM does not participate in Whisper CUDA→CPU recovery.
+The fallback guarantee applies to the standard single-pass Whisper path and to `gigaam-e2e-ctc`. Options like diarization may require additional GPU capacity. `gigaam-ctc` does not participate in CUDA→CPU recovery.
 
-In addition to OOM fallback inside the Whisper path, daemon mode adds an external bounded CPU fallback at the client level: on timeout or GPU daemon unavailability, one in-process CPU pass is performed (see step 4 above). This covers cases where the GPU daemon hung or crashed and can no longer unload or switch to CPU on its own.
+In addition to OOM fallback inside the model path, daemon mode adds an external bounded CPU fallback at the client level: on timeout or GPU daemon unavailability, one in-process CPU pass is performed (see step 4 above). This covers cases where the GPU daemon hung or crashed and can no longer unload or switch to CPU on its own.
 
 ## Reliability on Windows (subprocess isolation)
 
-For `external-transcribe` on Windows with `--device != cpu`, AskVLM runs transcription in a child process:
+For `external-transcribe` on Windows with `--device != cpu` (Whisper and `gigaam-e2e-ctc`; `gigaam-ctc` always runs in-process on CPU), AskVLM runs transcription in a child process:
 
 1. The parent launches the same CLI entrypoint with internal hidden child-mode flags.
 2. The child writes a service JSON result before `pipeline.close(...)`.
@@ -341,6 +359,8 @@ Instead of a duration gate and a short-form branch, the wrapper **always** strea
 - a non-standard WAV header (`wave.Error` / `EOFError`, including WAVE_FORMAT_EXTENSIBLE on Python 3.11) — one ffmpeg re-encode to PCM 16 kHz mono, then the same window loop.
 
 Cancel of a long job is cooperative: the pipeline raises `CancelledError` from `on_segment` between chunks, not inside a single model call.
+
+For `gigaam-e2e-ctc` on CUDA, a window that fails with a VRAM out-of-memory error is retried on CPU, so the stitched result has no skipped windows.
 
 ### `--client-timeout` for long files
 

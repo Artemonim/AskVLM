@@ -11,6 +11,7 @@ packages, so it is fully unit-testable with an injected spawner and clock.
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from collections.abc import Callable
@@ -35,12 +36,15 @@ from core.external_queue import (
 )
 from core.stt_providers import STT_PROVIDER_WHISPER, normalize_stt_provider
 
+logger = logging.getLogger(__name__)
+
 ClientStatus = Literal["ok", "empty", "error", "timeout", "unavailable"]
 
 # * Maximum time to wait for a freshly spawned daemon to publish a heartbeat.
 _DAEMON_START_TIMEOUT_SECONDS = 30.0
 _POLL_INTERVAL_SECONDS = 0.25
 _PROVIDER_MISMATCH_MARKER = "ASKVLM_DAEMON_PROVIDER_MISMATCH"
+_DEVICE_MISMATCH_MARKER = "ASKVLM_DAEMON_DEVICE_MISMATCH"
 
 SpawnFn = Callable[[], None]
 
@@ -169,6 +173,49 @@ def _provider_mismatch_detail(*, daemon_provider: str, requested: str) -> str:
         f"{_PROVIDER_MISMATCH_MARKER}: live daemon stt_provider={daemon_provider!r} "
         f"does not match requested {requested!r}; keep the singleton daemon and "
         f"restart it with --stt-provider {requested}"
+    )
+
+
+def _device_class(token: object) -> str:
+    """Collapse a device token to ``cpu`` or ``gpu`` (any GPU-preferring token).
+
+    Args:
+        token: Device token such as ``auto``, ``cuda``, or ``cpu``.
+
+    Returns:
+        ``"cpu"`` for an explicit CPU token, otherwise ``"gpu"``.
+
+    """
+    return "cpu" if str(token).strip().lower() == "cpu" else "gpu"
+
+
+def _warn_on_device_mismatch(queue_dir: Path, requested_device: str) -> None:
+    """Log when the live daemon's device class differs from the request.
+
+    The mismatch is advisory: the resident daemon keeps serving the job on the
+    device it was started with, so the request is not rejected.
+
+    Args:
+        queue_dir: The queue root directory.
+        requested_device: The ``--device`` token of this client request.
+
+    """
+    beacon = read_heartbeat(queue_dir)
+    if beacon is None:
+        return
+    raw = beacon.get("device")
+    if raw is None or not str(raw).strip():
+        return
+    if _device_class(raw) == _device_class(requested_device):
+        return
+    logger.warning(
+        "%s: live daemon device=%r differs from requested device=%r; the "
+        "resident daemon keeps serving on its own device (restart it with "
+        "--device %s to change)",
+        _DEVICE_MISMATCH_MARKER,
+        str(raw),
+        requested_device,
+        requested_device,
     )
 
 
@@ -309,6 +356,7 @@ def run_client_transcribe(
                     requested=requested_provider,
                 ),
             )
+        _warn_on_device_mismatch(resolved, request.device)
     elif not ensure_daemon_running(
         resolved, request, spawn=spawn, clock=clock, sleeper=sleeper
     ):

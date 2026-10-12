@@ -7,15 +7,15 @@
 Поток заточен под машинное взаимодействие:
 
 - Модель Whisper по умолчанию — `small`.
-- Провайдер STT по умолчанию — `whisper` (`--stt-provider whisper`). Опционально доступны CPU-only GigaAM:
-  - `gigaam-ctc` — `ai-sage/GigaAM-Multilingual` revision `ctc`, без пунктуации и капитализации;
-  - `gigaam-e2e-ctc` — `ai-sage/GigaAM-v3` revision `e2e_ctc`, **с** пунктуацией и капитализацией (BPE + ITN).
+- Провайдер STT по умолчанию — `whisper` (`--stt-provider whisper`). Опционально доступны GigaAM:
+  - `gigaam-ctc` — `ai-sage/GigaAM-Multilingual` revision `ctc`, без пунктуации и капитализации; только CPU;
+  - `gigaam-e2e-ctc` — `ai-sage/GigaAM-v3` revision `e2e_ctc`, **с** пунктуацией и капитализацией (BPE + ITN); CPU или CUDA.
 - Команда по умолчанию пишет только текст транскрипта в `stdout`.
 - Диаризация спикеров и LLM-форматирование диалога по умолчанию выключены.
 - Модель подгружается по требованию и выгружается после завершения команды (в legacy `--no-daemon`; в режиме демона — резидентно).
-- Если CUDA доступна, но выделение VRAM для Whisper не удаётся, AskVLM автоматически повторяет запуск Whisper на CPU.
-- GigaAM (`gigaam-ctc` и `gigaam-e2e-ctc`) не использует CUDA, CUDA-fallback Whisper и Windows GPU child-isolation: только CPU.
-- На Windows при `--device` отличном от `cpu` (только Whisper) команда использует изолированный child-процесс, чтобы снизить влияние upstream crash-on-exit (`faster-whisper`/`ctranslate2`) на вызывающий процесс (только legacy-режим `--no-daemon`).
+- Если CUDA доступна, но выделение VRAM для Whisper или `gigaam-e2e-ctc` не удаётся, AskVLM автоматически продолжает на CPU (подробности — в разделе «Поведение по умолчанию»).
+- `gigaam-ctc` не использует CUDA, CUDA→CPU recovery и Windows GPU child-isolation: только CPU.
+- На Windows при `--device` отличном от `cpu` (Whisper и `gigaam-e2e-ctc`) команда использует изолированный child-процесс, чтобы снизить влияние upstream crash-on-exit (`faster-whisper`/`ctranslate2`, CUDA-рантайм torch) на вызывающий процесс (только legacy-режим `--no-daemon`).
 
 ## Демон-оркестратор и файловая очередь (режим по умолчанию)
 
@@ -24,7 +24,7 @@
 1. Клиент проверяет, жив ли демон (по heartbeat). Если нет — запускает один **detached** процесс `external-transcribe-daemon` и ждёт его готовности.
 2. Клиент кладёт задание в файловую очередь (по умолчанию `<project>/.cache/external_queue`), ждёт результат до `--client-timeout`, печатает транскрипт и завершается.
 3. Если истёк `--client-timeout`, клиент **сигнализирует демону дроп** задания (cancel-маркер), чтобы демон не тратил ресурсы на брошенную задачу и очередь не копила «висяки».
-4. **Bounded CPU-recovery.** Если запрос был на GPU (`--device` ≠ `cpu`), а демон оказался деградирован (истёк `--client-timeout` или демон недоступен), клиент перед выходом делает один встроенный (in-process) проход транскрипции на CPU. При успехе печатается транскрипт и команда завершается с кодом `0`; только если CPU-проход тоже не дал результата, команда возвращает деградированный код выхода (`10` для таймаута, `11` для недоступного демона). Так зависший/недоступный GPU-демон больше не теряет транскрипт молча. Для явного `--device cpu` дополнительный проход не выполняется (восстанавливаться не из чего).
+4. **Bounded CPU-recovery.** Если запрос был на GPU (`--device` ≠ `cpu`) у провайдера, умеющего CUDA (Whisper или `gigaam-e2e-ctc`), а демон оказался деградирован (истёк `--client-timeout` или демон недоступен), клиент перед выходом делает один встроенный (in-process) проход транскрипции на CPU тем же провайдером. При успехе печатается транскрипт и команда завершается с кодом `0`; только если CPU-проход тоже не дал результата, команда возвращает деградированный код выхода (`10` для таймаута, `11` для недоступного демона). Так зависший/недоступный GPU-демон не теряет транскрипт молча. Для явного `--device cpu` и для `gigaam-ctc` дополнительный проход не выполняется (восстанавливаться не из чего). CPU-проход `gigaam-e2e-ctc` загружает модель в процесс клиента (~2.9 ГБ RAM на время прохода); вызывающим с жёстким бюджетом RAM подходит явный `--device cpu`.
 
 Зачем это нужно:
 
@@ -39,16 +39,20 @@
 python cli.py external-transcribe-daemon --workers 1 --whisper-model small --device cuda
 ```
 
-GigaAM (CPU; зависимости уже в `.[ml]`):
+GigaAM (зависимости уже в `.[ml]`; `gigaam-ctc` — CPU, `gigaam-e2e-ctc` — CPU или CUDA):
 
 ```powershell
 python cli.py external-transcribe-daemon --stt-provider gigaam-ctc --device cpu
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc
 python cli.py external-transcribe-daemon --stt-provider gigaam-e2e-ctc --device cpu
-python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cpu
+python cli.py external-transcribe-daemon --stt-provider gigaam-e2e-ctc --device cuda
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cuda
 ```
 
-Если уже жив демон с другим `--stt-provider`, клиент **не** отправит задание в «чужую» резидентную модель: вернётся unavailable / mismatch. Singleton сохраняется — перезапустите демон с нужным провайдером.
+Если уже жив демон с другим `--stt-provider`, клиент **не** отправит задание в «чужую» резидентную модель: вернётся unavailable / mismatch. Singleton сохраняется — перезапустите демон с нужным провайдером. Для GPU-запроса провайдера с CUDA (Whisper, `gigaam-e2e-ctc`) такой unavailable запускает bounded CPU-recovery (шаг 4), и транскрипт выдаёт встроенный CPU-проход; с `--device cpu` и для `gigaam-ctc` команда завершается кодом `11`.
+
+Устройство живого демона сверяется с запросом только для диагностики: если heartbeat демона и `--device` клиента расходятся по классу (`cpu` против `auto`/`cuda`), клиент пишет в `stderr` предупреждение с маркером `ASKVLM_DAEMON_DEVICE_MISMATCH`, а задание всё равно обслуживает резидентный демон на своём устройстве. Чтобы сменить устройство, перезапустите демон с нужным `--device`. Heartbeat несёт запрошенный при старте демона токен (`auto`/`cpu`/`cuda`), а не фактическое устройство после выбора и fallback.
 
 Legacy одноразовый запуск без демона (старое поведение «модель в этом же процессе»):
 
@@ -67,9 +71,9 @@ pip install -e .[ml]
 .\run.ps1 -SkipLaunch -Fast
 ```
 
-Стек `[ml]` включает torch/torchaudio **2.10** (CUDA-колёса чинит `run.ps1`/`build.ps1` по умолчанию: cu128 → cu126), transformers 5, hydra-core, omegaconf, **sentencepiece**, **pyannote.audio**. Последние два нужны remote-code modeling GigaAM даже для short-form `.transcribe` (без longform/VAD). На CPU `gigaam-ctc` занимает порядка ~2.5 ГБ RAM, `gigaam-e2e-ctc` — ~2.9 ГБ RAM (против компактного Whisper Small CPU); оба не занимают VRAM.
+Стек `[ml]` включает torch/torchaudio **2.10** (CUDA-колёса чинит `run.ps1`/`build.ps1` по умолчанию: cu128 → cu126), transformers 5, hydra-core, omegaconf, **sentencepiece**, **pyannote.audio**. Последние два нужны remote-code modeling GigaAM даже для short-form `.transcribe` (без longform/VAD). На CPU `gigaam-ctc` занимает порядка ~2.5 ГБ RAM, `gigaam-e2e-ctc` — ~2.9 ГБ RAM (против компактного Whisper Small CPU); на CPU оба не занимают VRAM. `gigaam-e2e-ctc` на CUDA занимает около 1.5–1.65 ГБ VRAM на процесс (CUDA-контекст, веса fp32 ~0.85 ГБ, активации окна 20 с под fp16 autocast; замер nvidia-smi на RTX 3070, torch 2.10 + cu128).
 
-Загрузка модели идёт через Hugging Face Transformers с `trust_remote_code=True` **только** для двух закреплённых репозиториев: `ai-sage/GigaAM-Multilingual` на revision `ctc` и `ai-sage/GigaAM-v3` на revision `e2e_ctc` (официальный remote-code API карточек). Это доверие относится к коду этих моделей/ревизий, а не к произвольным HF-репозиториям. Для v3 обёртка на время `from_pretrained` патчит `hydra.utils.instantiate` (CPU device) и `PreTrainedModel._finalize_model_loading` (compat с transformers 5.x) и **всегда** восстанавливает оригиналы в `finally`, в том числе при ошибке загрузки. Если remote-code поднимает `ImportError`/`ModuleNotFoundError` из‑за незакрытого `[ml]`, обёртка подсказывает `pip install -e ".[ml]"` и сохраняет имя недостающего модуля.
+Загрузка модели идёт через Hugging Face Transformers с `trust_remote_code=True` **только** для двух закреплённых репозиториев: `ai-sage/GigaAM-Multilingual` на revision `ctc` и `ai-sage/GigaAM-v3` на revision `e2e_ctc` (официальный remote-code API карточек). Это доверие относится к коду этих моделей/ревизий, а не к произвольным HF-репозиториям. Для v3 обёртка на время `from_pretrained` патчит `hydra.utils.instantiate` (CPU device) и `PreTrainedModel._finalize_model_loading` (compat с transformers 5.x) и **всегда** восстанавливает оригиналы в `finally`, в том числе при ошибке загрузки. Веса v3 всегда загружаются на CPU и приводятся к fp32; для `--device auto|cuda` готовая модель затем целиком переносится на CUDA уже после снятия патчей. Модель целиком в fp16 не переводится: mel-фронтенд (n_fft=320) остаётся fp32, а энкодер на CUDA выполняется под собственным `torch.autocast(float16)` remote-кода. Если remote-code поднимает `ImportError`/`ModuleNotFoundError` из‑за незакрытого `[ml]`, обёртка подсказывает `pip install -e ".[ml]"` и сохраняет имя недостающего модуля.
 
 Не ставьте `torch` с PyPI «поверх» CUDA-сборки без последующего `run.ps1`/`build.ps1`: голый `pip install -e .[ml]` часто оставляет CPU `torch 2.10.0`. Отказ от авточинки: `-SkipEnsureCUDA`. Подробности — в `doc/CUDA_SETUP.md`.
 
@@ -114,11 +118,12 @@ python cli.py external-transcribe "C:\media\call.wav" --device cpu
 python cli.py external-transcribe "C:\media\call.wav" --language ru
 ```
 
-Выбрать GigaAM (CPU):
+Выбрать GigaAM:
 
 ```powershell
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc --device cpu
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cpu
+python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cuda
 ```
 
 ## Контракт команды
@@ -169,17 +174,30 @@ python cli.py external-transcribe INPUT_PATH [options]
 2. Если загрузка модели или инференс на GPU падают из‑за нехватки памяти GPU, AskVLM выгружает Whisper и повторяет запуск на CPU.
 3. Fallback на CPU сам подбирает безопасный для CPU тип вычислений.
 
-Для `--stt-provider gigaam-ctc` и `gigaam-e2e-ctc` устройство всегда CPU (`auto` → `cpu`); `cuda` отклоняется до загрузки модели. Параметры Whisper (`--compute-type`, beam/VAD) в GigaAM не передаются.
+Для `--stt-provider gigaam-ctc` устройство всегда CPU (`auto` → `cpu`); `cuda` отклоняется до загрузки модели.
+
+Для `--stt-provider gigaam-e2e-ctc` токен `--device` (`auto`/`cpu`/`cuda`) проверяется без импорта torch, а разрешается при загрузке модели:
+
+1. `cpu` — модель остаётся на CPU, CUDA не трогается.
+2. `cuda` — модель переносится на CUDA, если CUDA доступна; иначе — CPU с предупреждением в логе (команда не падает).
+3. `auto` — CUDA выбирается, только если CUDA доступна и `torch.cuda.mem_get_info` показывает не меньше 2.5 ГиБ свободной VRAM (`GIGAAM_AUTO_CUDA_MIN_FREE_VRAM_BYTES` в `core/gigaam_device.py`: пик процесса ~1.6 ГиБ плюс запас для соседа по GPU, например резидентного Whisper-демона); иначе — CPU с предупреждением. Запрос свободной VRAM создаёт CUDA-контекст процесса; если `auto` затем остаётся на CPU, контекст (несколько сотен МиБ) удерживается до выхода процесса.
+4. Нехватка памяти GPU при переносе модели возвращает всю модель на CPU (без смешанного размещения весов) и освобождает кэш CUDA.
+5. Нехватка памяти GPU на очередном 20-секундном окне переносит модель на CPU, освобождает кэш CUDA и повторяет это же окно на CPU; последующие окна и задания резидентного демона остаются на CPU до перезапуска процесса.
+6. Выгрузка модели (`close`/`unload`) после работы на CUDA освобождает кэш CUDA (`torch.cuda.empty_cache`).
+
+На CUDA энкодер работает под fp16 autocast, поэтому текст может незначительно отличаться от CPU-прогона (на 5-минутном тестовом файле — 2 слова из 453). Резидентный демон на CUDA обрабатывает 5-минутный файл примерно в 3.5 раза быстрее, чем на CPU (замер на RTX 3070: около 2.9 с против 10 с на задание с учётом старта клиента); в одноразовом `--no-daemon` на коротких файлах CUDA медленнее CPU из-за инициализации CUDA и child-процесса.
+
+Параметры Whisper (`--compute-type`, beam/VAD) в GigaAM не передаются.
 
 Так перегруженный GPU не блокирует локальную интеграцию, пока в системе ещё достаточно RAM.
 
-Гарантия fallback относится к стандартному одноразовому пути Whisper. Опции вроде диаризации могут потребовать дополнительной ёмкости GPU. GigaAM не участвует в CUDA→CPU recovery Whisper.
+Гарантия fallback относится к стандартному одноразовому пути Whisper и к `gigaam-e2e-ctc`. Опции вроде диаризации могут потребовать дополнительной ёмкости GPU. `gigaam-ctc` не участвует в CUDA→CPU recovery.
 
-Помимо OOM-fallback внутри пути Whisper, режим демона добавляет внешний bounded CPU-fallback на уровне клиента: при таймауте или недоступности GPU-демона выполняется один встроенный проход на CPU (см. шаг 4 выше). Это покрывает случаи, когда GPU-демон завис или аварийно завершился и сам выгрузиться/переключиться на CPU уже не может.
+Помимо OOM-fallback внутри пути модели, режим демона добавляет внешний bounded CPU-fallback на уровне клиента: при таймауте или недоступности GPU-демона выполняется один встроенный проход на CPU (см. шаг 4 выше). Это покрывает случаи, когда GPU-демон завис или аварийно завершился и сам выгрузиться/переключиться на CPU уже не может.
 
 ## Надёжность на Windows (subprocess isolation)
 
-Для `external-transcribe` на Windows при `--device != cpu` AskVLM выполняет транскрипцию в child-процессе:
+Для `external-transcribe` на Windows при `--device != cpu` (Whisper и `gigaam-e2e-ctc`; `gigaam-ctc` всегда работает в процессе на CPU) AskVLM выполняет транскрипцию в child-процессе:
 
 1. Parent запускает тот же CLI entrypoint с внутренними скрытыми флагами child-mode.
 2. Child пишет служебный JSON-результат до `pipeline.close(...)`.
@@ -342,6 +360,8 @@ fps_used    = manifest["fps_used"]
 - нестандартный WAV-заголовок (`wave.Error` / `EOFError`, включая WAVE_FORMAT_EXTENSIBLE на Python 3.11) — один ре-энкод через ffmpeg в PCM 16 kHz mono, затем тот же оконный цикл.
 
 Отмена длинной джобы кооперативная: pipeline бросает `CancelledError` из `on_segment` между чанками, а не внутри одного вызова модели.
+
+Для `gigaam-e2e-ctc` на CUDA окно, упавшее по нехватке VRAM, повторяется на CPU, поэтому в склейке нет пропущенных окон.
 
 ### `--client-timeout` для длинных файлов
 

@@ -22,9 +22,10 @@ from core.external_daemon import DaemonConfig, run_daemon
 from core.stt_providers import (
     STT_PROVIDER_CHOICES,
     STT_PROVIDER_WHISPER,
-    is_cpu_only_gigaam_provider,
+    is_gigaam_provider,
     normalize_stt_provider,
-    resolve_gigaam_device,
+    provider_may_use_cuda,
+    resolve_gigaam_requested_device,
 )
 
 app = typer.Typer(
@@ -138,17 +139,21 @@ def _resolve_external_device(*, stt_provider: str, device: str) -> str:
         stt_provider: Canonical provider id.
         device: Raw ``--device`` token from the CLI.
 
+    Validation is torch-free: ``gigaam-ctc`` resolves to ``cpu``;
+    ``gigaam-e2e-ctc`` keeps ``auto``/``cpu``/``cuda`` and the model resolves
+    it against the live CUDA state at load time.
+
     Returns:
         Device token safe for the selected provider.
 
     Raises:
-        typer.BadParameter: When GigaAM is requested with a non-CPU device.
+        typer.BadParameter: When the device token is invalid for a GigaAM head.
 
     """
-    if not is_cpu_only_gigaam_provider(stt_provider):
+    if not is_gigaam_provider(stt_provider):
         return device
     try:
-        return resolve_gigaam_device(device)
+        return resolve_gigaam_requested_device(stt_provider, device)
     except ValueError as exc:
         raise typer.BadParameter(str(exc)) from exc
 
@@ -372,9 +377,10 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
     """Transcribe through the shared daemon and map the outcome to CLI rules.
 
     When the daemon is reachable-but-degraded (client timeout or no daemon) on a
-    GPU-seeded Whisper request, a bounded in-process CPU fallback is attempted
-    before the degraded exit code is surfaced. GigaAM providers are CPU-only and
-    are never used as a CUDA fallback path.
+    GPU-seeded request of a CUDA-capable provider (Whisper or
+    ``gigaam-e2e-ctc``), a bounded in-process CPU fallback is attempted before
+    the degraded exit code is surfaced. The CPU-only ``gigaam-ctc`` head has no
+    GPU state to recover from and skips it.
 
     Args:
         input_path: Media file to transcribe.
@@ -389,7 +395,8 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
         stt_provider: STT backend id (``whisper``, ``gigaam-ctc``, or
             ``gigaam-e2e-ctc``).
         cpu_fallback: Optional callable performing one in-process CPU
-            transcription, used only on a degraded GPU-seeded Whisper outcome.
+            transcription, used only on a degraded GPU-seeded outcome of a
+            CUDA-capable provider.
 
     Raises:
         typer.Exit: With code ``0`` on success, ``1`` on error,
@@ -414,9 +421,9 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
             text=outcome.text, output_file=output_file, stdout=stdout
         )
         return
-    # * Whisper-only CUDA→CPU recovery; never route GigaAM into this path.
+    # * CUDA→CPU recovery for CUDA-capable providers; never for gigaam-ctc.
     if (
-        stt_provider == STT_PROVIDER_WHISPER
+        provider_may_use_cuda(stt_provider)
         and outcome.status in _DAEMON_DEGRADED_STATUSES
         and cpu_fallback is not None
         and _device_prefers_gpu(device)
@@ -606,8 +613,8 @@ def external_transcribe(  # noqa: PLR0913
         STT_PROVIDER_WHISPER,
         "--stt-provider",
         help=(
-            "Speech-to-text provider: whisper (default), gigaam-ctc, or "
-            "gigaam-e2e-ctc (GigaAM providers are CPU-only; included in .[ml])."
+            "Speech-to-text provider: whisper (default), gigaam-ctc (CPU-only), "
+            "or gigaam-e2e-ctc (CPU or CUDA); GigaAM is included in .[ml]."
         ),
     ),
     language: Optional[str] = typer.Option(
@@ -617,8 +624,9 @@ def external_transcribe(  # noqa: PLR0913
         "auto",
         help=(
             "Preferred device: auto|cuda|cpu. When CUDA memory is exhausted, "
-            "Whisper retries on CPU automatically. GigaAM providers accept only "
-            "cpu (auto resolves to cpu)."
+            "Whisper and gigaam-e2e-ctc retry on CPU automatically; "
+            "gigaam-e2e-ctc auto picks CUDA only with enough free VRAM. "
+            "gigaam-ctc accepts only cpu (auto resolves to cpu)."
         ),
     ),
     compute_type: str = typer.Option(
@@ -760,11 +768,11 @@ def external_transcribe(  # noqa: PLR0913
             output_file=output_file,
             stdout=stdout,
             stt_provider=provider,
-            # * Bounded Whisper CUDA→CPU recovery only. GigaAM is CPU-only and
-            # * must not participate in CUDA fallbacks or Windows GPU isolation.
+            # * Bounded CUDA→CPU recovery for CUDA-capable providers only; the
+            # * CPU-only gigaam-ctc head has no GPU state to recover from.
             cpu_fallback=(
                 None
-                if provider != STT_PROVIDER_WHISPER
+                if not provider_may_use_cuda(provider)
                 else lambda: _run_external_transcribe_once(
                     input_path=input_path,
                     whisper_model=whisper_model,
@@ -774,15 +782,16 @@ def external_transcribe(  # noqa: PLR0913
                     diarization=diarization,
                     dialog_blocks=dialog_blocks,
                     work_dir=work_dir,
-                    stt_provider=STT_PROVIDER_WHISPER,
+                    stt_provider=provider,
                 )
             ),
         )
         return
 
-    # * Windows GPU child isolation is Whisper-only; GigaAM always runs in-process CPU.
+    # * Windows GPU child isolation covers CUDA-capable providers (Whisper and
+    # * gigaam-e2e-ctc); gigaam-ctc always runs in-process on CPU.
     windows_non_cpu = (
-        provider == STT_PROVIDER_WHISPER
+        provider_may_use_cuda(provider)
         and sys.platform.startswith("win")
         and device.lower() != "cpu"
     )
@@ -877,8 +886,8 @@ def external_transcribe_daemon(
         STT_PROVIDER_WHISPER,
         "--stt-provider",
         help=(
-            "Resident STT provider: whisper (default), gigaam-ctc, or "
-            "gigaam-e2e-ctc (GigaAM providers are CPU-only)."
+            "Resident STT provider: whisper (default), gigaam-ctc (CPU-only), "
+            "or gigaam-e2e-ctc (CPU or CUDA)."
         ),
     ),
     whisper_model: str = typer.Option(
@@ -889,7 +898,8 @@ def external_transcribe_daemon(
         "--device",
         help=(
             "Device for the resident model: auto|cuda|cpu. "
-            "GigaAM providers accept only cpu (auto→cpu)."
+            "gigaam-ctc accepts only cpu (auto→cpu); gigaam-e2e-ctc resolves "
+            "auto/cuda when the model loads."
         ),
     ),
     compute_type: str = typer.Option(

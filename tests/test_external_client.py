@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import TYPE_CHECKING
 
@@ -251,6 +252,74 @@ def test_run_client_transcribe_provider_mismatch_is_unavailable(
     assert requested_provider in (outcome.detail or "")
     assert spawned["n"] == 0
     assert q.list_incoming_job_ids(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("beacon_device", "requested_device", "expect_warning"),
+    [
+        ("cpu", "auto", True),
+        ("cpu", "cuda", True),
+        ("cuda", "cpu", True),
+        ("auto", "cpu", True),
+        ("cuda", "auto", False),
+        ("auto", "cuda", False),
+        ("cpu", "cpu", False),
+        (None, "cpu", False),
+    ],
+)
+def test_run_client_transcribe_device_mismatch_only_warns(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    beacon_device: str | None,
+    requested_device: str,
+    expect_warning: bool,  # noqa: FBT001
+) -> None:
+    """A CPU/GPU class mismatch with the live daemon warns but still serves the job.
+
+    The resident daemon keeps its own device, so the request must be neither
+    rejected nor routed elsewhere: it is submitted and its transcript returned.
+    """
+    q.ensure_layout(tmp_path)
+    beacon: dict[str, object] = {"model": "small", "stt_provider": "whisper"}
+    if beacon_device is not None:
+        beacon["device"] = beacon_device
+    q.write_heartbeat(tmp_path, beacon)
+    media = tmp_path / "clip.wav"
+    media.write_text("stub", encoding="utf-8")
+    request = ec.ClientRequest(
+        input_path=media,
+        language=None,
+        device=requested_device,
+        compute_type="auto",
+        whisper_model="small",
+        client_timeout_s=5.0,
+        daemon_workers=1,
+    )
+    spawned = {"n": 0}
+
+    def _spawn() -> None:
+        spawned["n"] += 1
+
+    def _sleeper(_seconds: float) -> None:
+        _write_results(tmp_path, "ok", "served by resident daemon", None)
+
+    with caplog.at_level(logging.WARNING, logger=ec.__name__):
+        outcome = ec.run_client_transcribe(
+            request,
+            queue_dir=tmp_path,
+            spawn=_spawn,
+            sleeper=_sleeper,
+            poll_interval_s=0.0,
+        )
+
+    assert outcome.status == "ok"
+    assert outcome.text == "served by resident daemon"
+    assert spawned["n"] == 0
+    warned = any(
+        "ASKVLM_DAEMON_DEVICE_MISMATCH" in record.getMessage()
+        for record in caplog.records
+    )
+    assert warned is expect_warning
 
 
 def test_build_daemon_command_includes_stt_provider(tmp_path: Path) -> None:

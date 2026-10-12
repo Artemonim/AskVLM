@@ -1,4 +1,4 @@
-r"""Lazy CPU-only wrapper for GigaAM Multilingual CTC speech-to-text.
+r"""Lazy wrapper for GigaAM Multilingual CTC speech-to-text (CPU-only head).
 
 Uses the official Transformers API::
 
@@ -9,6 +9,10 @@ Results are normalized to the pipeline contract ``{"text", "segments"}``.
 Upstream ``.transcribe`` rejects more than 400_000 samples (~25 s at 16 kHz).
 This wrapper streams the WAV in 20 s windows so files of any length stay
 under that limit without native ``transcribe_longform``.
+
+The device machinery (CUDA placement after a CPU load, CUDA OOM fallback to
+CPU per window, VRAM release on unload) is shared with the CUDA-capable
+subclass; for this head the device is always ``cpu`` and CUDA is never used.
 """
 
 from __future__ import annotations
@@ -24,12 +28,19 @@ import time
 import wave
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NoReturn, cast
 
+from core.gigaam_device import (
+    is_cuda_oom_error,
+    module_device_types,
+    release_cuda_cache,
+    select_gigaam_device,
+)
 from core.stt_providers import (
     GIGAAM_HF_REPO_ID,
     GIGAAM_HF_REVISION,
-    resolve_gigaam_device,
+    STT_PROVIDER_GIGAAM_CTC,
+    resolve_gigaam_requested_device,
 )
 
 if TYPE_CHECKING:
@@ -267,6 +278,24 @@ def _maybe_write_min_duration_wav(audio_path: Path) -> Path | None:
     return padded_path
 
 
+def _call_model_transcribe(model: object, path: str) -> object:
+    """Run ``model.transcribe`` and map lazy remote-code import failures.
+
+    Args:
+        model: Loaded GigaAM model.
+        path: Audio path handed to the model.
+
+    Returns:
+        Raw ``.transcribe`` result.
+
+    """
+    # * First .transcribe() can still ImportError on lazy remote-code deps.
+    try:
+        return cast("Any", model).transcribe(path)
+    except ImportError as exc:
+        _raise_missing_extra(exc)
+
+
 def _log_chunk_progress(
     *,
     idx: int,
@@ -290,6 +319,9 @@ def _log_chunk_progress(
 class GigaAMCtcWrapper:
     """Load GigaAM CTC on CPU, transcribe, and release resources on close."""
 
+    # * Provider served by this wrapper; selects device validation (CPU-only here).
+    PROVIDER: ClassVar[str] = STT_PROVIDER_GIGAAM_CTC
+
     def __init__(
         self,
         *,
@@ -299,17 +331,27 @@ class GigaAMCtcWrapper:
         """Initialize the wrapper without loading model weights.
 
         Args:
-            device: Requested device; only ``cpu`` / ``auto`` are accepted.
+            device: Requested device. The CPU-only head accepts ``cpu`` /
+                ``auto`` (both mean CPU); a CUDA-capable subclass accepts
+                ``auto`` / ``cpu`` / ``cuda`` and resolves it at model load.
             cache_dir: Optional Hugging Face cache directory override.
 
         Raises:
-            ValueError: When *device* is not CPU-compatible.
+            ValueError: When *device* is not valid for :attr:`PROVIDER`.
 
         """
         # * Reject invalid devices before any model download or import.
-        self.device = resolve_gigaam_device(device)
+        self.device = resolve_gigaam_requested_device(self.PROVIDER, device)
         self.cache_dir = cache_dir
         self._model: Any | None = None
+        self._torch: Any | None = None
+        self._active_device: str | None = None
+        self._cuda_used = False
+
+    @property
+    def active_device(self) -> str | None:
+        """Device of the resident model, or ``None`` when no model is loaded."""
+        return self._active_device
 
     def _ensure_deps(self) -> tuple[Any, Any]:
         """Import Transformers / torch or raise a useful missing-extra error.
@@ -335,7 +377,7 @@ class GigaAMCtcWrapper:
         """Load the pinned GigaAM CTC revision onto CPU when not already loaded."""
         if self._model is not None:
             return
-        auto_model_cls, _torch = self._ensure_deps()
+        auto_model_cls, torch_mod = self._ensure_deps()
         kwargs: dict[str, Any] = {
             "revision": GIGAAM_HF_REVISION,
             "trust_remote_code": True,
@@ -353,22 +395,107 @@ class GigaAMCtcWrapper:
             model = auto_model_cls.from_pretrained(GIGAAM_HF_REPO_ID, **kwargs)
         except ImportError as exc:
             _raise_missing_extra(exc)
-        # * Keep weights on CPU; do not call .to("cuda").
         if hasattr(model, "eval"):
             model.eval()
-        self._model = model
+        self._install_loaded_model(model, torch_mod)
 
-    def unload(self, *, safe: bool = True) -> None:  # noqa: ARG002 - API parity
-        """Release the resident model and run a best-effort GC pass.
+    def _install_loaded_model(self, model: object, torch_mod: object) -> None:
+        """Make a freshly loaded CPU model resident and apply the device request.
 
         Args:
-            safe: Retained for WhisperXWrapper API parity; unused for CPU GigaAM.
+            model: Model loaded onto CPU.
+            torch_mod: The ``torch`` module returned by :meth:`_ensure_deps`.
 
         """
+        self._model = model
+        self._torch = torch_mod
+        self._active_device = "cpu"
+        self._place_on_requested_device()
+
+    def _place_on_requested_device(self) -> None:
+        """Move the resident CPU model to CUDA when the device request allows it.
+
+        A CUDA out-of-memory error during the move returns the whole model to
+        CPU, so parameters never stay split across devices. Any other move
+        failure drops the model and propagates.
+
+        Raises:
+            Exception: Non-OOM failure of ``model.to("cuda")``.
+
+        """
+        model = self._model
+        if model is None or select_gigaam_device(self.device, self._torch) != "cuda":
+            return
+        self._cuda_used = True
+        try:
+            moved = model.to("cuda")
+        except Exception as exc:
+            if not is_cuda_oom_error(exc):
+                # ! Never keep a half-moved model resident.
+                self._discard_model()
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+        else:
+            self._model = moved
+            self._active_device = "cuda"
+            logger.info("GigaAM model moved to CUDA (requested device=%s)", self.device)
+            return
+        # * Outside the except block the OOM traceback no longer pins CUDA tensors.
+        logger.warning(
+            "GigaAM: CUDA out of memory while moving the model (%s); using CPU.",
+            reason[:300],
+        )
+        self._move_resident_model_to_cpu()
+
+    def _move_resident_model_to_cpu(self) -> object:
+        """Move the resident model (fully) to CPU and release cached VRAM.
+
+        Returns:
+            The resident CPU model.
+
+        Raises:
+            RuntimeError: When no model is loaded, or when tensors remain on a
+                non-CPU device after the move.
+
+        """
+        model = self._model
+        if model is None:
+            msg = "GigaAM model is not loaded"
+            raise RuntimeError(msg)
+        model = model.to("cpu")
+        self._model = model
+        self._active_device = "cpu"
+        release_cuda_cache(self._torch)
+        device_types = module_device_types(model)
+        if device_types is not None and device_types != {"cpu"}:
+            self._discard_model()
+            msg = f"GigaAM model still holds tensors on {sorted(device_types)}"
+            raise RuntimeError(msg)
+        return model
+
+    def _discard_model(self) -> None:
+        """Drop the resident model reference and release cached VRAM."""
+        self._model = None
+        self._active_device = None
+        release_cuda_cache(self._torch)
+
+    def unload(self, *, safe: bool = True) -> None:  # noqa: ARG002 - API parity
+        """Release the resident model, cached VRAM when CUDA was used, and GC.
+
+        Args:
+            safe: Retained for WhisperXWrapper API parity; unused for GigaAM.
+
+        """
+        used_cuda = self._cuda_used
         if self._model is not None:
             with contextlib.suppress(Exception):
                 del self._model
             self._model = None
+        self._active_device = None
+        self._cuda_used = False
+        if used_cuda:
+            release_cuda_cache(self._torch)
+            return
         with contextlib.suppress(Exception):
             _gc.collect()
 
@@ -416,14 +543,40 @@ class GigaAMCtcWrapper:
         padded_path = _maybe_write_min_duration_wav(audio_path)
         transcribe_path = padded_path if padded_path is not None else audio_path
         try:
-            # * First .transcribe() can still ImportError on lazy remote-code deps.
-            try:
-                return self._coerce_text(model.transcribe(str(transcribe_path)))
-            except ImportError as exc:
-                _raise_missing_extra(exc)
+            raw = self._transcribe_window(model, str(transcribe_path))
+            return self._coerce_text(raw)
         finally:
             if padded_path is not None:
                 _unlink_padded_wav(padded_path)
+
+    def _transcribe_window(self, model: object, path: str) -> object:
+        """Transcribe one window, retrying it on CPU after a CUDA OOM.
+
+        After the fallback the model stays on CPU, so later windows (and later
+        files of a resident pipeline) run on CPU too.
+
+        Args:
+            model: Resident model.
+            path: Window audio path.
+
+        Returns:
+            Raw ``.transcribe`` result.
+
+        """
+        try:
+            return _call_model_transcribe(model, path)
+        except Exception as exc:
+            if self._active_device != "cuda" or not is_cuda_oom_error(exc):
+                raise
+            reason = f"{type(exc).__name__}: {exc}"
+        # * Retry outside the except block so the OOM traceback no longer pins
+        # * the window's CUDA activations before the cache is released.
+        logger.warning(
+            "GigaAM: CUDA out of memory on a window (%s); moving the model to "
+            "CPU and retrying; later windows stay on CPU.",
+            reason[:300],
+        )
+        return _call_model_transcribe(self._move_resident_model_to_cpu(), path)
 
     def _fast_path_original(
         self,

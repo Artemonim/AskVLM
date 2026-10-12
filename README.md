@@ -111,9 +111,9 @@ python cli.py external-transcribe PATH_TO_MEDIA
 Выводит текст транскрипции в stdout. Предназначен как машинно-читаемый endpoint для внешних приложений.
 
 - Провайдер по умолчанию: `--stt-provider whisper` (модель `small`).
-- Опционально: `--stt-provider gigaam-ctc` (CPU-only; `GigaAM-Multilingual` @ `ctc`; без пунктуации; ~2.5 ГБ RAM) или `--stt-provider gigaam-e2e-ctc` (CPU-only; `GigaAM-v3` @ `e2e_ctc`; с пунктуацией и капитализацией; ~2.9 ГБ RAM). Оба входят в `.[ml]`, без VRAM.
+- Опционально: `--stt-provider gigaam-ctc` (только CPU; `GigaAM-Multilingual` @ `ctc`; без пунктуации; ~2.5 ГБ RAM) или `--stt-provider gigaam-e2e-ctc` (CPU или CUDA, `--device auto|cpu|cuda`; `GigaAM-v3` @ `e2e_ctc`; с пунктуацией и капитализацией; ~2.9 ГБ RAM на CPU, ~1.5–1.65 ГБ VRAM на CUDA). Оба входят в `.[ml]`.
 - JIT-загрузка модели: Whisper/GigaAM загружается при старте транскрипции и выгружается перед выходом (в `--no-daemon`; в демоне — резидентно).
-- Безопасность CUDA (Whisper): на Windows, если дочерний GPU-процесс падает (OOM), AskVLM автоматически повторяет на CPU в изолированном подпроцессе. GigaAM в CUDA/fallback/Windows GPU-isolation не участвует.
+- Безопасность CUDA (Whisper и `gigaam-e2e-ctc`): на Windows, если дочерний GPU-процесс падает (OOM), AskVLM автоматически повторяет на CPU в изолированном подпроцессе; CUDA→CPU fallback и Windows GPU child-isolation действуют для Whisper и `gigaam-e2e-ctc`. `gigaam-ctc` в CUDA/fallback/Windows GPU-isolation не участвует.
 - Живой демон с другим `--stt-provider` → unavailable/mismatch (singleton не подменяется молча; нужен рестарт демона).
 - Опциональный файловый вывод: `--output-file transcript.txt`.
 - Диаризация отключена по умолчанию (экономия VRAM).
@@ -174,8 +174,9 @@ core/           Ядро обработки
   ffmpeg.py             Конвертация аудио/видео через FFmpeg
   whisper_wrapper.py    Бэкенд OpenAI Whisper
   whisperx_wrapper.py   Бэкенд WhisperX (пословные таймстемпы)
-  gigaam_ctc_wrapper.py     Опциональный CPU-only GigaAM Multilingual CTC
-  gigaam_e2e_ctc_wrapper.py Опциональный CPU-only GigaAM-v3 e2e CTC (пунктуация)
+  gigaam_ctc_wrapper.py     Опциональный GigaAM Multilingual CTC (только CPU) с общим device-механизмом
+  gigaam_e2e_ctc_wrapper.py Опциональный GigaAM-v3 e2e CTC (пунктуация), CPU или CUDA
+  gigaam_device.py          Политика CUDA для GigaAM (порог свободной VRAM для auto, распознавание OOM, освобождение кэша)
   stt_providers.py          Идентификаторы STT (whisper / gigaam-ctc / gigaam-e2e-ctc)
   diarization.py        Диаризация говорящих через PyAnnote
   llm_formatter.py      LLM-форматирование текста

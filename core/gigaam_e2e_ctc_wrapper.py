@@ -1,4 +1,4 @@
-r"""Lazy CPU-only wrapper for GigaAM-v3 end-to-end CTC speech-to-text.
+r"""Lazy wrapper for GigaAM-v3 end-to-end CTC speech-to-text (CPU or CUDA).
 
 Uses the official Transformers API::
 
@@ -6,8 +6,13 @@ Uses the official Transformers API::
     model.transcribe(path)
 
 The v3 ``e2e_ctc`` head returns punctuated, capitalized text (BPE + ITN).
-Windowing, ffmpeg fallback, cancel, and result coercion are inherited from
-:class:`~core.gigaam_ctc_wrapper.GigaAMCtcWrapper`.
+Windowing, ffmpeg fallback, cancel, result coercion, and the device machinery
+are inherited from :class:`~core.gigaam_ctc_wrapper.GigaAMCtcWrapper`.
+
+Weights always load on CPU as fp32 under the transformers 5.x compatibility
+patches. For ``--device auto|cuda`` the loaded model then moves to CUDA as a
+whole (see :mod:`core.gigaam_device`); the remote-code encoder runs under its
+own ``torch.autocast(float16)`` on CUDA while the mel front-end stays fp32.
 """
 
 from __future__ import annotations
@@ -15,10 +20,14 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 from core.gigaam_ctc_wrapper import GigaAMCtcWrapper, _raise_missing_extra
-from core.stt_providers import GIGAAM_V3_HF_REPO_ID, GIGAAM_V3_HF_REVISION
+from core.stt_providers import (
+    GIGAAM_V3_HF_REPO_ID,
+    GIGAAM_V3_HF_REVISION,
+    STT_PROVIDER_GIGAAM_E2E_CTC,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -105,18 +114,23 @@ def _patch_v3_finalize_loading() -> _FinalizeLoading:
 
 
 class GigaAME2ECtcWrapper(GigaAMCtcWrapper):
-    """Load GigaAM-v3 e2e CTC on CPU; reuse the multilingual windowing pipeline."""
+    """Load GigaAM-v3 e2e CTC on CPU, optionally move it to CUDA, and transcribe."""
+
+    # * CUDA-capable head: ``device`` is ``auto``/``cpu``/``cuda``, resolved at load.
+    PROVIDER: ClassVar[str] = STT_PROVIDER_GIGAAM_E2E_CTC
 
     def _load_model(self) -> None:
-        """Load the pinned GigaAM-v3 e2e_ctc revision onto CPU when not loaded.
+        """Load the pinned GigaAM-v3 e2e_ctc revision when not already loaded.
 
         Applies transformers 5.x compatibility patches around
         ``from_pretrained`` and always restores the original globals, including
-        when load raises. Weights stay on CPU as fp32.
+        when load raises. Weights load on CPU as fp32; the device request is
+        applied after the patches are restored, so a CUDA move never extends
+        the global patch window.
         """
         if self._model is not None:
             return
-        auto_model_cls, _torch = self._ensure_deps()
+        auto_model_cls, torch_mod = self._ensure_deps()
         kwargs: dict[str, Any] = {
             "revision": GIGAAM_V3_HF_REVISION,
             "trust_remote_code": True,
@@ -124,9 +138,11 @@ class GigaAME2ECtcWrapper(GigaAMCtcWrapper):
         if self.cache_dir is not None:
             kwargs["cache_dir"] = str(self.cache_dir)
         logger.info(
-            "Loading GigaAM-v3 e2e CTC: repo=%s revision=%s device=cpu",
+            "Loading GigaAM-v3 e2e CTC: repo=%s revision=%s load_device=cpu "
+            "requested_device=%s",
             GIGAAM_V3_HF_REPO_ID,
             GIGAAM_V3_HF_REVISION,
+            self.device,
         )
         try:
             import hydra.utils as hydra_utils  # noqa: PLC0415
@@ -138,6 +154,7 @@ class GigaAME2ECtcWrapper(GigaAMCtcWrapper):
 
         original_instantiate: _HydraInstantiate | None = None
         original_finalize: _FinalizeLoading | None = None
+        loaded: Any = None
         with _LOAD_PATCH_LOCK:
             try:
                 # * Patch hydra.utils.instantiate before remote code imports it.
@@ -152,13 +169,16 @@ class GigaAME2ECtcWrapper(GigaAMCtcWrapper):
                 except ImportError as exc:
                     _raise_missing_extra(exc)
                 # * v3 bins on disk look fp16; fp32 is required for Mel/STFT parity.
+                # ! Never .half() the model: the n_fft=320 mel front-end must stay
+                # ! fp32 (cuFFT fp16 needs power-of-two sizes); the encoder uses the
+                # ! remote code's own fp16 autocast on CUDA.
                 model = model.float()
-                # * Keep weights on CPU; do not call .to("cuda").
                 if hasattr(model, "eval"):
                     model.eval()
-                self._model = model
+                loaded = model
             finally:
                 if original_instantiate is not None:
                     hydra_utils.instantiate = original_instantiate
                 if original_finalize is not None:
                     _set_finalize_loading(PreTrainedModel, original_finalize)
+        self._install_loaded_model(loaded, torch_mod)

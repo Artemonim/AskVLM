@@ -17,9 +17,9 @@ from .settings import configure_ml_caches, get_project_cache_dir
 from .stt_providers import (
     STT_PROVIDER_GIGAAM_E2E_CTC,
     STT_PROVIDER_WHISPER,
-    is_cpu_only_gigaam_provider,
+    is_gigaam_provider,
     normalize_stt_provider,
-    resolve_gigaam_device,
+    resolve_gigaam_requested_device,
 )
 from .whisperx_wrapper import WhisperXWrapper
 
@@ -36,8 +36,9 @@ class CancelledError(RuntimeError):
 class LocalPipeline:
     """Pipeline for local processing: FFmpeg -> STT -> Diarization -> LLM formatting.
 
-    Default STT provider is Whisper/faster-whisper. Optional GigaAM providers
-    (``gigaam-ctc``, ``gigaam-e2e-ctc``) run on CPU only.
+    Default STT provider is Whisper/faster-whisper. Optional GigaAM providers:
+    ``gigaam-ctc`` runs on CPU only; ``gigaam-e2e-ctc`` accepts
+    ``auto``/``cpu``/``cuda`` and resolves CUDA lazily at model load.
     """
 
     def __init__(  # noqa: PLR0913
@@ -67,9 +68,10 @@ class LocalPipeline:
         self.compute_type = compute_type
         self.whisperx: WhisperXWrapper | None = None
         self.gigaam: Any | None = None
-        if is_cpu_only_gigaam_provider(self.stt_provider):
-            # * Reject CUDA/non-CPU before any GigaAM import or weight download.
-            self.device = resolve_gigaam_device(device)
+        if is_gigaam_provider(self.stt_provider):
+            # * Validate the device token before any GigaAM import or weight
+            # * download; the CUDA-capable head keeps auto/cuda for load time.
+            self.device = resolve_gigaam_requested_device(self.stt_provider, device)
             hf_cache = cache_root / "huggingface"
             if self.stt_provider == STT_PROVIDER_GIGAAM_E2E_CTC:
                 from . import gigaam_e2e_ctc_wrapper as gigaam_e2e_mod  # noqa: PLC0415
@@ -138,7 +140,7 @@ class LocalPipeline:
             ``(transcript_dict, asr_label)`` for progress reporting.
 
         """
-        if is_cpu_only_gigaam_provider(self.stt_provider):
+        if is_gigaam_provider(self.stt_provider):
             if self.gigaam is None:
                 msg = "GigaAM CTC backend is not configured"
                 raise RuntimeError(msg)
@@ -373,7 +375,8 @@ def create_default_local_pipeline() -> LocalPipeline:
     Defaults are aligned with the GUI/CLI behavior:
     - engine="auto" (prefer Faster-Whisper; WhisperX alignment when available)
     - stt_provider="whisper" (optional external path: gigaam-ctc / gigaam-e2e-ctc)
-    - device="auto" (prefer CUDA when available; GigaAM forces CPU)
+    - device="auto" (prefer CUDA when available; gigaam-ctc forces CPU,
+      gigaam-e2e-ctc also checks free VRAM at model load)
     - enable_diarization=False
     - enable_dialog_blocks=False
     - whisper_model="auto" (resolves to "large-v3")

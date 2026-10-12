@@ -111,9 +111,9 @@ python cli.py external-transcribe PATH_TO_MEDIA
 Prints plain transcript text to stdout. Designed as a machine-friendly endpoint for external applications.
 
 - Default provider: `--stt-provider whisper` (model `small`).
-- Optional: `--stt-provider gigaam-ctc` (CPU-only; `GigaAM-Multilingual` @ `ctc`; no punctuation; ~2.5 GB RAM) or `--stt-provider gigaam-e2e-ctc` (CPU-only; `GigaAM-v3` @ `e2e_ctc`; with punctuation and capitalization; ~2.9 GB RAM). Both are included in `.[ml]`; no VRAM.
+- Optional: `--stt-provider gigaam-ctc` (CPU-only; `GigaAM-Multilingual` @ `ctc`; no punctuation; ~2.5 GB RAM) or `--stt-provider gigaam-e2e-ctc` (CPU or CUDA, `--device auto|cpu|cuda`; `GigaAM-v3` @ `e2e_ctc`; with punctuation and capitalization; ~2.9 GB RAM on CPU, ~1.5–1.65 GB VRAM on CUDA). Both are included in `.[ml]`.
 - JIT model loading: Whisper/GigaAM loads at transcription start and unloads before exit (`--no-daemon`; resident in daemon mode).
-- CUDA safety (Whisper): on Windows, if the GPU child process crashes (OOM), AskVLM retries on CPU automatically in an isolated subprocess. GigaAM does not use CUDA, Whisper CUDA fallbacks, or Windows GPU isolation.
+- CUDA safety (Whisper and `gigaam-e2e-ctc`): on Windows, if the GPU child process crashes (OOM), AskVLM retries on CPU automatically in an isolated subprocess; the CUDA→CPU fallback and Windows GPU child isolation apply to Whisper and `gigaam-e2e-ctc`. `gigaam-ctc` does not use CUDA, CUDA fallbacks, or Windows GPU isolation.
 - A live daemon with a different `--stt-provider` → unavailable/mismatch (singleton is not silently replaced; restart the daemon).
 - Optional file output: `--output-file transcript.txt`.
 - Diarization is off by default (saves VRAM).
@@ -174,8 +174,9 @@ core/           Core processing modules
   ffmpeg.py             FFmpeg audio/video conversion
   whisper_wrapper.py    OpenAI Whisper backend
   whisperx_wrapper.py   WhisperX backend (word-level timestamps)
-  gigaam_ctc_wrapper.py     Optional CPU-only GigaAM Multilingual CTC
-  gigaam_e2e_ctc_wrapper.py Optional CPU-only GigaAM-v3 e2e CTC (punctuation)
+  gigaam_ctc_wrapper.py     Optional GigaAM Multilingual CTC (CPU-only) with shared device machinery
+  gigaam_e2e_ctc_wrapper.py Optional GigaAM-v3 e2e CTC (punctuation), CPU or CUDA
+  gigaam_device.py          CUDA policy for GigaAM (auto VRAM threshold, OOM detection, cache release)
   stt_providers.py          STT provider ids (whisper / gigaam-ctc / gigaam-e2e-ctc)
   diarization.py        PyAnnote speaker diarization
   llm_formatter.py      LLM-based text formatting

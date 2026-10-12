@@ -36,7 +36,8 @@ class _StubWhisper:
 
 
 class _StubGigaAM:
-    def __init__(self, **_kwargs: object) -> None:
+    def __init__(self, **kwargs: object) -> None:
+        self.init_kwargs: dict[str, object] = dict(kwargs)
         self.calls: list[dict[str, Any]] = []
 
     def transcribe(self, **kwargs: object) -> dict[str, object]:
@@ -146,10 +147,12 @@ def test_local_pipeline_dispatches_gigaam_e2e_ctc_without_whisper_kwargs(
     pipeline = pl.LocalPipeline(stt_provider=STT_PROVIDER_GIGAAM_E2E_CTC, device="auto")
     assert pipeline.stt_provider == STT_PROVIDER_GIGAAM_E2E_CTC
     assert pipeline.whisperx is None
-    assert pipeline.device == "cpu"
+    # * The CUDA-capable head keeps ``auto`` for the model load to resolve.
+    assert pipeline.device == "auto"
     assert created
     gigaam = created[0]
     assert pipeline.gigaam is gigaam
+    assert gigaam.init_kwargs["device"] == "auto"
     doc = pipeline.process(tmp_path / "in.wav", tmp_path / "work")
     assert "gigaam text" in doc.get_full_text()
     call = gigaam.calls[0]
@@ -159,12 +162,35 @@ def test_local_pipeline_dispatches_gigaam_e2e_ctc_without_whisper_kwargs(
     assert "compute_type" not in call
 
 
-def test_local_pipeline_rejects_gigaam_e2e_ctc_cuda(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("device", ["cpu", "cuda", "auto"])
+def test_local_pipeline_forwards_gigaam_e2e_ctc_device_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, device: str
 ) -> None:
-    """CUDA is rejected before GigaAM-v3 construction."""
+    """The v3 wrapper receives the requested device token, never a forced CPU."""
+    created: list[_StubGigaAM] = []
+
+    def _factory(**kwargs: object) -> _StubGigaAM:
+        stub = _StubGigaAM(**kwargs)
+        created.append(stub)
+        return stub
+
     monkeypatch.setattr(pl, "load_env_file", lambda: None)
     monkeypatch.setattr(pl, "configure_ml_caches", lambda root: root)
     monkeypatch.setattr(pl, "get_project_cache_dir", lambda: tmp_path)
-    with pytest.raises(ValueError, match="CPU only"):
-        pl.LocalPipeline(stt_provider=STT_PROVIDER_GIGAAM_E2E_CTC, device="cuda")
+    monkeypatch.setattr(gigaam_e2e_mod, "GigaAME2ECtcWrapper", _factory)
+
+    pipeline = pl.LocalPipeline(stt_provider=STT_PROVIDER_GIGAAM_E2E_CTC, device=device)
+
+    assert pipeline.device == device
+    assert created[0].init_kwargs["device"] == device
+
+
+def test_local_pipeline_rejects_unknown_gigaam_e2e_ctc_device(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A device outside auto|cpu|cuda is rejected before GigaAM-v3 construction."""
+    monkeypatch.setattr(pl, "load_env_file", lambda: None)
+    monkeypatch.setattr(pl, "configure_ml_caches", lambda root: root)
+    monkeypatch.setattr(pl, "get_project_cache_dir", lambda: tmp_path)
+    with pytest.raises(ValueError, match="tpu"):
+        pl.LocalPipeline(stt_provider=STT_PROVIDER_GIGAAM_E2E_CTC, device="tpu")

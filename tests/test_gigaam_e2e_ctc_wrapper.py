@@ -152,37 +152,60 @@ def _live_patch_flags(
 
 
 class _FakeV3Model:
-    """Records ``float``/``eval``/``to`` order for load-contract assertions."""
+    """Tracks the precision, mode, and device a loaded model ends up in.
+
+    The v3 checkpoint ships fp16 weights, so a freshly "loaded" model starts as
+    ``fp16``; the wrapper must leave it fp32, in eval mode, on CPU.
+    """
 
     def __init__(self) -> None:
-        self.calls: list[str] = []
+        self.dtype = "fp16"
+        self.training = True
+        self.device = "cpu"
+        self.half_called = False
 
     def float(self) -> _FakeV3Model:
-        self.calls.append("float")
+        self.dtype = "fp32"
+        return self
+
+    def half(self) -> _FakeV3Model:
+        self.half_called = True
+        self.dtype = "fp16"
         return self
 
     def eval(self) -> _FakeV3Model:
-        self.calls.append("eval")
+        self.training = False
         return self
 
     def to(self, device: str) -> _FakeV3Model:
-        self.calls.append(f"to:{device}")
+        self.device = device
         return self
 
     def transcribe(self, path: str) -> str:
         return f"transcribed:{path}"
 
 
-def test_gigaam_e2e_rejects_cuda_before_load() -> None:
-    """Non-CPU devices are rejected before any model import."""
-    with pytest.raises(ValueError, match="CPU only"):
-        GigaAME2ECtcWrapper(device="cuda")
+def test_gigaam_e2e_rejects_unknown_device_before_load() -> None:
+    """Tokens outside ``auto|cpu|cuda`` are rejected before any model import."""
+    with pytest.raises(ValueError, match="tpu"):
+        GigaAME2ECtcWrapper(device="tpu")
 
 
-def test_gigaam_e2e_auto_resolves_to_cpu() -> None:
-    """``auto`` is accepted and forced onto CPU."""
-    wrapper = GigaAME2ECtcWrapper(device="auto")
-    assert wrapper.device == "cpu"
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("auto", "auto"),
+        ("cpu", "cpu"),
+        ("cuda", "cuda"),
+        (" CUDA ", "cuda"),
+        ("", "auto"),
+    ],
+)
+def test_gigaam_e2e_keeps_device_request_for_load_time(raw: str, expected: str) -> None:
+    """The CUDA-capable head keeps the request; the model load resolves it."""
+    wrapper = GigaAME2ECtcWrapper(device=raw)
+    assert wrapper.device == expected
+    assert wrapper.active_device is None
 
 
 @pytest.mark.parametrize(
@@ -237,8 +260,11 @@ def test_gigaam_e2e_from_pretrained_identity_and_patches(
     assert seen["kwargs"]["trust_remote_code"] is True
     assert seen["instantiate_patched"] is True
     assert seen["finalize_patched"] is True
-    assert created[0].calls == ["float", "eval"]
-    assert all(not call.startswith("to:") for call in created[0].calls)
+    # * fp32 (Mel/STFT parity), eval mode, untouched by CUDA for a CPU request.
+    assert created[0].dtype == "fp32"
+    assert created[0].half_called is False
+    assert created[0].training is False
+    assert created[0].device == "cpu"
     assert hydra_utils.instantiate is original_instantiate
     assert _finalize_loading(pretrained_cls) is original_finalize
 
