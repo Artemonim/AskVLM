@@ -9,6 +9,9 @@ param(
     [switch]$SkipLaunch,
     [switch]$FastLaunch,
     [switch]$Fast,
+    [switch]$Cli,
+    # * 0 (in-process), a positive integer or 'auto'; validated below and by build.py.
+    [string]$TestWorkers,
     [switch]$SkipEnsureML,
     [switch]$SkipEnsureCUDA
 )
@@ -17,7 +20,7 @@ function Show-Help {
     Write-Host "AskVLM runner" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage:"
-    Write-Host "  .\run.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-Fast] [-- <build.py args>]"
+    Write-Host "  .\run.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-Fast] [-Cli] [-TestWorkers <N>] [-- <build.py args>]"
     Write-Host ""
     Write-Host "Flags:"
     Write-Host "  -Tool <name>      Run only one tool: ruff-format, ruff, compile, mypy, pyright, pytest, bandit, pip-audit"
@@ -28,6 +31,8 @@ function Show-Help {
     Write-Host "  -SkipLaunch       Run checks/tests only; do not launch the app"
     Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
     Write-Host "  -Fast             Skip slow and heavy ML tests (pytest)"
+    Write-Host "  -Cli              Run only tests that do not need the Qt GUI (pytest -m 'not gui'); combines with -Fast"
+    Write-Host "  -TestWorkers <N>  pytest-xdist worker count: 0 (in-process, no workers), positive integer or 'auto' (default: 3 from pyproject.toml)"
     Write-Host "  -SkipEnsureML     Skip auto-install of .[ml] (default: ensure)"
     Write-Host "  -SkipEnsureCUDA   Skip torch 2.10 CUDA repair (default: ensure)"
     Write-Host "  -Help             Show this help"
@@ -40,9 +45,17 @@ function Show-Help {
     Write-Host "  .\run.ps1 -Path core,editing"
     Write-Host "  .\run.ps1 -FastLaunch"
     Write-Host "  .\run.ps1 -SkipLaunch"
+    Write-Host "  .\run.ps1 -SkipLaunch -Fast -Cli"
+    Write-Host "  .\run.ps1 -SkipLaunch -Fast -TestWorkers 2"
 }
 
 if ($Help) { Show-Help; exit 0 }
+
+# * Fail fast on a bad worker count, before the venv and dependency setup in build.ps1.
+if ($PSBoundParameters.ContainsKey('TestWorkers') -and $TestWorkers -notmatch '^\s*(auto|[0-9]+)\s*$') {
+    Write-Error ("-TestWorkers must be 0 (in-process), a positive integer or 'auto' (got '{0}')." -f $TestWorkers)
+    exit 2
+}
 
 # * Resolve the project root from the script location so the wrapper works
 # * even when it is launched from another working directory.
@@ -67,6 +80,8 @@ if ($NoFix) { $buildParams['NoFix'] = $true }
 if ($SkipLaunch) { $buildParams['SkipLaunch'] = $true }
 if ($FastLaunch) { $buildParams['FastLaunch'] = $true }
 if ($Fast) { $buildParams['Fast'] = $true }
+if ($Cli) { $buildParams['Cli'] = $true }
+if ($PSBoundParameters.ContainsKey('TestWorkers')) { $buildParams['TestWorkers'] = $TestWorkers.Trim() }
 if ($SkipEnsureML) { $buildParams['SkipEnsureML'] = $true }
 if ($SkipEnsureCUDA) { $buildParams['SkipEnsureCUDA'] = $true }
 

@@ -474,6 +474,7 @@ def _make_dummy_thread(*, should_stop: bool) -> SimpleNamespace:
     return thread
 
 
+@pytest.mark.gui
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.heavy_ml
@@ -537,6 +538,7 @@ def test_e2e_subtitles_live_gui_run_completes(
             window.await_worker_shutdown(timeout_ms=30000)
 
 
+@pytest.mark.gui
 @pytest.mark.integration
 @pytest.mark.slow
 @pytest.mark.heavy_ml
@@ -626,6 +628,7 @@ def test_e2e_video_qa_real_gui_run_completes(
             window.await_worker_shutdown(timeout_ms=30000)
 
 
+@pytest.mark.gui
 @pytest.mark.parametrize(
     ("shutdown_result", "expected_accept"),
     [(False, False), (True, True)],

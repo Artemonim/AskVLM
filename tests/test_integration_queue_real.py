@@ -11,6 +11,8 @@ from core.pipelines import LocalPipeline
 from core.settings import get_project_cache_dir
 from gui.main_window import PipelineWorker
 
+pytestmark = pytest.mark.gui
+
 
 @pytest.mark.integration
 @pytest.mark.slow

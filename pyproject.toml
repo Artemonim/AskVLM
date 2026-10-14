@@ -203,8 +203,9 @@ addopts = [
     "--cov=utils",
     "--cov-report=term-missing",
     "--cov-report=xml",
+    # * Default worker count; `run.ps1 -TestWorkers N` appends a later `-n N` that overrides it.
     "-n",
-    "auto",
+    "3",
     "--dist=loadgroup",
 ]
 testpaths = ["tests"]
@@ -214,6 +215,7 @@ markers = [
     "integration: marks tests as integration tests",
     "gpu: marks tests that require GPU",
     "lm_studio_ping: optional localhost LM Studio HTTP probe (no inference)",
+    "gui: test needs the Qt GUI (PySide6/QApplication/MainWindow); deselect with '-m \"not gui\"' or run.ps1 -Cli",
 ]
 filterwarnings = [
     "error",

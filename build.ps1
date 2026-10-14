@@ -14,6 +14,9 @@ param(
     [switch]$SkipLaunch,
     [switch]$FastLaunch,
     [switch]$Fast,
+    [switch]$Cli,
+    # * 0 (in-process), a positive integer or 'auto'; validated below and by build.py.
+    [string]$TestWorkers,
     [switch]$RecreateVenv,
     # * ML + CUDA torch 2.10 are ensured by default on every build.ps1/run.ps1 entry.
     [switch]$SkipEnsureML,
@@ -27,7 +30,7 @@ function Show-Help {
     Write-Host "AskVLM build/runner" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "Usage:"
-    Write-Host "  .\\build.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-Fast] [-- <build.py args>]"
+    Write-Host "  .\\build.ps1 [-Tool <name>] [-Path <paths...>] [-Verbose] [-Json] [-NoFix] [-SkipLaunch] [-FastLaunch] [-Fast] [-Cli] [-TestWorkers <N>] [-- <build.py args>]"
     Write-Host ""
     Write-Host "Flags:"
     Write-Host "  -Tool <name>      Run only one tool: ruff-format, ruff, compile, mypy, pyright, pytest, bandit, pip-audit"
@@ -38,6 +41,8 @@ function Show-Help {
     Write-Host "  -SkipLaunch       Run checks/tests only; do not launch the app"
     Write-Host "  -FastLaunch       Launch the app only; skip checks/tests"
     Write-Host "  -Fast             Skip slow and heavy ML tests (pytest)"
+    Write-Host "  -Cli              Run only tests that do not need the Qt GUI (pytest -m 'not gui'); combines with -Fast"
+    Write-Host "  -TestWorkers <N>  pytest-xdist worker count: 0 (in-process, no workers), positive integer or 'auto' (default: 3 from pyproject.toml)"
     Write-Host "  -SkipEnsureML     Skip auto-install of .[ml] (default: ensure ML deps)"
     Write-Host "  -SkipEnsureCUDA   Skip torch 2.10 CUDA repair (default: ensure CUDA stack)"
     Write-Host "  -Help             Show this help"
@@ -50,9 +55,17 @@ function Show-Help {
     Write-Host "  .\\build.ps1 -Path core,editing"
     Write-Host "  .\\build.ps1 -FastLaunch"
     Write-Host "  .\\build.ps1 -SkipLaunch"
+    Write-Host "  .\\build.ps1 -SkipLaunch -Fast -Cli"
+    Write-Host "  .\\build.ps1 -SkipLaunch -Fast -TestWorkers 2"
 }
 
 if ($Help) { Show-Help; exit 0 }
+
+# * Fail fast on a bad worker count, before the venv and dependency setup below.
+if ($PSBoundParameters.ContainsKey('TestWorkers') -and $TestWorkers -notmatch '^\s*(auto|[0-9]+)\s*$') {
+    Write-Error ("-TestWorkers must be 0 (in-process), a positive integer or 'auto' (got '{0}')." -f $TestWorkers)
+    exit 2
+}
 
 $dashdashIndex = $args.IndexOf("--")
 $forward = @()
@@ -197,6 +210,8 @@ if ($NoFix) { $pyArgs += "--no-fix" }
 if ($SkipLaunch) { $pyArgs += "--skip-launch" }
 if ($FastLaunch) { $pyArgs += "--fast-launch" }
 if ($Fast) { $pyArgs += "--fast" }
+if ($Cli) { $pyArgs += "--cli" }
+if ($PSBoundParameters.ContainsKey('TestWorkers')) { $pyArgs += "--test-workers"; $pyArgs += $TestWorkers.Trim() }
 if ($forward.Count -gt 0) { $pyArgs += $forward }
 
 Write-Host "DEBUG: Running python with args: $($pyArgs -join ' ')" -ForegroundColor DarkGray

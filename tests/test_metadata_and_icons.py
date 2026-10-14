@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
 from PySide6.QtWidgets import QApplication, QTableWidgetItem
 
 from editing.text_model import Document, TextSegment
@@ -41,6 +42,7 @@ def test_srt_metadata_round_trip() -> None:
     assert meta.get("completed") is True
 
 
+@pytest.mark.gui
 def test_input_status_scan_sets_icons(tmp_path: Path) -> None:
     """Scanning output dir sets expected per-row statuses/icons."""
     # Create a minimal Qt app
@@ -89,6 +91,7 @@ def test_input_status_scan_sets_icons(tmp_path: Path) -> None:
     assert w._get_input_status(burn_media) == "burned"  # noqa: SLF001
 
 
+@pytest.mark.gui
 def test_pipeline_appends_ask_metadata_and_scan(tmp_path: Path) -> None:
     """Pipeline exports SRT with AskVLM metadata and scanner detects quality."""
     # Ensure Qt exists

@@ -11,6 +11,8 @@ from editing.text_model import Document, TextSegment
 from gui import main_window as gw
 from gui.main_window import PipelineWorker
 
+pytestmark = pytest.mark.gui
+
 
 class _StubPipeline:
     """Lightweight stub pipeline for queue integration tests.

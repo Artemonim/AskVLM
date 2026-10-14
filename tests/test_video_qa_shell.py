@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
+import pytest
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QPushButton, QSplitter, QTableWidget
 
@@ -22,8 +23,9 @@ from gui.video_qa_worker import VideoQALocalRunWorker
 if TYPE_CHECKING:
     from pathlib import Path
 
-    import pytest
     from pytestqt.qtbot import QtBot
+
+pytestmark = pytest.mark.gui
 
 
 def test_video_qa_shell_restores_screen_and_source(

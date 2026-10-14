@@ -132,6 +132,7 @@ def test_whisperx_unload_emits_boundary_info_logs(
     assert wx._align_model is None  # noqa: SLF001
 
 
+@pytest.mark.gui
 def test_processing_fixture_twice_produces_two_tabs(tmp_path: Path) -> None:
     """Use the fixture twice as two inputs and ensure two non-empty tabs are created.
 
@@ -200,6 +201,7 @@ def test_processing_fixture_twice_produces_two_tabs(tmp_path: Path) -> None:
     assert ed1.item(0, 2).text() if ed1.item(0, 2) else ""
 
 
+@pytest.mark.gui
 def test_time_parsing_populates_nonzero_times() -> None:
     """Ensure that time parsing yields non-zero start/end in the first row."""
     QApplication.instance() or QApplication([])

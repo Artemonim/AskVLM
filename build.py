@@ -15,6 +15,12 @@ Usage examples:
   # * Launch control:
   #   --skip-launch  -> run checks/tests only (no app launch)
   #   --fast-launch  -> launch app only (skip checks/tests)
+  # * Pytest selection and parallelism:
+  #   --fast         -> skip slow and heavy ML tests (-m "not slow and not heavy_ml")
+  #   --cli          -> skip tests that need the Qt GUI (-m "not gui")
+  #   --test-workers -> pytest-xdist worker count: a non-negative integer (0 runs
+  #                     in-process without xdist workers) or "auto";
+  #                     default comes from pyproject.toml addopts (-n 3)
 """
 
 from __future__ import annotations
@@ -134,6 +140,39 @@ TOOLS: Dict[str, Dict[str, Any]] = {
 
 DEFAULT_TARGETS = ["core", "editing", "utils", "gui", "tests"]
 
+# * Pytest markers deselected by --fast (slow and heavy ML) and by --cli (Qt GUI).
+_FAST_EXCLUDED_MARKERS = ("slow", "heavy_ml")
+_CLI_EXCLUDED_MARKERS = ("gui",)
+
+
+def parse_test_workers(value: str) -> str:
+    """Validate the ``--test-workers`` value.
+
+    Args:
+        value: Raw command-line text.
+
+    Returns:
+        The literal ``auto`` or a non-negative integer without leading zeros.
+        ``0`` makes pytest-xdist run the tests in-process, without workers.
+
+    Raises:
+        argparse.ArgumentTypeError: The text is neither ``auto`` nor plain
+            decimal digits (signs, underscores and non-ASCII digits are rejected).
+    """
+    text = value.strip().lower()
+    if text == "auto":
+        return text
+    # * int() alone also accepts "+3", "1_0" and non-ASCII digits; only ASCII digits pass.
+    if re.fullmatch(r"[0-9]+", text):
+        try:
+            return str(int(text))
+        except ValueError:
+            # * Digit strings beyond the interpreter's int conversion limit.
+            pass
+    raise argparse.ArgumentTypeError(
+        f"{value!r} is not valid: expected 0 (in-process), a positive integer or 'auto'"
+    )
+
 
 def ensure_ml_models() -> None:
     """Check and download required ML models."""
@@ -177,12 +216,18 @@ class LocalCI:
         *,
         fast: bool = False,
         no_cache: bool = False,
+        cli_only: bool = False,
+        test_workers: Optional[str] = None,
     ) -> None:
         self.verbose = verbose
         self.json_output = json_output
         self.targets = targets or DEFAULT_TARGETS
         self.fast = fast
         self.no_cache = no_cache
+        # * Deselect tests that need the Qt GUI (marker "gui").
+        self.cli_only = cli_only
+        # * Overrides the pytest-xdist worker count from pyproject.toml addopts.
+        self.test_workers = test_workers
         self.results: Dict[str, Any] = {}
         self.start_time = time.time()
         # Initialize log file
@@ -345,8 +390,18 @@ class LocalCI:
                 add = [p for p in self.targets if p != "tests"]
                 if add and add != DEFAULT_TARGETS:
                     cmd += add
-        if tool == "pytest" and self.fast:
-            cmd += ["-m", "not slow and not heavy_ml"]
+        if tool == "pytest":
+            # * One combined -m expression: pytest honors only the last -m option.
+            excluded: List[str] = []
+            if self.fast:
+                excluded += _FAST_EXCLUDED_MARKERS
+            if self.cli_only:
+                excluded += _CLI_EXCLUDED_MARKERS
+            if excluded:
+                cmd += ["-m", " and ".join(f"not {m}" for m in excluded)]
+            # * A later -n overrides the default from pyproject.toml addopts.
+            if self.test_workers is not None:
+                cmd += ["-n", self.test_workers]
         return cmd
 
     def run_tool(self, name: str, fix: bool) -> Dict[str, Any]:
@@ -913,6 +968,20 @@ def main() -> None:
         help="Skip slow and heavy ML tests (pytest -m \"not slow and not heavy_ml\")",
     )
     parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Run only tests that do not need the Qt GUI (pytest -m \"not gui\"); "
+        "combines with --fast into one -m expression",
+    )
+    parser.add_argument(
+        "--test-workers",
+        type=parse_test_workers,
+        default=None,
+        metavar="N",
+        help="pytest-xdist worker count: 0 (in-process, no workers), a positive integer "
+        "or 'auto' (default: -n 3 from pyproject.toml addopts)",
+    )
+    parser.add_argument(
         "--no-cache",
         action="store_true",
         help="Ignore CI stage cache reads (still records trust stamps on success)",
@@ -965,6 +1034,8 @@ def main() -> None:
         targets=targets,
         fast=args.fast,
         no_cache=args.no_cache,
+        cli_only=args.cli,
+        test_workers=args.test_workers,
     )
     res = ci.run(only=args.tool, fix=(not args.no_fix))
     if args.json:

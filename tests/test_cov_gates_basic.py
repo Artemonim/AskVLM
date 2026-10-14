@@ -12,6 +12,18 @@ from core import settings as core_settings
 from core.gpu_guard import GPUResourceGuard
 from utils import downloader
 
+# * Every variable core.settings.configure_ml_caches sets through os.environ.setdefault.
+_ML_CACHE_ENV_VARS = (
+    "HF_HOME",
+    "TRANSFORMERS_CACHE",
+    "HF_HUB_CACHE",
+    "HF_HUB_DISABLE_SYMLINKS",
+    "HF_HUB_DISABLE_SYMLINKS_WARNING",
+    "TORCH_HOME",
+    "XDG_CACHE_HOME",
+    "WHISPER_CACHE",
+)
+
 
 def test_find_project_root_points_to_repo_root() -> None:
     """Root discovery returns a directory containing pyproject.toml."""
@@ -31,6 +43,12 @@ def test_configure_ml_caches_sets_env_and_dirs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """configure_ml_caches creates dirs and sets env variables."""
+    # * setdefault keeps values that an earlier test in this process already set
+    # * (e.g. a real LocalPipeline). monkeypatch.delenv records nothing for an unset
+    # * variable, so setenv first makes the teardown restore the original state.
+    for name in _ML_CACHE_ENV_VARS:
+        monkeypatch.setenv(name, "")
+        monkeypatch.delenv(name, raising=False)
     used = core_settings.configure_ml_caches(cache_root=tmp_path)
     # Directories
     assert (used / "huggingface").exists()

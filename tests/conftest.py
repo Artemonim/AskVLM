@@ -2,17 +2,31 @@
 
 Heavy ML / LM Studio / GPU integration tests declare
 ``@pytest.mark.xdist_group(name="ml_singleton")`` so that with
-``addopts = -n auto --dist=loadgroup`` (see ``pyproject.toml``) pytest-xdist
-assigns them to one worker and runs them sequentially. That keeps at most one
-neural-network-heavy process path active at a time across the suite (policy:
-one active NN stack).
+``addopts = -n 3 --dist=loadgroup`` (see ``pyproject.toml``; override the worker
+count with ``run.ps1 -TestWorkers N``) pytest-xdist assigns them to one worker
+and runs them sequentially. That keeps at most one neural-network-heavy process
+path active at a time across the suite (policy: one active NN stack).
+
+Tests that need the Qt GUI carry the ``gui`` marker (deselect with ``-m "not gui"``
+or ``run.ps1 -Cli``). Qt runs headless (``QT_QPA_PLATFORM=offscreen``) so the suite
+never shows a window; set ``ASKVLM_TESTS_SHOW_GUI=1`` to keep the native platform.
 """
 
+import os
 import shutil
 import sys
 from pathlib import Path
 
 import pytest
+
+# * Env var that opts out of the headless Qt platform for local GUI debugging.
+SHOW_GUI_ENV = "ASKVLM_TESTS_SHOW_GUI"
+
+# * Qt reads the platform when the first QGuiApplication is created, so the variable
+# * must be set before any test builds a QApplication (pytest-qt `qapp`, MainWindow).
+# * `setdefault` keeps an explicit QT_QPA_PLATFORM chosen by the caller.
+if os.environ.get(SHOW_GUI_ENV, "").strip() != "1":
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 # Add project root to sys.path to ensure imports work correctly
 project_root = Path(__file__).parent.parent
