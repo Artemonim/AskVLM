@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`python cli.py external-transcribe ...` — a stable CLI entry point "one call — one file" for local applications that need to pass AskVLM a single media file and receive the transcript text.
+`python cli.py external-transcribe ...` — a stable CLI entry point for local applications that pass AskVLM media files and receive transcript text. One input keeps the "one call — one file" contract (plain text on `stdout`); several inputs in one call return one JSON line per input.
 
 The flow is designed for machine interaction:
 
@@ -12,47 +12,82 @@ The flow is designed for machine interaction:
   - `gigaam-e2e-ctc` — `ai-sage/GigaAM-v3` revision `e2e_ctc`, **with** punctuation and capitalization (BPE + ITN); CPU or CUDA.
 - By default the command writes only the transcript text to `stdout`.
 - Speaker diarization and LLM dialog formatting are disabled by default.
-- The model is loaded on demand and unloaded after the command finishes (legacy `--no-daemon`; resident in daemon mode).
-- If CUDA is available but VRAM allocation for Whisper or `gigaam-e2e-ctc` fails, AskVLM automatically continues on CPU (details in the "Default Behavior" section).
+- By default the files go through the shared STT supervisor: worker processes keep the models resident, one process per configuration (provider, model, compute type, CPU or GPU). With legacy `--no-daemon` the model is loaded in the command's own process and unloaded before it exits.
+- Through the supervisor the device is strict: `--device cpu` never uses the GPU and `--device cuda` stays on the GPU (CPU only when no CUDA device exists, with a warning); `auto` prefers the GPU and runs on CPU only when that is expected to finish sooner. The in-process CUDA→CPU fallbacks described in "Default Behavior" apply to legacy `--no-daemon` only.
 - `gigaam-ctc` does not use CUDA, CUDA→CPU recovery, or Windows GPU child isolation: CPU only.
 - On Windows with `--device` other than `cpu` (Whisper and `gigaam-e2e-ctc`), the command runs in an isolated child process to reduce the impact of upstream crash-on-exit bugs (`faster-whisper`/`ctranslate2`, the torch CUDA runtime) on the calling process (legacy `--no-daemon` mode only).
 
-## Daemon orchestrator and file queue (default mode)
+## STT supervisor and worker pool (default mode)
 
-Starting with this version, `external-transcribe` defaults to acting as a **thin client** of a single daemon orchestrator rather than loading the model in its own process:
+By default `external-transcribe` is a **thin client** of one STT supervisor (`external-transcribe-daemon`) that runs a pool of worker processes. The client never loads a model.
 
-1. The client checks whether the daemon is alive (via heartbeat). If not, it starts one **detached** `external-transcribe-daemon` process and waits for readiness.
-2. The client enqueues a job in the file queue (default `<project>/.cache/external_queue`), waits for the result up to `--client-timeout`, prints the transcript, and exits.
-3. If `--client-timeout` expires, the client **signals the daemon to drop** the job (cancel marker) so the daemon does not waste resources on an abandoned task and the queue does not accumulate stale entries.
-4. **Bounded CPU recovery.** If the request targeted GPU (`--device` ≠ `cpu`) for a CUDA-capable provider (Whisper or `gigaam-e2e-ctc`) and the daemon was degraded (client timeout expired or daemon unavailable), the client performs one built-in (in-process) CPU transcription pass with the same provider before exiting. On success it prints the transcript and exits with code `0`; only if the CPU pass also fails does the command return a degraded exit code (`10` for timeout, `11` for unavailable daemon). This prevents a stuck/unavailable GPU daemon from silently losing the transcript. For explicit `--device cpu` and for `gigaam-ctc`, no extra pass is performed (nothing to recover from). The `gigaam-e2e-ctc` CPU pass loads the model into the client process (~2.9 GB RAM for the duration of the pass); callers with a strict RAM budget should pass an explicit `--device cpu`.
+### Call flow
 
-Why this matters:
+1. The client starts one wall-clock deadline (`--client-timeout`, default 300 s) for the whole call, probes each input's duration with `ffprobe` (a failed probe only means "duration unknown"), and writes one job per input into the file queue `<queue root>/v2/` (queue root: `ASKVLM_EXTERNAL_QUEUE_DIR` or `<project>/.cache/external_queue`). All inputs of one call share a call id, `--priority` and `--max-parallel`.
+2. If no supervisor heartbeat is fresh, the client starts a **detached** supervisor (with `CREATE_BREAKAWAY_FROM_JOB` when the caller's job object allows it, so the supervisor survives the caller) and keeps re-starting it at most every 10 s while none answers. If no supervisor becomes reachable within 30 s, the unfinished inputs end as `unavailable` (exit `11`); the message names the supervisor log `<queue root>/v2/control/supervisor.out.log`.
+3. The client waits for the results until the deadline. When the deadline passes, it writes cancel markers for the unfinished jobs (the supervisor drops or stops them) and reports `timeout` (exit `10`). `--client-timeout inf` waits without a deadline.
+4. There is **no in-process CPU recovery** in the client: a GPU job that cannot finish is not re-run on CPU inside the client process.
 
-- **The model loads once** in the resident daemon, not per file — no repeated weight reads from disk and no "cold load per message".
-- **One process per machine** serves all invocations (`external-transcribe-daemon` is a singleton via lock + heartbeat). Parallelism is capped by `--workers` (default `1`, per the "one active neural network" doctrine).
-- **No orphaned workers**: heavy work lives in the daemon; the client is short-lived, and its crash does not leave background GPU processes behind.
-- The daemon shuts down after idle time (`--idle-shutdown`, default 600 s), freeing VRAM, and wakes on the next job.
+### Supervisor and workers
 
-Start the daemon manually (optional — the client starts it automatically):
+- **One supervisor per queue root**, guarded by an OS file lock (`v2/control/supervisor.lock`); a second supervisor exits at once with code `0`. A heartbeat (`v2/control/supervisor.heartbeat.json`) carries the limits, the workers and the queue size.
+- **A worker is a process** that keeps one model resident and serves one configuration (a worker key): provider, model, compute type normalized per backend (Whisper: `int8` on CPU, `float16` on GPU for `auto`; GigaAM: `fp32`), and backend `cpu` or `gpu`. Language is per job and never part of the key.
+  - CPU worker: one model shared by several concurrent jobs (CPU slots); each slot runs on `threads_per_slot` threads (default 2).
+  - GPU worker: one process that batches across jobs — up to 8 GigaAM 20-second windows or up to 4 Whisper clips of at most 30 s with an explicit language (other Whisper jobs run sequentially). GigaAM never runs CUDA inference from several threads.
+- **Workers start on demand** for the configurations that are queued and stop after an idle TTL (default 600 s, `--idle-shutdown`). When a new configuration does not fit, idle workers of other configurations are stopped first (least recently used). Busy workers are never stopped to free resources. The supervisor exits shortly after the last worker stops with an empty queue.
+- **Every worker lives in its own Windows Job Object** with a memory limit equal to its commit reservation; the whole process tree (including `ffmpeg`) dies with the job, so no orphaned GPU processes remain. A worker that exceeds its reservation fails alone; the next reservation for that configuration grows by 25%.
+- **Admission control:** before a worker starts, the supervisor reserves CPU slots and threads, commit (Windows private bytes) and, for GPU workers, VRAM. It starts at most one cold load at a time and checks the system free commit and the physically free VRAM (`nvidia-smi`) against guards. A request that can never fit the configured limits gets `unavailable` with the numbers.
+- **Device policy:** `cpu` runs on CPU; `cuda` runs on the GPU and waits for GPU capacity (it falls back to CPU only when no CUDA device exists, with the warning `ASKVLM_CUDA_UNAVAILABLE`); `auto` prefers the GPU and moves a job to CPU only when its estimated time to result on CPU is below 0.8 × the estimate for waiting for the GPU, so a long `auto` queue can fill both GPU and CPU slots. `gigaam-ctc` is CPU-only. CPU and GPU results may differ slightly.
+- **Priority and fair share:** `--priority high|normal|low` (default `normal`). A higher class is admitted first; within a class the scheduler takes turns between calls, so a single-file call does not wait behind a whole batch. Jobs that already started are never preempted. A waiting job is promoted one class every `priority_aging_s` (default 300 s), so `low` work is eventually served.
+- **Failures:** a worker crash retries its job once (`max_attempts` 2, persisted across supervisor restarts); a configuration whose model fails to load cools down and its jobs end as `unavailable` with the load error; the worker's error text (for example `Too long wav file`) reaches the client's `stderr`.
+- Learned timings and memory peaks are kept in `v2/state/estimates.json`; logs are `v2/control/supervisor.log` and `v2/logs/<worker>.log`.
+- A still-running old (v1) daemon only scans `<queue root>/incoming` and never takes v2 jobs; it exits after its own idle time.
+
+### Limits and configuration
+
+The supervisor reads its limits from (first match): `external-transcribe-daemon --config PATH`, the environment variable `ASKVLM_STT_POOL_CONFIG`, `<project>/stt_pool.json` (git-ignored, per machine), or conservative built-in defaults (2 CPU slots, 1 GPU worker, 12 GiB commit, 4 GiB VRAM). `stt_pool.example.json` in the project root shows every key with the values for an 8-CPU-slot / 24 GiB commit, 2-GPU-worker / 7 GiB VRAM machine; copy it to `stt_pool.json` and adjust. Unknown keys or invalid values stop the supervisor with an error.
+
+| Key | Meaning |
+| --- | --- |
+| `cpu.max_slots`, `cpu.threads_per_slot`, `cpu.max_slots_per_worker` | Concurrent CPU jobs, threads per job, slots per CPU worker process |
+| `gpu.max_workers`, `gpu.batch_lanes`, `gpu.host_threads`, `gpu.scale_out_backlog_s` | GPU worker processes, batch lanes (GigaAM/Whisper), CPU threads reserved per GPU worker, backlog that justifies another GPU worker |
+| `threads.budget` | One CPU-thread budget for CPU slots and the host threads of GPU workers |
+| `memory.commit_budget_gib`, `memory.free_commit_guard_gib`, `memory.critical_free_commit_gib` | Commit budget for all workers together, free-commit guard for a new worker, free commit below which idle workers are stopped |
+| `vram.budget_gib`, `vram.free_guard_gib` | VRAM budget for all GPU workers, free-VRAM guard for a new GPU worker |
+| `lifecycle.*` | Worker idle TTL, supervisor linger, stop and cancel grace periods |
+| `scheduling.*` | CPU spill ratio, starvation guard, attempts, GPU/CPU contention factor, priority aging, cooldowns |
+
+Start the supervisor manually (optional — the client starts it automatically):
 
 ```powershell
-python cli.py external-transcribe-daemon --workers 1 --whisper-model small --device cuda
+python cli.py external-transcribe-daemon
+python cli.py external-transcribe-daemon --config C:\path\stt_pool.json --idle-shutdown 300
+python cli.py external-transcribe-daemon --cpu-slots 4 --gpu-workers 1 --commit-budget-gb 16 --vram-budget-gb 6
 ```
 
-GigaAM (deps already in `.[ml]`; `gigaam-ctc` — CPU, `gigaam-e2e-ctc` — CPU or CUDA):
+The old daemon flags `--workers`, `--stt-provider`, `--whisper-model`, `--device`, `--compute-type` and `--language` are accepted and ignored (a note with `ASKVLM_DEPRECATED` goes to `stderr`): the pool serves every configuration.
+
+### Batch calls
 
 ```powershell
-python cli.py external-transcribe-daemon --stt-provider gigaam-ctc --device cpu
+python cli.py external-transcribe a.wav b.mp3 c.ogg --max-parallel 2 --priority low --output-dir C:\out
+```
+
+- With several inputs `stdout` carries one JSON object per input, in input order: `{"index", "input", "status", "text", "error"}` (plus `"output"` with `--output-dir`); a line is written as soon as all earlier inputs are finished. `status` is `ok`, `empty`, `error`, `timeout` or `unavailable`.
+- `--output-dir DIR` writes `<stem>.txt` for every successful input; repeated stems get `-2`, `-3`, … suffixes, decided before the run.
+- `--output-file` with several inputs is written once at the end: the transcripts joined by newlines in input order (a failed input contributes an empty line).
+- `--max-parallel N` caps how many jobs of this call run at the same time; it does not affect other callers. `--daemon-workers N` is a deprecated alias (note on `stderr`).
+- Exit code: `10` if any input timed out, else `11` if any was unavailable, else `1` if any failed, else `0`.
+
+`--diarization`, `--dialog-blocks` and `--work-dir` are not supported through the supervisor: the command exits with code `2` and suggests `--no-daemon`.
+
+GigaAM examples (deps in `.[ml]`; `gigaam-ctc` — CPU, `gigaam-e2e-ctc` — CPU or CUDA):
+
+```powershell
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-ctc
-python cli.py external-transcribe-daemon --stt-provider gigaam-e2e-ctc --device cpu
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cpu
-python cli.py external-transcribe-daemon --stt-provider gigaam-e2e-ctc --device cuda
 python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-ctc --device cuda
 ```
-
-If a daemon is already live with a different `--stt-provider`, the client will **not** submit the job to the wrong resident model: it returns unavailable / mismatch. The singleton is preserved — restart the daemon with the desired provider. For a GPU request of a CUDA-capable provider (Whisper, `gigaam-e2e-ctc`), such an unavailable result triggers the bounded CPU recovery (step 4), and the built-in CPU pass produces the transcript; with `--device cpu` and for `gigaam-ctc`, the command exits with code `11`.
-
-The live daemon's device is compared with the request for diagnostics only: if the daemon heartbeat and the client's `--device` differ by class (`cpu` versus `auto`/`cuda`), the client writes a warning with the `ASKVLM_DAEMON_DEVICE_MISMATCH` marker to `stderr`, and the resident daemon still serves the job on its own device. To change the device, restart the daemon with the desired `--device`. The heartbeat carries the token requested when the daemon started (`auto`/`cpu`/`cuda`), not the actual device after selection and fallback.
 
 Legacy one-shot run without the daemon (old "model in this same process" behavior):
 
@@ -130,23 +165,27 @@ python cli.py external-transcribe "C:\media\call.wav" --stt-provider gigaam-e2e-
 Command:
 
 ```text
-python cli.py external-transcribe INPUT_PATH [options]
+python cli.py external-transcribe INPUT_PATH [INPUT_PATH ...] [options]
 ```
 
 Input:
 
-- `INPUT_PATH` — a single audio or video file.
+- `INPUT_PATH` — an audio or video file; several files are allowed through the supervisor (`--no-daemon` accepts exactly one).
 
-Output:
+Output (one input):
 
 - By default the command prints the final transcript text to `stdout`.
-- If `--output-file` is specified, the same plain text is additionally written to that file.
-- With `--no-stdout`, you must also pass `--output-file`.
+- If `--output-file` is specified, the same plain text is additionally written to that file; `--output-dir` additionally writes `<stem>.txt`.
+- With `--no-stdout`, you must also pass `--output-file` or `--output-dir`.
+- Several inputs: see "Batch calls" above.
 
 Exit codes:
 
 - `0` — transcription completed successfully, including the case of an empty or whitespace-only result after `str.strip()`.
-- `1` — execution error with no valid successful result.
+- `1` — execution error with no valid successful result; through the supervisor `stderr` carries the worker's error text.
+- `2` — invalid arguments (for example `--work-dir` without `--no-daemon`, an unknown `--priority`).
+- `10` — the call deadline (`--client-timeout`) passed before the transcript was ready; `stderr` starts with `ASKVLM_CLIENT_TIMEOUT:`.
+- `11` — the supervisor was unavailable, or the request can never fit the configured limits, or its model failed to load; `stderr` starts with `ASKVLM_DAEMON_UNAVAILABLE:`.
 - Any other non-zero code — AskVLM failed to process the file or execution-stage failure.
 
 Empty transcript: if `get_full_text()` returns a string that is empty after `strip()`, this is treated as a normal successful completion. The command:
@@ -166,6 +205,9 @@ The external CLI uses these defaults unless overridden:
 - `--no-diarization`
 - `--no-dialog-blocks`
 - `--stdout`
+- `--priority normal`
+
+Through the supervisor the device policy of "STT supervisor and worker pool" applies, and models are loaded in strict device mode: no CUDA→CPU fallback happens inside a worker (a GPU out-of-memory error fails the attempt; the supervisor retries an `auto` job on CPU and a `cuda` job on the GPU). The rules below describe the in-process model path used by legacy `--no-daemon` and by the other AskVLM commands.
 
 Behavior of `--device auto` for Whisper:
 
@@ -181,22 +223,20 @@ For `--stt-provider gigaam-e2e-ctc` the `--device` token (`auto`/`cpu`/`cuda`) i
 2. `cuda` — the model is moved to CUDA if CUDA is available; otherwise it runs on CPU with a warning in the log (the command does not fail).
 3. `auto` — CUDA is chosen only if CUDA is available and `torch.cuda.mem_get_info` reports at least 2.5 GiB of free VRAM (`GIGAAM_AUTO_CUDA_MIN_FREE_VRAM_BYTES` in `core/gigaam_device.py`: the process peak of ~1.6 GiB plus headroom for a GPU neighbor, such as a resident Whisper daemon); otherwise CPU with a warning. The free-VRAM query creates the process's CUDA context; if `auto` then stays on CPU, the context (a few hundred MiB) is held until the process exits.
 4. A GPU out-of-memory error while moving the model returns the whole model to CPU (no mixed weight placement) and releases the CUDA cache.
-5. A GPU out-of-memory error on a given 20-second window moves the model to CPU, releases the CUDA cache, and retries that same window on CPU; subsequent windows and jobs of the resident daemon stay on CPU until the process restarts.
+5. A GPU out-of-memory error on a given 20-second window moves the model to CPU, releases the CUDA cache, and retries that same window on CPU; subsequent windows stay on CPU until the process restarts.
 6. Unloading the model (`close`/`unload`) after CUDA work releases the CUDA cache (`torch.cuda.empty_cache`).
 
-On CUDA the encoder runs under fp16 autocast, so the text may differ slightly from a CPU run (on the 5-minute test file — 2 words out of 453). The resident daemon on CUDA processes a 5-minute file about 3.5× faster than on CPU (RTX 3070 measurement: about 2.9 s versus 10 s per job, including client startup); in one-shot `--no-daemon` mode on short files CUDA is slower than CPU because of CUDA initialization and the child process.
+On CUDA the encoder runs under fp16 autocast, so the text may differ slightly from a CPU run (on the 5-minute test file — 2 words out of 453). A resident CUDA model processes a 5-minute file about 3.5× faster than on CPU (RTX 3070 measurement with the earlier resident daemon: about 2.9 s versus 10 s per job, including client startup); in one-shot `--no-daemon` mode on short files CUDA is slower than CPU because of CUDA initialization and the child process. Throughput of the pool modes is measured in `doc/STT_CONCURRENCY_BENCHMARK.en.md`.
 
 Whisper-only parameters (`--compute-type`, beam/VAD) are not sent to GigaAM.
 
 This way an overloaded GPU does not block local integration as long as there is enough RAM in the system.
 
-The fallback guarantee applies to the standard single-pass Whisper path and to `gigaam-e2e-ctc`. Options like diarization may require additional GPU capacity. `gigaam-ctc` does not participate in CUDA→CPU recovery.
-
-In addition to OOM fallback inside the model path, daemon mode adds an external bounded CPU fallback at the client level: on timeout or GPU daemon unavailability, one in-process CPU pass is performed (see step 4 above). This covers cases where the GPU daemon hung or crashed and can no longer unload or switch to CPU on its own.
+The fallback guarantee applies to the standard single-pass Whisper path and to `gigaam-e2e-ctc` in legacy `--no-daemon` mode. Options like diarization may require additional GPU capacity. `gigaam-ctc` does not participate in CUDA→CPU recovery. The client performs no CPU recovery of its own.
 
 ## Reliability on Windows (subprocess isolation)
 
-For `external-transcribe` on Windows with `--device != cpu` (Whisper and `gigaam-e2e-ctc`; `gigaam-ctc` always runs in-process on CPU), AskVLM runs transcription in a child process:
+For `external-transcribe --no-daemon` on Windows with `--device != cpu` (Whisper and `gigaam-e2e-ctc`; `gigaam-ctc` always runs in-process on CPU), AskVLM runs transcription in a child process (through the supervisor, worker processes in Job Objects provide the isolation):
 
 1. The parent launches the same CLI entrypoint with internal hidden child-mode flags.
 2. The child writes a service JSON result before `pipeline.close(...)`.
@@ -208,7 +248,7 @@ For `external-transcribe` on Windows with `--device != cpu` (Whisper and `gigaam
 
 ## JIT Loading and Unloading
 
-The command is designed for single-shot use:
+In legacy `--no-daemon` mode the command is designed for single-shot use (through the supervisor, workers keep models resident until their idle TTL):
 
 1. AskVLM parses CLI arguments.
 2. AskVLM prepares audio in a temporary working directory unless `--work-dir` is specified.
@@ -253,16 +293,16 @@ transcript_text = result.stdout
 Enable speaker diarization:
 
 ```powershell
-python cli.py external-transcribe "C:\media\meeting.mp3" --diarization
+python cli.py external-transcribe "C:\media\meeting.mp3" --no-daemon --diarization
 ```
 
 Enable LLM text cleanup:
 
 ```powershell
-python cli.py external-transcribe "C:\media\draft.wav" --dialog-blocks
+python cli.py external-transcribe "C:\media\draft.wav" --no-daemon --dialog-blocks
 ```
 
-These options are disabled by default: they increase startup cost and may load additional ML backends.
+These options are disabled by default: they increase startup cost and may load additional ML backends. They work only in legacy `--no-daemon` mode; through the supervisor the command exits with code `2`.
 
 ## Video Frame Extraction (`external-extract-frames`)
 
@@ -364,13 +404,13 @@ For `gigaam-e2e-ctc` on CUDA, a window that fails with a VRAM out-of-memory erro
 
 ### `--client-timeout` for long files
 
-In daemon mode the job deadline is `submitted_at + client_timeout` (default 300 s). When it expires, the client sets a cancel marker; the daemon stops at a 20-second window boundary.
+Through the supervisor the deadline is the call start + `client_timeout` (default 300 s) and covers queue time, model loading and transcription. When it expires, the client sets a cancel marker; the worker stops at a 20-second window boundary (a worker that does not stop within the cancel grace is killed).
 
 Callers need to scale `--client-timeout` with media duration. For files longer than a few minutes the default may be insufficient: hours of audio on CPU GigaAM will not fit in 300 s. After timeout, cancel is cooperative between windows, not instantaneous inside `model.transcribe`.
 
 ## Notes
 
 - AskVLM stores model caches in the project's `.cache/` directory.
-- `external-transcribe` is designed for one file per process invocation.
+- `external-transcribe` takes one file per call or a batch of files through the supervisor (`--no-daemon`: one file).
 - `external-extract-frames` is designed for one video file per process invocation; frames persist in `--output-dir` after the process exits.
 - For batch export to `txt`, `srt`, `vtt`, or `json`, use `python cli.py transcribe ...`.

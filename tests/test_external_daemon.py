@@ -1,417 +1,128 @@
-"""Unit tests for the transcription daemon scheduling and lifecycle."""
+"""Surviving v1 lifecycle contracts exercised through the real v2 supervisor."""
 
 from __future__ import annotations
 
-import threading
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+import os
+from dataclasses import replace
+from functools import partial
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
-from core import external_queue as q
-from core.external_daemon import (
-    DaemonConfig,
-    _serve_loop,
-    process_claimed_job,
-    run_daemon,
-)
-from core.temp_gc import TempGcSummary
+from core.stt_pool.queue import SupervisorLock, read_heartbeat
+from core.stt_pool.supervisor import run_supervisor
+from core.temp_gc import TempGcSummary, purge_stale_askvlm_temp_dirs
+from tests.stt_pool_supervisor_support import SupervisorHarness
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Iterator
 
-TranscribeFn = Callable[[q.TranscribeJob, Callable[[], bool]], q.TranscribeResult]
+pytestmark = [pytest.mark.integration, pytest.mark.xdist_group(name="pool_supervisor")]
 
 
-@pytest.fixture(autouse=True)
-def _stub_temp_gc(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Stub temp GC to keep daemon tests isolated from real system temp."""
-    monkeypatch.setattr(
-        "core.external_daemon.purge_stale_askvlm_temp_dirs",
-        lambda: TempGcSummary(),
+def test_run_supervisor_runs_temp_gc_once_after_lock(tmp_path: Path) -> None:
+    """Catch GC before ownership, duplicate GC or GC after lock denial."""
+    pool = SupervisorHarness(tmp_path)
+    calls = []
+
+    def sweep() -> TempGcSummary:
+        with SupervisorLock(pool.paths) as other:
+            assert not other.try_acquire()
+        calls.append(True)
+        assert run_supervisor(pool.paths.root, pool.config, options=pool.options) == 0
+        return TempGcSummary()
+
+    pool.options = replace(pool.options, temp_gc=sweep)
+    job = pool.job(text="after GC")
+    try:
+        pool.start()
+        assert pool.result(job).text == "after GC"
+        assert calls == [True]
+        pool.finish()
+    finally:
+        pool.cleanup()
+
+
+def test_run_supervisor_survives_real_temp_gc_filesystem_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch GC failure preventing work; scan only a test temp root."""
+    pool = SupervisorHarness(tmp_path)
+    temp_root = tmp_path / "isolated-temp"
+    temp_root.mkdir()
+    original_iterdir = Path.iterdir
+    failures = []
+
+    def inaccessible(path: Path) -> Iterator[Path]:
+        if path == temp_root:
+            failures.append(True)
+            msg = "test GC root access denied"
+            raise PermissionError(msg)
+        return original_iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", inaccessible)
+    pool.options = replace(
+        pool.options, temp_gc=partial(purge_stale_askvlm_temp_dirs, temp_root)
     )
+    job = pool.job(text="GC failure is tolerated")
+    try:
+        pool.start()
+        assert pool.result(job).text == "GC failure is tolerated"
+        assert failures == [True]
+        pool.finish()
+    finally:
+        pool.cleanup()
 
 
-def _job(job_id: str = "j", *, deadline_at: float | None = None) -> q.TranscribeJob:
-    """Build a test job.
-
-    Args:
-        job_id: Identifier for the job.
-        deadline_at: Optional deadline timestamp.
-
-    Returns:
-        A populated :class:`~core.external_queue.TranscribeJob`.
-
-    """
-    return q.TranscribeJob(
-        job_id=job_id,
-        input_path="input.wav",
-        language=None,
-        device="cpu",
-        compute_type="auto",
-        whisper_model="small",
-        diarization=False,
-        dialog_blocks=False,
-        submitted_at=0.0,
-        deadline_at=deadline_at,
-    )
-
-
-def _ok_fn(text: str) -> TranscribeFn:
-    """Return a transcribe function that always succeeds with *text*.
-
-    Args:
-        text: The transcript text to return.
-
-    Returns:
-        A transcribe callable.
-
-    """
-
-    def _fn(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        return q.TranscribeResult(job.job_id, "ok", text, None, None, 1.0)
-
-    return _fn
-
-
-def test_process_claimed_job_success(tmp_path: Path) -> None:
-    """A successful job publishes an ``ok`` result."""
-    result = process_claimed_job(tmp_path, _job(), _ok_fn("hi"), clock=lambda: 0.0)
-    assert result.status == "ok"
-    stored = q.read_result(tmp_path, "j")
-    assert stored is not None
-    assert stored.text == "hi"
-
-
-def test_process_claimed_job_cancel_before_start(tmp_path: Path) -> None:
-    """A pre-existing cancel marker skips the transcribe call."""
-    q.ensure_layout(tmp_path)
-    q.request_cancel(tmp_path, "j")
-    calls = {"n": 0}
-
-    def _fn(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        calls["n"] += 1
-        return q.TranscribeResult(job.job_id, "ok", "x", None, None, 1.0)
-
-    result = process_claimed_job(tmp_path, _job(), _fn, clock=lambda: 0.0)
-    assert result.status == "cancelled"
-    assert calls["n"] == 0
-
-
-def test_process_claimed_job_error(tmp_path: Path) -> None:
-    """An exception in the transcribe call yields a terminal ``error``."""
-
-    def _boom(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        message = "boom"
-        raise RuntimeError(message)
-
-    result = process_claimed_job(tmp_path, _job(), _boom, clock=lambda: 0.0)
-    assert result.status == "error"
-    assert result.error_kind == "RuntimeError"
-
-
-def test_process_claimed_job_deadline_is_cancelled(tmp_path: Path) -> None:
-    """A job past its deadline is cancelled before any work starts."""
-    calls = {"n": 0}
-
-    def _fn(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        calls["n"] += 1
-        return q.TranscribeResult(job.job_id, "ok", "x", None, None, 1.0)
-
-    result = process_claimed_job(
-        tmp_path, _job(deadline_at=50.0), _fn, clock=lambda: 100.0
-    )
-    assert result.status == "cancelled"
-    assert calls["n"] == 0
-
-
-def test_process_claimed_job_rejects_provider_mismatch(tmp_path: Path) -> None:
-    """A claimed job with the wrong provider never reaches the transcribe fn."""
-    calls = {"n": 0}
-
-    def _fn(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        calls["n"] += 1
-        return q.TranscribeResult(job.job_id, "ok", "wrong", None, None, 1.0)
-
-    # * Default job is whisper; resident daemon expects gigaam-ctc.
-    result = process_claimed_job(
-        tmp_path,
-        _job(),
-        _fn,
-        expected_stt_provider="gigaam-ctc",
-        clock=lambda: 0.0,
-    )
-    assert result.status == "error"
-    assert result.error_kind == "stt_provider_mismatch"
-    assert "gigaam-ctc" in (result.error_detail or "")
-    assert calls["n"] == 0
-    stored = q.read_result(tmp_path, "j")
-    assert stored is not None
-    assert stored.status == "error"
-    assert stored.error_kind == "stt_provider_mismatch"
-
-
-def test_process_claimed_job_rejects_gigaam_job_on_whisper_daemon(
+def test_run_supervisor_releases_os_lock_if_startup_is_interrupted(
     tmp_path: Path,
 ) -> None:
-    """Whisper-resident daemon rejects a queued gigaam-ctc job without work."""
-    calls = {"n": 0}
+    """Catch interruption leaking ownership, liveness or attempts."""
+    pool = SupervisorHarness(tmp_path)
+    job = pool.job()
 
-    def _fn(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        calls["n"] += 1
-        return q.TranscribeResult(job.job_id, "ok", "wrong", None, None, 1.0)
-
-    job = q.TranscribeJob(
-        job_id="giga",
-        input_path="input.wav",
-        language=None,
-        device="cpu",
-        compute_type="auto",
-        whisper_model="small",
-        diarization=False,
-        dialog_blocks=False,
-        submitted_at=0.0,
-        deadline_at=None,
-        stt_provider="gigaam-ctc",
-    )
-    result = process_claimed_job(
-        tmp_path,
-        job,
-        _fn,
-        expected_stt_provider="whisper",
-        clock=lambda: 0.0,
-    )
-    assert result.status == "error"
-    assert result.error_kind == "stt_provider_mismatch"
-    assert calls["n"] == 0
-
-
-@pytest.mark.parametrize(
-    ("job_provider", "daemon_provider"),
-    [
-        ("gigaam-ctc", "gigaam-e2e-ctc"),
-        ("gigaam-e2e-ctc", "gigaam-ctc"),
-    ],
-)
-def test_process_claimed_job_rejects_gigaam_head_mismatch(
-    tmp_path: Path, job_provider: str, daemon_provider: str
-) -> None:
-    """Sibling GigaAM heads are distinct providers and never share a daemon."""
-    calls = {"n": 0}
-
-    def _fn(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        calls["n"] += 1
-        return q.TranscribeResult(job.job_id, "ok", "wrong", None, None, 1.0)
-
-    job = q.TranscribeJob(
-        job_id="giga-head",
-        input_path="input.wav",
-        language=None,
-        device="cpu",
-        compute_type="auto",
-        whisper_model="small",
-        diarization=False,
-        dialog_blocks=False,
-        submitted_at=0.0,
-        deadline_at=None,
-        stt_provider=job_provider,
-    )
-    result = process_claimed_job(
-        tmp_path,
-        job,
-        _fn,
-        expected_stt_provider=daemon_provider,
-        clock=lambda: 0.0,
-    )
-    assert result.status == "error"
-    assert result.error_kind == "stt_provider_mismatch"
-    assert job_provider in (result.error_detail or "")
-    assert daemon_provider in (result.error_detail or "")
-    assert calls["n"] == 0
-
-
-def test_run_daemon_exits_when_already_running(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A second daemon exits immediately while the first is alive."""
-    q.ensure_layout(tmp_path)
-    (tmp_path / "control" / "daemon.lock").write_text("123", encoding="utf-8")
-    q.write_heartbeat(tmp_path, {"model": "small"})
-    gc_calls = {"n": 0}
-
-    def _gc() -> TempGcSummary:
-        gc_calls["n"] += 1
-        return TempGcSummary()
-
-    monkeypatch.setattr("core.external_daemon.purge_stale_askvlm_temp_dirs", _gc)
-    calls = {"n": 0}
-
-    def _fn(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        calls["n"] += 1
-        return q.TranscribeResult(job.job_id, "ok", "x", None, None, 1.0)
-
-    code = run_daemon(tmp_path, config=DaemonConfig(), transcribe_fn=_fn)
-    assert code == 0
-    assert calls["n"] == 0
-    assert gc_calls["n"] == 0
-
-
-def test_run_daemon_runs_temp_gc_once_after_lock(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The daemon runs startup temp GC exactly once after lock acquisition."""
-    gc_calls = {"n": 0}
-
-    def _gc() -> TempGcSummary:
-        gc_calls["n"] += 1
-        return TempGcSummary()
-
-    monkeypatch.setattr("core.external_daemon.purge_stale_askvlm_temp_dirs", _gc)
-    code = run_daemon(
-        tmp_path,
-        config=DaemonConfig(
-            poll_interval_s=0.01, heartbeat_interval_s=0.01, idle_shutdown_s=0.05
-        ),
-        transcribe_fn=_ok_fn("unused"),
-    )
-    assert code == 0
-    assert gc_calls["n"] == 1
-
-
-def test_run_daemon_survives_temp_gc_exception(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A startup GC failure never aborts the daemon lifecycle."""
-
-    def _gc_fail() -> TempGcSummary:
-        msg = "gc boom"
-        raise RuntimeError(msg)
-
-    monkeypatch.setattr("core.external_daemon.purge_stale_askvlm_temp_dirs", _gc_fail)
-    code = run_daemon(
-        tmp_path,
-        config=DaemonConfig(
-            poll_interval_s=0.01, heartbeat_interval_s=0.01, idle_shutdown_s=0.05
-        ),
-        transcribe_fn=_ok_fn("unused"),
-    )
-    assert code == 0
-
-
-def test_run_daemon_releases_lock_if_gc_gets_keyboard_interrupt(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Lock cleanup still runs when startup GC is interrupted."""
-
-    def _gc_interrupt() -> TempGcSummary:
+    def interrupt() -> TempGcSummary:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(
-        "core.external_daemon.purge_stale_askvlm_temp_dirs", _gc_interrupt
-    )
-    with pytest.raises(KeyboardInterrupt):
-        run_daemon(
-            tmp_path,
-            config=DaemonConfig(
-                poll_interval_s=0.01,
-                heartbeat_interval_s=0.01,
-                idle_shutdown_s=0.05,
-            ),
-            transcribe_fn=_ok_fn("unused"),
-        )
-    assert not (tmp_path / "control" / "daemon.lock").exists()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            run_supervisor(
+                pool.paths.root,
+                pool.config,
+                options=replace(pool.options, temp_gc=interrupt),
+            )
+        assert read_heartbeat(pool.paths) is None
+        with SupervisorLock(pool.paths) as lock:
+            assert lock.try_acquire()
+        assert pool.paths.incoming_file(job.job_id).exists()
+        assert not pool.paths.attempts_file(job.job_id).exists()
+        assert not pool.events("constructed")
+    finally:
+        pool.cleanup()
 
 
-def test_run_daemon_processes_queued_job(tmp_path: Path) -> None:
-    """The daemon claims, processes, and publishes a queued job, then stops."""
-    q.submit_job(tmp_path, _job("queued"))
-    stop = threading.Event()
-
-    def _fn(
-        job: q.TranscribeJob, should_cancel: Callable[[], bool]
-    ) -> q.TranscribeResult:
-        result = q.TranscribeResult(job.job_id, "ok", "done", None, None, 1.0)
-        stop.set()
-        return result
-
-    code = run_daemon(
-        tmp_path,
-        config=DaemonConfig(poll_interval_s=0.01, idle_shutdown_s=999.0),
-        transcribe_fn=_fn,
-        stop_event=stop,
-    )
-    assert code == 0
-    stored = q.read_result(tmp_path, "queued")
-    assert stored is not None
-    assert stored.status == "ok"
-    assert stored.text == "done"
-
-
-def test_run_daemon_idle_shutdown_and_tidies_up(tmp_path: Path) -> None:
-    """An idle daemon shuts itself down and clears its heartbeat."""
-    code = run_daemon(
-        tmp_path,
-        config=DaemonConfig(
-            poll_interval_s=0.01, heartbeat_interval_s=0.01, idle_shutdown_s=0.05
-        ),
-        transcribe_fn=_ok_fn("unused"),
-    )
-    assert code == 0
-    assert q.read_heartbeat(tmp_path) is None
-    assert not (tmp_path / "control" / "daemon.lock").exists()
-
-
-def test_serve_loop_survives_heartbeat_oserror(
+def test_run_supervisor_keeps_serving_after_heartbeat_write_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A failed heartbeat write does not kill the serve loop or hot-spin."""
-    q.ensure_layout(tmp_path)
-    stop = threading.Event()
-    heartbeat_calls = {"n": 0}
+    """Catch transient heartbeat filesystem errors aborting the real serve loop."""
+    pool = SupervisorHarness(tmp_path)
+    original_replace = os.replace
+    failures = []
 
-    def _boom(*_args: object, **_kwargs: object) -> None:
-        heartbeat_calls["n"] += 1
-        message = "share violation"
-        raise OSError(message)
+    def failed_beacon(source: object, destination: object) -> None:
+        if Path(destination) == pool.paths.heartbeat_file:
+            failures.append(True)
+            msg = "test beacon access denied"
+            raise OSError(msg)
+        original_replace(source, destination)
 
-    monkeypatch.setattr("core.external_daemon.write_heartbeat", _boom)
-    polls = {"n": 0}
-
-    def _sleeper(_delay: float) -> None:
-        polls["n"] += 1
-        if polls["n"] >= 5:
-            stop.set()
-
-    config = DaemonConfig(
-        poll_interval_s=0.0,
-        heartbeat_interval_s=5.0,
-        idle_shutdown_s=999.0,
-    )
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        _serve_loop(
-            tmp_path,
-            config,
-            _ok_fn("unused"),
-            stop_event=stop,
-            executor=executor,
-            clock=lambda: 100.0,
-            sleeper=_sleeper,
-        )
-    assert heartbeat_calls["n"] == 1
+    monkeypatch.setattr(os, "replace", failed_beacon)
+    job = pool.job(text="heartbeat failure is tolerated")
+    try:
+        pool.start()
+        assert pool.result(job).text == "heartbeat failure is tolerated"
+        assert failures
+        pool.finish()
+    finally:
+        pool.cleanup()

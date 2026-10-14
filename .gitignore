@@ -138,6 +138,7 @@ dmypy.json
 
 # Project specific
 settings.json
+/stt_pool.json
 models/
 0-INPUT-0/
 0-OUTPUT-0/

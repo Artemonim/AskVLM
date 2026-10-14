@@ -13,6 +13,19 @@ under that limit without native ``transcribe_longform``.
 The device machinery (CUDA placement after a CPU load, CUDA OOM fallback to
 CPU per window, VRAM release on unload) is shared with the CUDA-capable
 subclass; for this head the device is always ``cpu`` and CUDA is never used.
+
+Opt-in modes used by the STT worker pool (defaults keep the behavior above):
+
+* ``strict_device`` — only an explicit ``cpu``/``cuda`` device; no CUDA→CPU
+  fallback anywhere: an unusable CUDA runtime raises
+  :class:`~core.stt_errors.DeviceUnavailableError` before weights load, and a
+  CUDA out-of-memory error raises :class:`~core.stt_errors.CudaOutOfMemoryError`.
+* ``threadsafe`` — :meth:`GigaAMCtcWrapper.transcribe` reads the 20 s windows
+  straight from the WAV and runs each through a lock-free per-call
+  ``forward`` + CTC ``decode`` of the remote-code ASR module, so several Python
+  threads can share one resident CPU model (see :meth:`ensure_loaded`).
+* :func:`iter_wav_windows` and :meth:`GigaAMCtcWrapper.transcribe_window_batch`
+  — the window stream and the padded batch inference used by GPU batching.
 """
 
 from __future__ import annotations
@@ -23,7 +36,9 @@ import importlib
 import logging
 import math
 import os
+import sys
 import tempfile
+import threading
 import time
 import wave
 from dataclasses import dataclass, field
@@ -31,11 +46,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NoReturn, cast
 
 from core.gigaam_device import (
+    STRICT_DEVICE_REQUESTS,
     is_cuda_oom_error,
     module_device_types,
     release_cuda_cache,
     select_gigaam_device,
 )
+from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
 from core.stt_providers import (
     GIGAAM_HF_REPO_ID,
     GIGAAM_HF_REVISION,
@@ -44,7 +61,10 @@ from core.stt_providers import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator, Sequence
+
+    import numpy as np
+    from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +78,19 @@ _WINDOW_S = 20.0
 # * samples @16 kHz — headroom for integer resample rounding above 321 samples.
 _MIN_AUDIO_DURATION_S = 0.04
 _CHUNK_LOG_INTERVAL = 10
+
+# * Sample rate of the remote code (its ``SAMPLE_RATE``) and of the 16-bit mono
+# * PCM WAVs that the lock-free path reads directly without ffmpeg.
+GIGAAM_SAMPLE_RATE = 16000
+_PCM16_SAMPLE_WIDTH = 2
+# * Scale of the remote ``load_audio``: int16 PCM -> float32 in [-1, 1).
+_PCM16_SCALE = 32768.0
+# * Sample bounds of one window accepted by the lock-free inference path:
+# * the STFT duration floor and the 20 s window of the warm-up.
+_MIN_WINDOW_SAMPLES = math.ceil(_MIN_AUDIO_DURATION_S * GIGAAM_SAMPLE_RATE)
+_MAX_WINDOW_SAMPLES = int(_WINDOW_S * GIGAAM_SAMPLE_RATE)
+# * Remote-code ASR attributes used by the lock-free path (``GigaAMASR``).
+_ASR_ATTRS = ("forward", "head", "decoding", "parameters")
 
 _MISSING_EXTRA_MSG = (
     "GigaAM CTC providers (Multilingual ctc, v3 e2e_ctc) require the AskVLM ML extra "
@@ -78,6 +111,41 @@ class _WavFormat(NamedTuple):
     sample_width: int
     channels: int
     window_frames: int
+
+
+class UnsupportedWavError(RuntimeError):
+    """The file cannot be streamed as 16 kHz mono 16-bit PCM WAV windows."""
+
+
+@dataclass(frozen=True, slots=True)
+class WavWindow:
+    """One window of a 16 kHz mono 16-bit PCM WAV, ready for GigaAM inference.
+
+    Attributes:
+        index: Zero-based window index.
+        start_s: Absolute window start in seconds.
+        end_s: Absolute end of the window's audio in seconds (before padding).
+        samples: 1-D float32 samples scaled like the remote ``load_audio``
+            (``int16 / 32768``), zero-padded to the STFT duration floor
+            (``_MIN_AUDIO_DURATION_S``) when the window is shorter.
+
+    """
+
+    index: int
+    start_s: float
+    end_s: float
+    samples: NDArray[np.float32]
+
+
+@dataclass(frozen=True, slots=True)
+class _LockFreeModel:
+    """Resolved remote-code ASR module used by the lock-free inference path."""
+
+    asr: Any
+    torch: Any
+    device: Any
+    dtype: Any
+    cuda: bool
 
 
 @dataclass(slots=True)
@@ -316,8 +384,224 @@ def _log_chunk_progress(
     )
 
 
+def _numpy() -> Any:  # noqa: ANN401 - the numpy module, imported lazily
+    """Import numpy on first use so importing this module stays light."""
+    return importlib.import_module("numpy")
+
+
+def _decoded_text(entry: object) -> str:
+    """Return the text of one remote-code CTC decoder entry.
+
+    v3 ``e2e_ctc`` decodes to plain strings; the Multilingual ``ctc`` revision
+    decodes to ``(text, token_ids, token_frames)`` tuples.
+    """
+    if isinstance(entry, str):
+        return entry
+    if isinstance(entry, (tuple, list)) and entry:
+        return str(entry[0])
+    text = getattr(entry, "text", None)
+    return str(text) if text is not None else str(entry)
+
+
+def _canonical_format(reader: wave.Wave_read, *, window_s: float) -> _WavFormat:
+    """Return the stream format of a 16 kHz mono 16-bit PCM WAV.
+
+    Args:
+        reader: Open WAV reader.
+        window_s: Window length in seconds.
+
+    Returns:
+        Stream format with ``window_frames`` for *window_s*.
+
+    Raises:
+        _UnparseableWavError: When the header is not streamable or the format
+            is not 16 kHz mono 16-bit PCM (which only ffmpeg can resample).
+
+    """
+    fmt = _format_from_reader(reader)
+    if (fmt.rate, fmt.channels, fmt.sample_width) != (
+        GIGAAM_SAMPLE_RATE,
+        1,
+        _PCM16_SAMPLE_WIDTH,
+    ):
+        msg = (
+            f"WAV is not {GIGAAM_SAMPLE_RATE} Hz mono 16-bit PCM "
+            f"(rate={fmt.rate}, channels={fmt.channels}, "
+            f"sample_width={fmt.sample_width})"
+        )
+        raise _UnparseableWavError(msg)
+    return fmt._replace(window_frames=int(window_s * fmt.rate))
+
+
+def _make_window(
+    index: int,
+    *,
+    start_frame: int,
+    pcm: bytes,
+    n_frames: int,
+    rate: int,
+) -> WavWindow:
+    """Convert one PCM16 mono window to float32 samples with the STFT padding.
+
+    Mirrors the default path: a window shorter than ``_MIN_AUDIO_DURATION_S``
+    gets trailing zero frames up to ``ceil(_MIN_AUDIO_DURATION_S * rate)``.
+    """
+    np_mod = _numpy()
+    pcm16 = np_mod.frombuffer(pcm[: n_frames * _PCM16_SAMPLE_WIDTH], dtype="<i2")
+    samples = pcm16.astype(np_mod.float32) / np_mod.float32(_PCM16_SCALE)
+    if n_frames / float(rate) < _MIN_AUDIO_DURATION_S:
+        target_frames = math.ceil(_MIN_AUDIO_DURATION_S * rate)
+        pad_frames = max(0, target_frames - n_frames)
+        samples = np_mod.concatenate(
+            [samples, np_mod.zeros(pad_frames, dtype=np_mod.float32)]
+        )
+    return WavWindow(
+        index=index,
+        start_s=start_frame / float(rate),
+        end_s=(start_frame + n_frames) / float(rate),
+        samples=cast("NDArray[np.float32]", samples),
+    )
+
+
+def _iter_reader_windows(
+    reader: wave.Wave_read, fmt: _WavFormat
+) -> Iterator[WavWindow]:
+    """Yield the windows of an open canonical WAV with the default-path boundaries.
+
+    A file shorter than one window is a single window (the default path's
+    original-file fast path); longer files are consecutive full windows and a
+    shorter tail, exactly like the default path's chunk files.
+    """
+    pcm = reader.readframes(fmt.window_frames)
+    n_frames = _pcm_frame_count(
+        pcm, sample_width=fmt.sample_width, channels=fmt.channels
+    )
+    if n_frames < fmt.window_frames:
+        yield _make_window(0, start_frame=0, pcm=pcm, n_frames=n_frames, rate=fmt.rate)
+        return
+    start_frame = 0
+    index = 0
+    while pcm:
+        yield _make_window(
+            index, start_frame=start_frame, pcm=pcm, n_frames=n_frames, rate=fmt.rate
+        )
+        start_frame += n_frames
+        index += 1
+        pcm = reader.readframes(fmt.window_frames)
+        n_frames = _pcm_frame_count(
+            pcm, sample_width=fmt.sample_width, channels=fmt.channels
+        )
+
+
+def _iter_wav_windows_from(path: Path, window_s: float) -> Iterator[WavWindow]:
+    """Stream windows of *path*, mapping parse failures to ``UnsupportedWavError``."""
+    try:
+        with wave.open(str(path), "rb") as reader:
+            fmt = _canonical_format(reader, window_s=window_s)
+            yield from _iter_reader_windows(reader, fmt)
+    except (wave.Error, EOFError, _UnparseableWavError) as exc:
+        msg = f"Cannot stream {path} as {GIGAAM_SAMPLE_RATE} Hz mono 16-bit PCM WAV"
+        raise UnsupportedWavError(msg) from exc
+
+
+def iter_wav_windows(path: Path, *, window_s: float = _WINDOW_S) -> Iterator[WavWindow]:
+    """Stream a prepared 16 kHz mono 16-bit PCM WAV as GigaAM windows.
+
+    The windows have the same boundaries, timestamps, and tail padding as the
+    wrapper's default :meth:`GigaAMCtcWrapper.transcribe` path, and their
+    samples equal what the remote ``load_audio`` decodes for each window. The
+    file is read lazily, one window at a time; close the iterator (or exhaust
+    it) to release the file handle early.
+
+    Args:
+        path: Prepared WAV (for example the output of ``prepare_audio``).
+        window_s: Window length in seconds (the wrapper uses 20 s;
+            :meth:`GigaAMCtcWrapper.transcribe_window_batch` accepts at most
+            20 s per window).
+
+    Returns:
+        Iterator over :class:`WavWindow` items; an empty WAV yields one padded
+        window ending at 0.0 s.
+
+    Raises:
+        ValueError: When *window_s* is not a positive finite number.
+
+    Note:
+        Iteration raises :class:`UnsupportedWavError` when the file is not a
+        parseable 16 kHz mono 16-bit PCM WAV, and ``OSError`` when it cannot
+        be opened.
+
+    """
+    if not (math.isfinite(window_s) and window_s > 0):
+        msg = f"window_s must be a positive finite number (got {window_s!r})"
+        raise ValueError(msg)
+    return _iter_wav_windows_from(Path(path), float(window_s))
+
+
+def _validated_window(window: object, position: int) -> NDArray[np.float32]:
+    """Return *window* as a 1-D float32 array within the lock-free sample bounds.
+
+    Raises:
+        ValueError: When the window is not 1-D or its length is outside
+            ``[_MIN_WINDOW_SAMPLES, _MAX_WINDOW_SAMPLES]``.
+
+    """
+    np_mod = _numpy()
+    array = np_mod.asarray(window, dtype=np_mod.float32)
+    if array.ndim != 1:
+        msg = f"window {position} must be 1-D (got shape {array.shape})"
+        raise ValueError(msg)
+    size = int(array.shape[0])
+    if not _MIN_WINDOW_SAMPLES <= size <= _MAX_WINDOW_SAMPLES:
+        msg = (
+            f"window {position} has {size} samples; expected "
+            f"{_MIN_WINDOW_SAMPLES}..{_MAX_WINDOW_SAMPLES} at {GIGAAM_SAMPLE_RATE} Hz"
+        )
+        raise ValueError(msg)
+    return cast("NDArray[np.float32]", array)
+
+
+def _optional_positive_int(name: str, value: int | None) -> int | None:
+    """Validate an optional positive integer option.
+
+    Raises:
+        ValueError: When *value* is not ``None`` and not an integer >= 1.
+
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        msg = f"{name} must be a positive integer or None (got {value!r})"
+        raise ValueError(msg)
+    return value
+
+
+def _require_strict_device_token(device: str) -> None:
+    """Reject a non-explicit device for strict device mode.
+
+    Raises:
+        ValueError: When *device* is not ``cpu`` or ``cuda``.
+
+    """
+    token = str(device).strip().lower()
+    if token not in STRICT_DEVICE_REQUESTS:
+        msg = (
+            "Strict device mode requires an explicit device 'cpu' or 'cuda' "
+            f"(got device={device!r})"
+        )
+        raise ValueError(msg)
+
+
 class GigaAMCtcWrapper:
-    """Load GigaAM CTC on CPU, transcribe, and release resources on close."""
+    """Load GigaAM CTC on CPU, transcribe, and release resources on close.
+
+    Concurrency contract: with ``threadsafe=True`` and after
+    :meth:`ensure_loaded`, :meth:`transcribe` and
+    :meth:`transcribe_window_batch` may be called from several threads on one
+    CPU-resident model. CUDA inference calls are serialized per wrapper (the
+    project never runs concurrent GigaAM CUDA inference). :meth:`unload` must
+    not overlap inference calls.
+    """
 
     # * Provider served by this wrapper; selects device validation (CPU-only here).
     PROVIDER: ClassVar[str] = STT_PROVIDER_GIGAAM_CTC
@@ -327,6 +611,10 @@ class GigaAMCtcWrapper:
         *,
         device: str = "cpu",
         cache_dir: Path | None = None,
+        strict_device: bool = False,
+        torch_threads: int | None = None,
+        threadsafe: bool = False,
+        warmup_batch: int = 1,
     ) -> None:
         """Initialize the wrapper without loading model weights.
 
@@ -335,23 +623,94 @@ class GigaAMCtcWrapper:
                 ``auto`` (both mean CPU); a CUDA-capable subclass accepts
                 ``auto`` / ``cpu`` / ``cuda`` and resolves it at model load.
             cache_dir: Optional Hugging Face cache directory override.
+            strict_device: Require an explicit ``cpu``/``cuda`` device and
+                never fall back to CPU: an unusable CUDA runtime raises
+                :class:`~core.stt_errors.DeviceUnavailableError` before the
+                weights load, and every CUDA out-of-memory error (model move,
+                window, batch) raises
+                :class:`~core.stt_errors.CudaOutOfMemoryError`.
+            torch_threads: When set, ``torch.set_num_threads`` is applied once
+                per model load (process-wide setting).
+            threadsafe: Route :meth:`transcribe` through the lock-free
+                per-window ``forward``/``decode`` path and warm the model up
+                in :meth:`ensure_loaded`.
+            warmup_batch: Batch size of the extra CUDA warm-up batch run by
+                :meth:`ensure_loaded` in thread-safe mode (the maximum number
+                of windows a caller passes to :meth:`transcribe_window_batch`).
 
         Raises:
-            ValueError: When *device* is not valid for :attr:`PROVIDER`.
+            ValueError: When *device* is not valid for :attr:`PROVIDER` (in
+                strict mode: not an explicit ``cpu``/``cuda`` accepted by the
+                provider) or an option is out of range.
 
         """
         # * Reject invalid devices before any model download or import.
+        if strict_device:
+            _require_strict_device_token(device)
         self.device = resolve_gigaam_requested_device(self.PROVIDER, device)
         self.cache_dir = cache_dir
+        self.strict_device = bool(strict_device)
+        self.torch_threads = _optional_positive_int("torch_threads", torch_threads)
+        self.threadsafe = bool(threadsafe)
+        checked_batch = _optional_positive_int("warmup_batch", warmup_batch)
+        self.warmup_batch = 1 if checked_batch is None else checked_batch
         self._model: Any | None = None
         self._torch: Any | None = None
         self._active_device: str | None = None
         self._cuda_used = False
+        self._lockfree: _LockFreeModel | None = None
+        # * Serializes lazy loading (and the thread-safe warm-up) per wrapper.
+        self._load_lock = threading.Lock()
+        # * Serializes CUDA inference of the lock-free path per wrapper.
+        self._cuda_infer_lock = threading.Lock()
 
     @property
     def active_device(self) -> str | None:
         """Device of the resident model, or ``None`` when no model is loaded."""
         return self._active_device
+
+    def ensure_loaded(self) -> None:
+        """Load the model once; in thread-safe mode also warm it up.
+
+        The thread-safe warm-up runs single-threaded under the load lock before
+        any caller can reach the lock-free path: one full-length 20 s zero
+        window and, on CUDA, one zero batch of ``warmup_batch`` windows. The
+        first encoder forward creates the remote code's lazy rotary
+        ``pos_enc.pe`` buffer (sized by ``pos_emb_max_len``, far above the 20 s
+        window); later forwards only read it.
+
+        Raises:
+            DeviceUnavailableError: Strict ``cuda`` without a usable CUDA runtime.
+            CudaOutOfMemoryError: Strict CUDA load/move, or any CUDA warm-up,
+                ran out of memory (the model is discarded).
+
+        """
+        if self.threadsafe:
+            self._lockfree_model()
+            return
+        self._load_model_locked()
+
+    def _load_model_locked(self) -> None:
+        """Run :meth:`_load_model` under the per-wrapper load lock."""
+        if self._model is not None:
+            return
+        with self._load_lock:
+            self._load_model()
+
+    def _prepare_load(self, torch_mod: object) -> None:
+        """Apply the strict device check and torch threads before weights load.
+
+        Args:
+            torch_mod: The ``torch`` module returned by :meth:`_ensure_deps`.
+
+        """
+        if self.strict_device:
+            # * Raises DeviceUnavailableError before any CPU weight load.
+            select_gigaam_device(self.device, torch_mod, strict=True)
+        if self.torch_threads is not None:
+            set_num_threads = getattr(torch_mod, "set_num_threads", None)
+            if callable(set_num_threads):
+                set_num_threads(self.torch_threads)
 
     def _ensure_deps(self) -> tuple[Any, Any]:
         """Import Transformers / torch or raise a useful missing-extra error.
@@ -378,6 +737,7 @@ class GigaAMCtcWrapper:
         if self._model is not None:
             return
         auto_model_cls, torch_mod = self._ensure_deps()
+        self._prepare_load(torch_mod)
         kwargs: dict[str, Any] = {
             "revision": GIGAAM_HF_REVISION,
             "trust_remote_code": True,
@@ -417,14 +777,27 @@ class GigaAMCtcWrapper:
 
         A CUDA out-of-memory error during the move returns the whole model to
         CPU, so parameters never stay split across devices. Any other move
-        failure drops the model and propagates.
+        failure drops the model and propagates. In strict device mode the
+        out-of-memory error drops the model too and raises
+        :class:`~core.stt_errors.CudaOutOfMemoryError`.
 
         Raises:
             Exception: Non-OOM failure of ``model.to("cuda")``.
+            CudaOutOfMemoryError: Strict mode, CUDA out of memory on the move.
+            DeviceUnavailableError: Strict ``cuda`` without a usable CUDA runtime.
 
         """
         model = self._model
-        if model is None or select_gigaam_device(self.device, self._torch) != "cuda":
+        if model is None:
+            return
+        try:
+            target = select_gigaam_device(
+                self.device, self._torch, strict=self.strict_device
+            )
+        except DeviceUnavailableError:
+            self._discard_model()
+            raise
+        if target != "cuda":
             return
         self._cuda_used = True
         try:
@@ -434,6 +807,16 @@ class GigaAMCtcWrapper:
                 # ! Never keep a half-moved model resident.
                 self._discard_model()
                 raise
+            if self.strict_device:
+                # * Strict mode never falls back to CPU: drop the half-moved
+                # * model; the caller decides what to do with the device.
+                del model
+                self._discard_model()
+                msg = (
+                    "GigaAM: CUDA out of memory while moving the model to CUDA "
+                    f"(strict device=cuda): {type(exc).__name__}: {exc}"
+                )
+                raise CudaOutOfMemoryError(msg) from exc
             reason = f"{type(exc).__name__}: {exc}"
         else:
             self._model = moved
@@ -465,6 +848,7 @@ class GigaAMCtcWrapper:
         model = model.to("cpu")
         self._model = model
         self._active_device = "cpu"
+        self._lockfree = None
         release_cuda_cache(self._torch)
         device_types = module_device_types(model)
         if device_types is not None and device_types != {"cpu"}:
@@ -476,6 +860,7 @@ class GigaAMCtcWrapper:
     def _discard_model(self) -> None:
         """Drop the resident model reference and release cached VRAM."""
         self._model = None
+        self._lockfree = None
         self._active_device = None
         release_cuda_cache(self._torch)
 
@@ -487,6 +872,7 @@ class GigaAMCtcWrapper:
 
         """
         used_cuda = self._cuda_used
+        self._lockfree = None
         if self._model is not None:
             with contextlib.suppress(Exception):
                 del self._model
@@ -535,7 +921,7 @@ class GigaAMCtcWrapper:
             Transcript text for that file.
 
         """
-        self._load_model()
+        self._load_model_locked()
         model = self._model
         if model is None:
             msg = "GigaAM CTC model failed to load"
@@ -553,7 +939,9 @@ class GigaAMCtcWrapper:
         """Transcribe one window, retrying it on CPU after a CUDA OOM.
 
         After the fallback the model stays on CPU, so later windows (and later
-        files of a resident pipeline) run on CPU too.
+        files of a resident pipeline) run on CPU too. In strict device mode the
+        window raises :class:`~core.stt_errors.CudaOutOfMemoryError` instead
+        and the model stays resident on CUDA.
 
         Args:
             model: Resident model.
@@ -562,12 +950,21 @@ class GigaAMCtcWrapper:
         Returns:
             Raw ``.transcribe`` result.
 
+        Raises:
+            CudaOutOfMemoryError: Strict mode, CUDA out of memory on the window.
+
         """
         try:
             return _call_model_transcribe(model, path)
         except Exception as exc:
             if self._active_device != "cuda" or not is_cuda_oom_error(exc):
                 raise
+            if self.strict_device:
+                msg = (
+                    "GigaAM: CUDA out of memory on a window (strict device=cuda): "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise CudaOutOfMemoryError(msg) from exc
             reason = f"{type(exc).__name__}: {exc}"
         # * Retry outside the except block so the OOM traceback no longer pins
         # * the window's CUDA activations before the cache is released.
@@ -713,6 +1110,244 @@ class GigaAMCtcWrapper:
                 )
                 raise RuntimeError(msg) from exc
 
+    # * ----------------------------------------------------------------------
+    # * Lock-free inference path (thread-safe mode and window batches)
+    # * ----------------------------------------------------------------------
+
+    def _lockfree_model(self) -> _LockFreeModel:
+        """Return the resolved ASR module, loading and warming it up once.
+
+        Raises:
+            CudaOutOfMemoryError: The CUDA warm-up ran out of memory (the model
+                is discarded).
+
+        """
+        state = self._lockfree
+        if state is not None:
+            return state
+        with self._load_lock:
+            state = self._lockfree
+            if state is None:
+                self._load_model()
+                state = self._resolve_lockfree_model()
+                if self.threadsafe:
+                    try:
+                        self._warm_up(state)
+                    except CudaOutOfMemoryError:
+                        self._discard_model()
+                        raise
+                self._lockfree = state
+        return state
+
+    def _resolve_lockfree_model(self) -> _LockFreeModel:
+        """Resolve the remote-code ``GigaAMASR`` module of the resident model.
+
+        Raises:
+            RuntimeError: When no model is loaded or the remote-code layout or
+                sample rate differs from what the lock-free path relies on.
+
+        """
+        model = self._model
+        if model is None:
+            msg = "GigaAM CTC model failed to load"
+            raise RuntimeError(msg)
+        asr = getattr(model, "model", None)
+        missing = [name for name in _ASR_ATTRS if not hasattr(asr, name)]
+        if asr is None or missing:
+            msg = (
+                f"Unexpected GigaAM remote-code layout; missing {missing or ['model']}"
+            )
+            raise RuntimeError(msg)
+        remote = sys.modules.get(type(asr).__module__)
+        sample_rate = int(getattr(remote, "SAMPLE_RATE", GIGAAM_SAMPLE_RATE))
+        if sample_rate != GIGAAM_SAMPLE_RATE:
+            msg = (
+                f"GigaAM remote code expects {sample_rate} Hz audio; the lock-free "
+                f"path reads {GIGAAM_SAMPLE_RATE} Hz WAVs"
+            )
+            raise RuntimeError(msg)
+        first_param = next(iter(asr.parameters()), None)
+        if first_param is None:
+            msg = "GigaAM remote-code ASR module has no parameters"
+            raise RuntimeError(msg)
+        return _LockFreeModel(
+            asr=asr,
+            torch=self._torch,
+            device=first_param.device,
+            dtype=first_param.dtype,
+            cuda=str(first_param.device.type) == "cuda",
+        )
+
+    def _warm_up(self, state: _LockFreeModel) -> None:
+        """Run the single-threaded warm-up forwards of the thread-safe mode."""
+        np_mod = _numpy()
+        window = np_mod.zeros(_MAX_WINDOW_SAMPLES, dtype=np_mod.float32)
+        started_at = time.perf_counter()
+        self._infer_windows(state, [window])
+        if state.cuda and self.warmup_batch > 1:
+            self._infer_windows(state, [window] * self.warmup_batch)
+        if state.cuda:
+            synchronize = getattr(
+                getattr(state.torch, "cuda", None), "synchronize", None
+            )
+            if callable(synchronize):
+                synchronize()
+        logger.info(
+            "GigaAM lock-free path warmed up (device=%s, batch=%s, %.2f s)",
+            "cuda" if state.cuda else "cpu",
+            self.warmup_batch if state.cuda else 1,
+            time.perf_counter() - started_at,
+        )
+
+    def _infer_windows(
+        self, state: _LockFreeModel, windows: Sequence[NDArray[np.float32]]
+    ) -> list[str]:
+        """Run one zero-padded batch through ``forward`` and CTC ``decode``.
+
+        Mirrors the remote ``GigaAMASR.transcribe`` (``prepare_wav`` →
+        ``forward`` → ``decoding.decode``) for every row, with per-call tensors
+        only: the batch of one is exactly a single-window transcription. CUDA
+        calls are serialized per wrapper.
+
+        Args:
+            state: Resolved ASR module.
+            windows: 1-D float32 windows (validated by the caller).
+
+        Returns:
+            One stripped text per window.
+
+        Raises:
+            CudaOutOfMemoryError: CUDA ran out of memory (no fallback, no retry;
+                the model stays resident).
+
+        """
+        np_mod = _numpy()
+        torch = state.torch
+        lengths = [int(window.shape[0]) for window in windows]
+        batch = np_mod.zeros((len(windows), max(lengths)), dtype=np_mod.float32)
+        for row, window in enumerate(windows):
+            batch[row, : lengths[row]] = window
+        guard: contextlib.AbstractContextManager[object] = (
+            self._cuda_infer_lock if state.cuda else contextlib.nullcontext()
+        )
+        try:
+            with guard, torch.inference_mode():
+                wav = torch.from_numpy(batch).to(state.device).to(state.dtype)
+                wav_lengths = torch.tensor(lengths, dtype=torch.long).to(state.device)
+                encoded, encoded_len = state.asr.forward(wav, wav_lengths)
+                decoded = state.asr.decoding.decode(
+                    state.asr.head, encoded, encoded_len
+                )
+        except Exception as exc:
+            if not (state.cuda and is_cuda_oom_error(exc)):
+                raise
+            msg = (
+                f"GigaAM: CUDA out of memory on a batch of {len(windows)} "
+                f"window(s): {type(exc).__name__}: {exc}"
+            )
+            raise CudaOutOfMemoryError(msg) from exc
+        return [self._coerce_text(_decoded_text(entry)) for entry in decoded]
+
+    def transcribe_window_batch(self, windows: Sequence[NDArray[Any]]) -> list[str]:
+        """Transcribe several windows in one zero-padded forward pass.
+
+        The batch is zero-padded to its longest window and carries the real
+        lengths, like the remote code's own collate. A batch of one equals the
+        thread-safe single-window result bit for bit; longer batches can
+        differ slightly at the right edge of shorter windows (the striding
+        sub-sampling convolutions see the zero padding). Loads the model on
+        first use (see :meth:`ensure_loaded`).
+
+        Args:
+            windows: 1-D 16 kHz float32 windows (for example
+                :attr:`WavWindow.samples`), each between the STFT duration
+                floor (640 samples) and 20 s.
+
+        Returns:
+            One stripped text per window, in input order.
+
+        Raises:
+            ValueError: When a window is not 1-D or its length is out of bounds.
+            CudaOutOfMemoryError: CUDA ran out of memory (never retried on CPU).
+
+        """
+        if len(windows) == 0:
+            return []
+        arrays = [
+            _validated_window(window, position)
+            for position, window in enumerate(windows)
+        ]
+        return self._infer_windows(self._lockfree_model(), arrays)
+
+    def _stream_lockfree(
+        self,
+        audio_path: Path,
+        state: _LockFreeModel,
+        *,
+        on_segment: Callable[[dict[str, Any]], None] | None,
+        progress: Callable[[float, str], None] | None,
+    ) -> dict[str, Any]:
+        """Run the 20 s window loop with lock-free inference on a canonical WAV."""
+        with wave.open(str(audio_path), "rb") as reader:
+            fmt = _canonical_format(reader, window_s=_WINDOW_S)
+            acc = _TranscriptAccumulator(
+                on_segment=on_segment,
+                progress=progress,
+                duration_s=_header_duration_seconds(reader),
+            )
+            started_at = time.perf_counter()
+            for window in _iter_reader_windows(reader, fmt):
+                text = self._infer_windows(state, [window.samples])[0]
+                # * on_segment runs between windows, so a pipeline cancel stops here.
+                acc.emit(window.start_s, window.end_s, text)
+                _log_chunk_progress(
+                    idx=window.index,
+                    offset_s=window.start_s,
+                    started_at=started_at,
+                    processed_s=window.end_s,
+                )
+            return acc.as_result()
+
+    def _transcribe_lockfree(
+        self,
+        audio_path: Path,
+        *,
+        on_segment: Callable[[dict[str, Any]], None] | None,
+        progress: Callable[[float, str], None] | None,
+    ) -> dict[str, Any]:
+        """Transcribe through the lock-free path (thread-safe mode).
+
+        A WAV that the stdlib reader cannot stream as 16 kHz mono 16-bit PCM is
+        re-encoded once with ffmpeg, like the default path's fallback.
+        """
+        state = self._lockfree_model()
+        try:
+            return self._stream_lockfree(
+                audio_path, state, on_segment=on_segment, progress=progress
+            )
+        except (wave.Error, EOFError, _UnparseableWavError) as exc:
+            logger.debug("GigaAM lock-free WAV read failed for %s: %s", audio_path, exc)
+        # * Lazy import so `import core.gigaam_ctc_wrapper` does not require ffmpeg-python.
+        from core.ffmpeg import extract_audio  # noqa: PLC0415
+
+        logger.warning(
+            "GigaAM CTC could not stream %s as 16 kHz mono PCM WAV; re-encoding",
+            audio_path,
+        )
+        with tempfile.TemporaryDirectory(prefix="askvlm-gigaam-reencode-") as tmp:
+            dst = Path(tmp) / "reencoded.wav"
+            extract_audio(audio_path, dst, sample_rate=GIGAAM_SAMPLE_RATE, channels=1)
+            try:
+                return self._stream_lockfree(
+                    dst, state, on_segment=on_segment, progress=progress
+                )
+            except (wave.Error, EOFError, _UnparseableWavError) as exc:
+                msg = (
+                    "GigaAM CTC could not parse WAV after re-encoding to "
+                    "PCM 16-bit 16 kHz mono"
+                )
+                raise RuntimeError(msg) from exc
+
     def transcribe(
         self,
         audio_path: Path,
@@ -733,6 +1368,13 @@ class GigaAMCtcWrapper:
         files are split into temporary window WAVs. Stdlib ``wave`` failures
         trigger one ffmpeg re-encode and a single retry.
 
+        In thread-safe mode the same windows (boundaries, timestamps, tail
+        padding, per-window stripped text, empty windows kept) are read
+        straight from a 16 kHz mono 16-bit PCM WAV and run through the
+        lock-free ``forward``/``decode`` path; any other WAV is re-encoded once
+        to that format first. ``on_segment`` runs between windows, so its
+        cancellation semantics are unchanged.
+
         Args:
             audio_path: Prepared WAV (or other path accepted by GigaAM).
             language: Unused; retained for call-site compatibility.
@@ -743,6 +1385,10 @@ class GigaAMCtcWrapper:
             Mapping with ``text`` and ``segments`` (list of start/end/text).
 
         """
+        if self.threadsafe:
+            return self._transcribe_lockfree(
+                audio_path, on_segment=on_segment, progress=progress
+            )
         try:
             return self._stream_transcribe(
                 audio_path,

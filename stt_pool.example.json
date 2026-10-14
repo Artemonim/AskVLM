@@ -1,0 +1,48 @@
+{
+  "schema": "askvlm.stt_pool.config",
+  "version": 1,
+  "cpu": {
+    "max_slots": 8,
+    "threads_per_slot": 2,
+    "max_slots_per_worker": 8
+  },
+  "gpu": {
+    "max_workers": 2,
+    "batch_lanes": {
+      "gigaam": 8,
+      "whisper": 4
+    },
+    "host_threads": {
+      "gigaam": 3,
+      "whisper": 2
+    },
+    "scale_out_backlog_s": 30.0
+  },
+  "threads": {
+    "budget": 28
+  },
+  "memory": {
+    "commit_budget_gib": 24,
+    "free_commit_guard_gib": 8,
+    "critical_free_commit_gib": 4
+  },
+  "vram": {
+    "budget_gib": 7,
+    "free_guard_gib": 0.5
+  },
+  "lifecycle": {
+    "worker_idle_ttl_s": 600,
+    "supervisor_linger_s": 30,
+    "stop_grace_s": 20,
+    "cancel_grace_s": 30
+  },
+  "scheduling": {
+    "spill_ratio": 0.8,
+    "starvation_after_s": 60,
+    "max_attempts": 2,
+    "gpu_cpu_contention": 0.5,
+    "priority_aging_s": 300,
+    "load_failure_cooldown_s": 300,
+    "crash_cooldown_s": 60
+  }
+}

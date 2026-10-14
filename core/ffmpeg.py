@@ -1,7 +1,12 @@
 # Placeholder for ffmpeg.py
 
+import json
 import logging
+import math
+import os
+import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -40,6 +45,108 @@ def get_media_duration_seconds(path: str | Path) -> float:
     except Exception as exc:  # noqa: BLE001
         logger.debug("ffprobe duration failed: %s", exc)
         return 0.0
+
+
+class MediaProbeError(RuntimeError):
+    """ffprobe could not report a valid media duration."""
+
+
+# * Hide the console window of ffprobe children on Windows.
+_NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+_PROBE_STDERR_TAIL_CHARS = 500
+
+
+def _parse_probe_duration(stdout: bytes) -> float:
+    """Return the ``format.duration`` of ffprobe JSON output.
+
+    Raises:
+        MediaProbeError: When the output is not JSON with a finite,
+            non-negative ``format.duration``.
+
+    """
+    try:
+        info = json.loads(stdout.decode("utf-8", errors="replace"))
+    except json.JSONDecodeError as exc:
+        msg = "ffprobe returned output that is not JSON"
+        raise MediaProbeError(msg) from exc
+    fmt = info.get("format") if isinstance(info, dict) else None
+    raw = fmt.get("duration") if isinstance(fmt, dict) else None
+    if raw is None:
+        msg = "ffprobe reported no format duration"
+        raise MediaProbeError(msg)
+    try:
+        duration = float(raw)
+    except (TypeError, ValueError) as exc:
+        msg = f"ffprobe reported an unparsable duration {raw!r}"
+        raise MediaProbeError(msg) from exc
+    if not math.isfinite(duration) or duration < 0:
+        msg = f"ffprobe reported an invalid duration {raw!r}"
+        raise MediaProbeError(msg)
+    return duration
+
+
+def probe_media_duration(path: str | Path, *, timeout_s: float = 10.0) -> float:
+    """Return the media duration in seconds reported by ffprobe.
+
+    Runs ``ffprobe -v error -show_entries format=duration -of json <path>`` as
+    a child process (no shell, no console window on Windows); the child is
+    killed when it outlives *timeout_s*.
+
+    Args:
+        path: Media file; passed as an absolute path so it is never read as
+            an ffprobe option.
+        timeout_s: Wall-clock limit of the probe in seconds.
+
+    Returns:
+        The finite, non-negative duration in seconds.
+
+    Raises:
+        MediaProbeError: ffprobe is missing, cannot start, times out (including
+            a non-positive *timeout_s*), exits non-zero, or reports no valid
+            duration.
+
+    """
+    if not (math.isfinite(timeout_s) and timeout_s > 0):
+        msg = f"no time left to probe the media duration (timeout_s={timeout_s!r})"
+        raise MediaProbeError(msg)
+    executable = shutil.which("ffprobe")
+    if executable is None:
+        msg = "ffprobe is not on PATH"
+        raise MediaProbeError(msg)
+    target = os.path.abspath(os.fspath(path))  # noqa: PTH100 - no filesystem access
+    command = [
+        executable,
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "json",
+        target,
+    ]
+    try:
+        completed = subprocess.run(  # noqa: S603 - resolved ffprobe, fixed argv, no shell
+            command,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout_s,
+            check=False,
+            creationflags=_NO_WINDOW_FLAGS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        msg = f"ffprobe timed out after {timeout_s:.1f} s on {target}"
+        raise MediaProbeError(msg) from exc
+    except OSError as exc:
+        msg = f"ffprobe could not start: {exc}"
+        raise MediaProbeError(msg) from exc
+    if completed.returncode != 0:
+        tail = completed.stderr.decode("utf-8", errors="replace").strip()
+        msg = (
+            f"ffprobe exited with code {completed.returncode} on {target}: "
+            f"{tail[-_PROBE_STDERR_TAIL_CHARS:]}"
+        )
+        raise MediaProbeError(msg)
+    return _parse_probe_duration(completed.stdout)
 
 
 def burn_subtitles(

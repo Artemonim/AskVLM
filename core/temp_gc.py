@@ -22,6 +22,7 @@ ASKVLM_TEMP_PREFIXES: tuple[str, ...] = (
     "askvlm-daemon-",
     "askvlm-gigaam-",
     "askvlm-gigaam-reencode-",
+    "askvlm-pool-",
 )
 
 

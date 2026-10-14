@@ -12,7 +12,7 @@
 | Text mode | ✅ ready | Stable base workflow. |
 | Subtitle mode | ✅ ready | Stable preview/export/burn-in workflow. |
 | Whisper/WhisperX | ✅ ready for subtitle-first base, ✅ Video QA local run wired | Subtitle pipeline unchanged; Video QA uses ASR via `WhisperXWrapper` + `prepare_audio` without diarization/dialog formatting by default in the local run path. VRAM hand-off Whisper → LM phase not enforced yet (see §6). |
-| GigaAM CTC | ✅ ready for `external-transcribe` | CPU-only `--stt-provider gigaam-ctc` (`ai-sage/GigaAM-Multilingual` revision `ctc`); deps in `.[ml]`; `run.ps1`/`build.ps1` default-ensure torch 2.10 CUDA; not used for CUDA / Whisper CUDA fallbacks / Windows GPU child isolation; daemon provider mismatch → unavailable. |
+| GigaAM CTC | ✅ ready for `external-transcribe` | CPU-only `--stt-provider gigaam-ctc` (`ai-sage/GigaAM-Multilingual` revision `ctc`); deps in `.[ml]`; `run.ps1`/`build.ps1` default-ensure torch 2.10 CUDA; not used for CUDA / Whisper CUDA fallbacks / Windows GPU child isolation; served by the STT supervisor pool (worker per configuration). |
 | Chunking | ✅ ready at planning level | Chunk planning exists in backend orchestration. |
 | Representative frames | ✅ ready for local GUI run | `core/video_qa_local_run.VideoQAFFmpegFrameMaterializer` uses `extract_frame_to_file`. |
 | LM Studio / VLM | 🟡 partial | GUI launch path runs chunk inferencer + LM Studio client; overflow vs live server behaviour still needs verification. |
@@ -151,7 +151,13 @@
 
 ## 12. Расширение (post-MVP)
 
-- **GigaAM CTC (сделано для external CLI):** опциональный CPU-only `--stt-provider gigaam-ctc` в `external-transcribe` / daemon / queue; Whisper остаётся default. Длинные файлы: зафиксировано решение — внешний потоковый чанкинг (окна 20 с, без short-form ветки). Native `transcribe_longform` (pyannote VAD, требует `HF_TOKEN`) отложен до доказанной потребности в качестве границ. Возможные follow-up: GUI picker, отдельный A/B quality gate на живых RU-записях.
+- **STT-супервизор с пулом воркеров (сделано для external CLI):** `external-transcribe` идёт через супервизор (`core/stt_pool/`): воркер-процесс на конфигурацию, раздельные лимиты CPU/GPU, бюджет commit/VRAM, Job Object на воркер, spill `auto` на CPU по ETA, пачки входов, `--priority` с чередованием вызовов. Follow-up:
+  - [ ] Снизить commit на воркер: замерить commit по стадиям (импорт, загрузка весов, прогрев, инференс), настройка аллокатора, загрузка весов без лишних копий.
+  - [ ] Замерить на реальном пуле «несколько GPU-процессов, каждый с батчингом» (GigaAM) и уточнить `gpu.max_workers`/`scale_out_backlog_s`; нужен остановленный прод-бот (замер грузит больше одной модели).
+  - [ ] Батчинг Whisper на GPU для заданий без `--language` (сейчас идут последовательным путём): определять язык по клипу и группировать.
+  - [ ] Адаптация NotArtemonim: бот шлёт `--priority high`, офлайн-инструмент `--priority low`, отказ от `--daemon-workers` (по зелёному свету Архитектора; ведётся отдельно).
+  - [ ] Вынести общий ctypes-код Job Object/commit из `tools/stt_concurrency/sysmetrics.py` на `core/stt_pool/` (сейчас копия; тесты бенчмарка патчат имена модуля).
+- **GigaAM CTC (сделано для external CLI):** опциональный CPU-only `--stt-provider gigaam-ctc` в `external-transcribe` (через пул воркеров); Whisper остаётся default. Длинные файлы: зафиксировано решение — внешний потоковый чанкинг (окна 20 с, без short-form ветки). Native `transcribe_longform` (pyannote VAD, требует `HF_TOKEN`) отложен до доказанной потребности в качестве границ. Возможные follow-up: GUI picker, отдельный A/B quality gate на живых RU-записях.
 - Блок задач по **загрузке видео из сети** (не только YouTube): унифицировать URL providers, политики temp/cleanup, UX импорта и ToS/лицензии в одном workstream, чтобы не размазывать сетевой ввод по разным §.
 - **Чат с финальным ответом Video QA**, а не только read-only просмотр: возможность уточнять ответ в диалоге (контекст: evidence, manifest, вопрос), с отдельным контрактом от subtitle-first. Опциональное подключение Filesystem MCP.
 - **Другие локальные LLM-провайдеры** помимо LM Studio: абстракция над OpenAI-compatible HTTP (base URL, auth, capabilities), плюс опциональные адаптеры (ollama, llama.cpp server, …) без смешения с subtitle pipeline.

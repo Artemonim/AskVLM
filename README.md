@@ -112,9 +112,9 @@ python cli.py external-transcribe PATH_TO_MEDIA
 
 - Провайдер по умолчанию: `--stt-provider whisper` (модель `small`).
 - Опционально: `--stt-provider gigaam-ctc` (только CPU; `GigaAM-Multilingual` @ `ctc`; без пунктуации; ~2.5 ГБ RAM) или `--stt-provider gigaam-e2e-ctc` (CPU или CUDA, `--device auto|cpu|cuda`; `GigaAM-v3` @ `e2e_ctc`; с пунктуацией и капитализацией; ~2.9 ГБ RAM на CPU, ~1.5–1.65 ГБ VRAM на CUDA). Оба входят в `.[ml]`.
-- JIT-загрузка модели: Whisper/GigaAM загружается при старте транскрипции и выгружается перед выходом (в `--no-daemon`; в демоне — резидентно).
-- Безопасность CUDA (Whisper и `gigaam-e2e-ctc`): на Windows, если дочерний GPU-процесс падает (OOM), AskVLM автоматически повторяет на CPU в изолированном подпроцессе; CUDA→CPU fallback и Windows GPU child-isolation действуют для Whisper и `gigaam-e2e-ctc`. `gigaam-ctc` в CUDA/fallback/Windows GPU-isolation не участвует.
-- Живой демон с другим `--stt-provider` → unavailable/mismatch (singleton не подменяется молча; нужен рестарт демона).
+- Режим по умолчанию: общий STT-супервизор держит пул процессов-воркеров, по одному на конфигурацию (провайдер, модель, тип вычислений, CPU или GPU); воркеры запускаются по спросу и останавливаются после TTL простоя; раздельные лимиты CPU/GPU и бюджет commit/VRAM задаются в `stt_pool.json` (см. `stt_pool.example.json`). `--device cpu` никогда не использует GPU, `cuda` остаётся на GPU, `auto` предпочитает GPU и уходит на CPU, только если там выйдет быстрее.
+- Несколько входов в одном вызове возвращают JSON Lines в порядке входов (`--output-dir`, `--max-parallel`); `--priority high|normal|low` упорядочивает очередь с чередованием вызовов.
+- Legacy `--no-daemon`: модель грузится в процессе самой команды и выгружается перед выходом; на Windows упавший GPU-процесс (OOM) повторяется на CPU в изолированном подпроцессе (Whisper и `gigaam-e2e-ctc`). `gigaam-ctc` в CUDA/fallback/Windows GPU-isolation не участвует.
 - Опциональный файловый вывод: `--output-file transcript.txt`.
 - Диаризация отключена по умолчанию (экономия VRAM).
 

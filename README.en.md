@@ -112,9 +112,9 @@ Prints plain transcript text to stdout. Designed as a machine-friendly endpoint 
 
 - Default provider: `--stt-provider whisper` (model `small`).
 - Optional: `--stt-provider gigaam-ctc` (CPU-only; `GigaAM-Multilingual` @ `ctc`; no punctuation; ~2.5 GB RAM) or `--stt-provider gigaam-e2e-ctc` (CPU or CUDA, `--device auto|cpu|cuda`; `GigaAM-v3` @ `e2e_ctc`; with punctuation and capitalization; ~2.9 GB RAM on CPU, ~1.5–1.65 GB VRAM on CUDA). Both are included in `.[ml]`.
-- JIT model loading: Whisper/GigaAM loads at transcription start and unloads before exit (`--no-daemon`; resident in daemon mode).
-- CUDA safety (Whisper and `gigaam-e2e-ctc`): on Windows, if the GPU child process crashes (OOM), AskVLM retries on CPU automatically in an isolated subprocess; the CUDA→CPU fallback and Windows GPU child isolation apply to Whisper and `gigaam-e2e-ctc`. `gigaam-ctc` does not use CUDA, CUDA fallbacks, or Windows GPU isolation.
-- A live daemon with a different `--stt-provider` → unavailable/mismatch (singleton is not silently replaced; restart the daemon).
+- Default mode: a shared STT supervisor runs a pool of worker processes, one per configuration (provider, model, compute type, CPU or GPU), started on demand and stopped after an idle TTL; separate CPU/GPU limits and a commit/VRAM budget come from `stt_pool.json` (see `stt_pool.example.json`). `--device cpu` never uses the GPU, `cuda` stays on the GPU, `auto` prefers the GPU and moves to CPU only when that finishes sooner.
+- Several inputs per call return JSON Lines in input order (`--output-dir`, `--max-parallel`); `--priority high|normal|low` orders the queue, with turns between calls.
+- Legacy `--no-daemon`: the model loads in the command's own process and unloads before exit; on Windows a crashing GPU child (OOM) is retried on CPU in an isolated subprocess (Whisper and `gigaam-e2e-ctc`). `gigaam-ctc` does not use CUDA, CUDA fallbacks, or Windows GPU isolation.
 - Optional file output: `--output-file transcript.txt`.
 - Diarization is off by default (saves VRAM).
 

@@ -10,15 +10,21 @@ import subprocess
 import sys
 import tempfile
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FrameType
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import typer
 
-from core.external_client import ClientRequest, run_client_transcribe
-from core.external_daemon import DaemonConfig, run_daemon
+from core.stt_pool.client import ClientRequest, run_client
+from core.stt_pool.config import PoolConfigError, apply_overrides, load_pool_config
+from core.stt_pool.keys import (
+    normalize_device_request,
+    normalize_language,
+    normalize_priority,
+)
+from core.stt_pool.queue import MAX_PARALLEL_LIMIT
 from core.stt_providers import (
     STT_PROVIDER_CHOICES,
     STT_PROVIDER_WHISPER,
@@ -27,6 +33,12 @@ from core.stt_providers import (
     provider_may_use_cuda,
     resolve_gigaam_requested_device,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from core.stt_pool.client import InputOutcome
+    from core.stt_pool.keys import DeviceRequest
 
 app = typer.Typer(
     help=(
@@ -306,12 +318,50 @@ def _raise_external_transcribe_error(attempt: _ExternalChildAttemptResult) -> No
 
 
 def _emit_external_transcribe_outputs(
-    *, text: str, output_file: Optional[Path], stdout: bool
+    *,
+    text: str,
+    output_file: Optional[Path],
+    stdout: bool,
+    output_dir_file: Path | None = None,
 ) -> None:
     if output_file is not None:
         _write_plain_text(output_file, text)
+    if output_dir_file is not None:
+        _write_plain_text(output_dir_file, text)
     if stdout and text:
         typer.echo(text)
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Replace *path* with *text* in one step (temporary file, then replace).
+
+    Args:
+        path: Destination file; missing parent directories are created.
+        text: Content written as UTF-8 with platform line endings, like
+            :func:`_write_plain_text`.
+
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            delete=False,
+            dir=path.parent,
+            prefix=f"{path.name}.",
+            suffix=".tmp",
+        ) as temp_file:
+            temp_path = Path(temp_file.name)
+            temp_file.write(text)
+            temp_file.flush()
+            os.fsync(temp_file.fileno())
+        temp_path.replace(path)
+    except BaseException:
+        if temp_path is not None:
+            with contextlib.suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+        raise
 
 
 # * Distinct exit codes let a caller (for example the Telegram bot) react to a
@@ -320,122 +370,289 @@ EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT = 10
 EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT = 11
 _CLIENT_TIMEOUT_MARKER = "ASKVLM_CLIENT_TIMEOUT"
 _DAEMON_UNAVAILABLE_MARKER = "ASKVLM_DAEMON_UNAVAILABLE"
-_CPU_FALLBACK_FAILED_MARKER = "ASKVLM_CPU_FALLBACK_FAILED"
+_ERROR_MARKER = "ERROR"
+_DEPRECATED_MARKER = "ASKVLM_DEPRECATED"
+_DAEMON_WORKERS_DEPRECATION = (
+    f"{_DEPRECATED_MARKER}: --daemon-workers is deprecated; use --max-parallel"
+)
 
-# * Daemon outcomes that mean the service was reachable-but-degraded (the resident
-# * GPU model could not deliver a transcript in time, or no daemon answered) rather
-# * than the media being unprocessable — eligible for a bounded CPU recovery pass.
-_DAEMON_DEGRADED_STATUSES = frozenset({"timeout", "unavailable"})
+# * Client statuses of a successful input; every other status is a failure.
+_SUCCESS_STATUSES = frozenset({"ok", "empty"})
+
+# * Exit code of a multi-input call: the first failure status present wins.
+_FAILURE_EXIT_PRIORITY: tuple[tuple[str, int], ...] = (
+    ("timeout", EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT),
+    ("unavailable", EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT),
+    ("error", 1),
+)
+
+# * stderr marker of each failure status in multi-input calls.
+_FAILURE_MARKERS: dict[str, str] = {
+    "timeout": _CLIENT_TIMEOUT_MARKER,
+    "unavailable": _DAEMON_UNAVAILABLE_MARKER,
+    "error": _ERROR_MARKER,
+}
 
 
-def _device_prefers_gpu(device: str) -> bool:
-    """Return True when *device* would run on GPU, so a CPU fallback differs.
+def _priority_callback(value: str) -> str:
+    """Validate ``--priority`` case-insensitively.
 
     Args:
-        device: The requested ``--device`` token (``auto``/``cuda``/``cpu``/...).
+        value: Raw option value.
 
     Returns:
-        True for everything except an explicit CPU request.
-    """
-    return device.strip().lower() != "cpu"
-
-
-def _try_cpu_fallback_transcribe(cpu_fallback: Callable[[], str]) -> Optional[str]:
-    """Run the bounded CPU fallback, swallowing failures.
-
-    Args:
-        cpu_fallback: Callable performing one in-process CPU transcription.
-
-    Returns:
-        The recovered transcript text (possibly empty), or ``None`` when the
-        fallback itself failed so the caller can surface the degraded exit code.
-    """
-    try:
-        return cpu_fallback()
-    except Exception as exc:  # noqa: BLE001 - best-effort recovery; original status still surfaced
-        typer.secho(
-            f"{_CPU_FALLBACK_FAILED_MARKER}: {type(exc).__name__}: {exc}".strip(),
-            err=True,
-        )
-        return None
-
-
-def _run_external_transcribe_via_daemon(  # noqa: PLR0913
-    *,
-    input_path: Path,
-    language: Optional[str],
-    device: str,
-    compute_type: str,
-    whisper_model: str,
-    client_timeout: float,
-    daemon_workers: int,
-    output_file: Optional[Path],
-    stdout: bool,
-    stt_provider: str = STT_PROVIDER_WHISPER,
-    cpu_fallback: Optional[Callable[[], str]] = None,
-) -> None:
-    """Transcribe through the shared daemon and map the outcome to CLI rules.
-
-    When the daemon is reachable-but-degraded (client timeout or no daemon) on a
-    GPU-seeded request of a CUDA-capable provider (Whisper or
-    ``gigaam-e2e-ctc``), a bounded in-process CPU fallback is attempted before
-    the degraded exit code is surfaced. The CPU-only ``gigaam-ctc`` head has no
-    GPU state to recover from and skips it.
-
-    Args:
-        input_path: Media file to transcribe.
-        language: Optional language hint or ``None``.
-        device: Preferred device for a freshly spawned daemon.
-        compute_type: Preferred faster-whisper compute type.
-        whisper_model: Preferred Whisper model name.
-        client_timeout: Seconds to wait before giving up and signalling a drop.
-        daemon_workers: Worker count requested when spawning a new daemon.
-        output_file: Optional plain-text file to also write.
-        stdout: Whether to echo the transcript to stdout.
-        stt_provider: STT backend id (``whisper``, ``gigaam-ctc``, or
-            ``gigaam-e2e-ctc``).
-        cpu_fallback: Optional callable performing one in-process CPU
-            transcription, used only on a degraded GPU-seeded outcome of a
-            CUDA-capable provider.
+        The canonical priority class.
 
     Raises:
-        typer.Exit: With code ``0`` on success, ``1`` on error,
-            :data:`EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT` on a client timeout, or
-            :data:`EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT` when no daemon is
-            reachable.
+        typer.BadParameter: When the value names no priority class.
+
     """
-    outcome = run_client_transcribe(
-        ClientRequest(
-            input_path=input_path,
-            language=language,
-            device=device,
-            compute_type=compute_type,
-            whisper_model=whisper_model,
-            client_timeout_s=client_timeout,
-            daemon_workers=daemon_workers,
-            stt_provider=stt_provider,
-        )
+    try:
+        return normalize_priority(value)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _client_timeout_callback(value: float) -> float:
+    """Validate ``--client-timeout``: a number of at least 1 or ``inf``.
+
+    The range check of the option already rejects values below 1; ``nan``
+    slips through every comparison and is refused here.
+
+    Args:
+        value: Parsed option value.
+
+    Returns:
+        The unchanged value; ``inf`` means the call has no deadline.
+
+    Raises:
+        typer.BadParameter: When the value is ``nan``.
+
+    """
+    if math.isnan(value):
+        msg = "--client-timeout must be a number of seconds (or inf), not nan."
+        raise typer.BadParameter(msg)
+    return value
+
+
+def _reject_supervisor_unsupported_flags(
+    *, diarization: bool, dialog_blocks: bool, work_dir: Path | None
+) -> None:
+    """Refuse flags the transcription supervisor cannot honor.
+
+    Args:
+        diarization: ``--diarization`` was given.
+        dialog_blocks: ``--dialog-blocks`` was given.
+        work_dir: Value of ``--work-dir``.
+
+    Raises:
+        typer.BadParameter: Naming the first unsupported flag and ``--no-daemon``.
+
+    """
+    for flag, used in (
+        ("--diarization", diarization),
+        ("--dialog-blocks", dialog_blocks),
+        ("--work-dir", work_dir is not None),
+    ):
+        if used:
+            msg = (
+                f"{flag} is not supported by the transcription supervisor; "
+                "rerun with --no-daemon to use it."
+            )
+            raise typer.BadParameter(msg, param_hint=f"'{flag}'")
+
+
+def _supervisor_device(provider: str, device: str) -> DeviceRequest:
+    """Map ``--device`` onto the supervisor's device vocabulary.
+
+    Args:
+        provider: Canonical provider id.
+        device: Device token already checked by :func:`_resolve_external_device`.
+
+    Returns:
+        ``auto``, ``cpu`` or ``cuda``. Whisper maps every other token to
+        ``auto``.
+
+    Raises:
+        typer.BadParameter: When a GigaAM head rejects the token.
+
+    """
+    if not is_gigaam_provider(provider):
+        # * Whisper keeps the legacy coercion of the in-process pipeline: a
+        # * token outside auto|cpu|cuda (for example ``cuda:0``) means ``auto``.
+        try:
+            return normalize_device_request(provider, device)
+        except ValueError:
+            return "auto"
+    try:
+        return normalize_device_request(provider, device)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="'--device'") from exc
+
+
+def _supervisor_language(language: str | None) -> str | None:
+    """Validate ``--language`` for a supervisor job.
+
+    Args:
+        language: Raw ``--language`` value.
+
+    Returns:
+        The lowercased language code, or ``None`` when absent or blank.
+
+    Raises:
+        typer.BadParameter: When the value is not a language code.
+
+    """
+    try:
+        return normalize_language(language)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="'--language'") from exc
+
+
+def _build_supervisor_request(  # noqa: PLR0913 - one argument per CLI option
+    *,
+    input_paths: Sequence[Path],
+    provider: str,
+    whisper_model: str,
+    compute_type: str,
+    device: str,
+    language: str | None,
+    priority: str,
+    max_parallel: int | None,
+    client_timeout: float,
+    diarization: bool,
+    dialog_blocks: bool,
+    work_dir: Path | None,
+) -> ClientRequest:
+    """Validate the supervisor-mode options and build the client request.
+
+    Args:
+        input_paths: Inputs in input order.
+        provider: Canonical provider id.
+        whisper_model: ``--whisper-model`` value.
+        compute_type: ``--compute-type`` value.
+        device: Device token already checked by :func:`_resolve_external_device`.
+        language: ``--language`` value.
+        priority: Canonical ``--priority`` value.
+        max_parallel: Effective per-call cap (``--max-parallel``, else the
+            deprecated ``--daemon-workers``), or ``None``.
+        client_timeout: ``--client-timeout`` value.
+        diarization: ``--diarization`` was given.
+        dialog_blocks: ``--dialog-blocks`` was given.
+        work_dir: ``--work-dir`` value.
+
+    Returns:
+        The request for :func:`~core.stt_pool.client.run_client`.
+
+    Raises:
+        typer.BadParameter: For a flag the supervisor cannot honor, a device
+            token a GigaAM head rejects, or an invalid language token.
+
+    """
+    _reject_supervisor_unsupported_flags(
+        diarization=diarization, dialog_blocks=dialog_blocks, work_dir=work_dir
     )
-    if outcome.status in {"ok", "empty"}:
+    return ClientRequest(
+        inputs=tuple(input_paths),
+        provider=provider,
+        whisper_model=whisper_model,
+        compute_type=compute_type,
+        device=_supervisor_device(provider, device),
+        language=_supervisor_language(language),
+        priority=normalize_priority(priority),
+        max_parallel=max_parallel,
+        client_timeout_s=client_timeout,
+    )
+
+
+def _note_deprecated_daemon_workers(daemon_workers: int | None) -> None:
+    """Print the ``--daemon-workers`` deprecation note when the flag was given.
+
+    Args:
+        daemon_workers: ``--daemon-workers`` value, or ``None``.
+
+    """
+    if daemon_workers is not None:
+        typer.secho(_DAEMON_WORKERS_DEPRECATION, err=True)
+
+
+def _resolve_output_dir_files(inputs: Sequence[Path], output_dir: Path) -> list[Path]:
+    """Name the ``--output-dir`` file of every input before the run.
+
+    The first input with a given stem gets ``<stem>.txt``; a later input whose
+    name would collide (compared case-insensitively) gets ``<stem>-2.txt``,
+    ``<stem>-3.txt``, and so on, skipping names already taken.
+
+    Args:
+        inputs: Inputs in input order.
+        output_dir: Target directory.
+
+    Returns:
+        One distinct file path per input, in input order.
+
+    """
+    taken: set[str] = set()
+    files: list[Path] = []
+    for input_path in inputs:
+        stem = input_path.stem
+        name = f"{stem}.txt"
+        suffix = 1
+        while name.casefold() in taken:
+            suffix += 1
+            name = f"{stem}-{suffix}.txt"
+        taken.add(name.casefold())
+        files.append(output_dir / name)
+    return files
+
+
+def _single_line(text: str) -> str:
+    """Join the non-blank lines of *text* into one stderr line.
+
+    Args:
+        text: Possibly multi-line diagnostic text.
+
+    Returns:
+        The stripped lines joined by `` | ``.
+
+    """
+    return " | ".join(line.strip() for line in text.splitlines() if line.strip())
+
+
+def _report_single_supervisor_outcome(
+    outcome: InputOutcome,
+    *,
+    output_file: Path | None,
+    output_dir_file: Path | None,
+    stdout: bool,
+) -> None:
+    """Apply the single-input output rules to a supervisor outcome.
+
+    Args:
+        outcome: The outcome of the only input.
+        output_file: ``--output-file`` target, if any.
+        output_dir_file: ``--output-dir`` file of the input, if any.
+        stdout: Whether the transcript goes to stdout.
+
+    Raises:
+        typer.Exit: :data:`EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT` on a timeout,
+            :data:`EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT` when the supervisor is
+            unavailable, ``1`` on an error (stderr carries the worker's detail).
+
+    """
+    for warning in outcome.warnings:
+        typer.secho(warning, err=True)
+    if outcome.status in _SUCCESS_STATUSES:
         _emit_external_transcribe_outputs(
-            text=outcome.text, output_file=output_file, stdout=stdout
+            text=outcome.text,
+            output_file=output_file,
+            stdout=stdout,
+            output_dir_file=output_dir_file,
         )
         return
-    # * CUDA→CPU recovery for CUDA-capable providers; never for gigaam-ctc.
-    if (
-        provider_may_use_cuda(stt_provider)
-        and outcome.status in _DAEMON_DEGRADED_STATUSES
-        and cpu_fallback is not None
-        and _device_prefers_gpu(device)
-    ):
-        recovered = _try_cpu_fallback_transcribe(cpu_fallback)
-        if recovered is not None:
-            _emit_external_transcribe_outputs(
-                text=recovered, output_file=output_file, stdout=stdout
-            )
-            return
     if outcome.status == "timeout":
-        typer.secho(f"{_CLIENT_TIMEOUT_MARKER}: {outcome.detail or ''}".strip(), err=True)
+        typer.secho(
+            f"{_CLIENT_TIMEOUT_MARKER}: {outcome.detail or ''}".strip(), err=True
+        )
         raise typer.Exit(code=EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT)
     if outcome.status == "unavailable":
         typer.secho(
@@ -444,6 +661,181 @@ def _run_external_transcribe_via_daemon(  # noqa: PLR0913
         raise typer.Exit(code=EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT)
     typer.secho(outcome.detail or "transcription failed", err=True)
     raise typer.Exit(code=1)
+
+
+class _BatchReporter:
+    """Report the outcomes of a multi-input call in input order.
+
+    Outcomes arrive in completion order. Each ``--output-dir`` file is written
+    as soon as its outcome arrives; the stdout JSON line and the stderr lines
+    of an input are emitted once every earlier input is final.
+    """
+
+    def __init__(
+        self,
+        inputs: Sequence[Path],
+        *,
+        output_dir_files: Sequence[Path] | None,
+        stdout: bool,
+    ) -> None:
+        self._count = len(inputs)
+        self._output_dir_files = (
+            None if output_dir_files is None else tuple(output_dir_files)
+        )
+        self._stdout = stdout
+        self._received: dict[int, InputOutcome] = {}
+        self._written: dict[int, Path] = {}
+        self._next_index = 0
+        self._warned: set[str] = set()
+
+    def on_outcome(self, outcome: InputOutcome) -> None:
+        """Accept one final outcome; a repeated index is ignored."""
+        if outcome.index in self._received:
+            return
+        self._received[outcome.index] = self._write_output_dir_file(outcome)
+        while self._next_index in self._received:
+            self._emit(self._received[self._next_index])
+            self._next_index += 1
+
+    def outcomes(self) -> list[InputOutcome]:
+        """Return the reported outcomes in input order."""
+        return [self._received[index] for index in range(self._count)]
+
+    def _write_output_dir_file(self, outcome: InputOutcome) -> InputOutcome:
+        """Write ``<stem>.txt`` of a successful input; a failed write is an error."""
+        files = self._output_dir_files
+        if files is None or outcome.status not in _SUCCESS_STATUSES:
+            return outcome
+        target = files[outcome.index]
+        try:
+            _write_plain_text(target, outcome.text)
+        except OSError as exc:
+            return replace(
+                outcome,
+                status="error",
+                text="",
+                detail=f"cannot write {target}: {exc}",
+            )
+        self._written[outcome.index] = target
+        return outcome
+
+    def _emit(self, outcome: InputOutcome) -> None:
+        """Write the stderr lines and the stdout JSON line of one input."""
+        for warning in outcome.warnings:
+            if warning not in self._warned:
+                self._warned.add(warning)
+                typer.secho(warning, err=True)
+        failed = outcome.status not in _SUCCESS_STATUSES
+        error = (outcome.detail or outcome.status) if failed else None
+        if error is not None:
+            typer.secho(
+                f"{_FAILURE_MARKERS.get(outcome.status, _ERROR_MARKER)}: "
+                f"input {outcome.index} ({outcome.input_path}): {_single_line(error)}",
+                err=True,
+            )
+        if not self._stdout:
+            return
+        record: dict[str, object] = {
+            "index": outcome.index,
+            "input": str(outcome.input_path),
+            "status": outcome.status,
+            "text": "" if failed else outcome.text,
+            "error": error,
+        }
+        if self._output_dir_files is not None:
+            written = self._written.get(outcome.index)
+            record["output"] = None if written is None else str(written)
+        typer.echo(json.dumps(record))
+
+
+def _batch_exit_code(outcomes: Sequence[InputOutcome]) -> int:
+    """Return the exit code of a multi-input call.
+
+    Args:
+        outcomes: Final outcomes of every input.
+
+    Returns:
+        ``10`` when any input timed out, else ``11`` when any was unavailable,
+        else ``1`` when any failed, else ``0``.
+
+    """
+    statuses = {outcome.status for outcome in outcomes}
+    for status, code in _FAILURE_EXIT_PRIORITY:
+        if status in statuses:
+            return code
+    return 0
+
+
+def _run_external_transcribe_via_supervisor(
+    request: ClientRequest,
+    *,
+    output_file: Path | None,
+    output_dir: Path | None,
+    stdout: bool,
+) -> None:
+    """Transcribe through the STT supervisor and apply the CLI output rules.
+
+    One input keeps the plain single-file contract (transcript on stdout,
+    exit codes 0/1/10/11). Several inputs produce one JSON line per input on
+    stdout in input order, optional ``--output-dir`` files, one atomic
+    ``--output-file`` with every transcript joined by newlines, and the exit
+    code of :func:`_batch_exit_code`. A failed ``--output-file`` write prints one
+    stderr line and turns an otherwise successful call into exit ``1``; the
+    previous file content stays. There is no in-process recovery.
+
+    Args:
+        request: The client request.
+        output_file: ``--output-file`` target, if any.
+        output_dir: ``--output-dir`` target, if any.
+        stdout: Whether transcripts (or JSON lines) go to stdout.
+
+    Raises:
+        typer.Exit: With the exit code of a failed call.
+
+    """
+    output_dir_files = (
+        None
+        if output_dir is None
+        else _resolve_output_dir_files(request.inputs, output_dir)
+    )
+    if len(request.inputs) == 1:
+        outcome = run_client(request).outcomes[0]
+        _report_single_supervisor_outcome(
+            outcome,
+            output_file=output_file,
+            output_dir_file=None if output_dir_files is None else output_dir_files[0],
+            stdout=stdout,
+        )
+        return
+    reporter = _BatchReporter(
+        request.inputs, output_dir_files=output_dir_files, stdout=stdout
+    )
+    result = run_client(request, on_outcome=reporter.on_outcome)
+    for outcome in result.outcomes:
+        reporter.on_outcome(outcome)
+    outcomes = reporter.outcomes()
+    output_file_failed = False
+    if output_file is not None:
+        try:
+            _write_text_atomic(
+                output_file,
+                "\n".join(
+                    outcome.text if outcome.status in _SUCCESS_STATUSES else ""
+                    for outcome in outcomes
+                ),
+            )
+        except OSError as exc:
+            # * A failed aggregate write counts as an error of the call but never
+            # * outranks a timeout (10) or an unavailable supervisor (11).
+            output_file_failed = True
+            typer.secho(
+                f"{_ERROR_MARKER}: cannot write --output-file {output_file}: "
+                f"{_single_line(str(exc)) or type(exc).__name__}",
+                err=True,
+            )
+    code = _batch_exit_code(outcomes) or (1 if output_file_failed else 0)
+    if code:
+        raise typer.Exit(code=code)
 
 
 @app.command()
@@ -538,7 +930,9 @@ def subtitle(
     diarization: bool = typer.Option(False, help="Enable speaker diarization"),
     burn_in: bool = typer.Option(True, help="Burn subtitles into the video"),
     save_srt: bool = typer.Option(True, help="Always save .srt sidecar"),
-    format: str = typer.Option("srt", help="Subtitle format: srt|vtt|ass (srt only for burn)"),
+    format: str = typer.Option(
+        "srt", help="Subtitle format: srt|vtt|ass (srt only for burn)"
+    ),
     max_cps: float = typer.Option(18.0, help="Max characters per second"),
     max_line_chars: int = typer.Option(42, help="Max characters per line"),
     max_lines: int = typer.Option(2, help="Max lines per cue"),
@@ -591,19 +985,36 @@ def subtitle(
 
 @app.command("external-transcribe")
 def external_transcribe(  # noqa: PLR0913
-    input_path: Path = typer.Argument(
+    input_paths: list[Path] = typer.Argument(
         ...,
         exists=True,
         readable=True,
         file_okay=True,
         dir_okay=False,
-        help="Single audio or video file to transcribe for an external caller.",
+        help=(
+            "One or more audio or video files to transcribe for an external "
+            "caller (--no-daemon accepts exactly one)."
+        ),
     ),
     output_file: Optional[Path] = typer.Option(
         None,
         "--output-file",
         "-o",
-        help="Optional plain-text file to write alongside stdout output.",
+        help=(
+            "Optional plain-text file to write alongside stdout output. With "
+            "several inputs it receives every transcript joined by newlines in "
+            "input order (failed inputs contribute an empty line)."
+        ),
+    ),
+    output_dir: Path | None = typer.Option(
+        None,
+        "--output-dir",
+        file_okay=False,
+        dir_okay=True,
+        help=(
+            "Optional directory that receives <stem>.txt for every successful "
+            "input; repeated stems get -2, -3, ... suffixes."
+        ),
     ),
     whisper_model: str = typer.Option(
         "small",
@@ -623,10 +1034,12 @@ def external_transcribe(  # noqa: PLR0913
     device: str = typer.Option(
         "auto",
         help=(
-            "Preferred device: auto|cuda|cpu. When CUDA memory is exhausted, "
-            "Whisper and gigaam-e2e-ctc retry on CPU automatically; "
-            "gigaam-e2e-ctc auto picks CUDA only with enough free VRAM. "
-            "gigaam-ctc accepts only cpu (auto resolves to cpu)."
+            "Preferred device: auto|cuda|cpu. Through the supervisor, auto "
+            "prefers the GPU and runs on CPU when that is expected to finish "
+            "sooner, cpu never uses the GPU, and cuda runs on the GPU (on CPU "
+            "only when no CUDA device exists, with a warning). gigaam-ctc "
+            "accepts only cpu (auto resolves to cpu). With --no-daemon, Whisper "
+            "and gigaam-e2e-ctc retry once on CPU after a GPU crash."
         ),
     ),
     compute_type: str = typer.Option(
@@ -640,54 +1053,80 @@ def external_transcribe(  # noqa: PLR0913
         False,
         "--diarization/--no-diarization",
         help=(
-            "Enable speaker diarization. Disabled by default for external calls; "
-            "this can require additional GPU memory."
+            "Enable speaker diarization (requires --no-daemon). Disabled by "
+            "default for external calls; this can require additional GPU memory."
         ),
     ),
     dialog_blocks: bool = typer.Option(
         False,
         "--dialog-blocks/--no-dialog-blocks",
-        help="Enable LLM-based text formatting. Disabled by default.",
+        help=(
+            "Enable LLM-based text formatting (requires --no-daemon). Disabled "
+            "by default."
+        ),
     ),
     stdout: bool = typer.Option(
         True,
         "--stdout/--no-stdout",
-        help="Write only the final transcript text to stdout. Enabled by default.",
+        help=(
+            "Write only the final transcript text to stdout; with several inputs, "
+            "one JSON line per input in input order. Enabled by default."
+        ),
     ),
     work_dir: Optional[Path] = typer.Option(
         None,
         "--work-dir",
         help=(
-            "Optional directory for intermediate files. When omitted, AskVLM uses "
-            "a temporary directory and deletes it after completion."
+            "Optional directory for intermediate files (requires --no-daemon). "
+            "When omitted, AskVLM uses a temporary directory and deletes it "
+            "after completion."
         ),
     ),
     no_daemon: bool = typer.Option(
         False,
         "--no-daemon/--daemon",
         help=(
-            "Run the legacy in-process one-shot flow instead of routing the "
-            "request through the shared transcription daemon."
+            "Run the legacy in-process one-shot flow (one input) instead of "
+            "routing the request through the shared transcription supervisor."
         ),
     ),
     client_timeout: float = typer.Option(
         300.0,
         "--client-timeout",
         min=1.0,
+        callback=_client_timeout_callback,
         help=(
-            "Daemon mode: seconds to wait for a transcript before giving up and "
-            "signalling the daemon to drop the job."
+            "Supervisor mode: seconds for the whole call, queue wait included; "
+            "unfinished inputs are then cancelled and reported as timeouts. "
+            "inf waits without a deadline."
         ),
     ),
-    daemon_workers: int = typer.Option(
-        1,
+    priority: str = typer.Option(
+        "normal",
+        "--priority",
+        callback=_priority_callback,
+        help=(
+            "Supervisor mode: priority class of this call: high, normal or low. "
+            "Higher classes are admitted first; running jobs are never "
+            "preempted. Ignored with --no-daemon."
+        ),
+    ),
+    max_parallel: int | None = typer.Option(
+        None,
+        "--max-parallel",
+        min=1,
+        max=MAX_PARALLEL_LIMIT,
+        help=(
+            "Supervisor mode: run at most N inputs of this call at once. By "
+            "default the supervisor decides. Ignored with --no-daemon."
+        ),
+    ),
+    daemon_workers: int | None = typer.Option(
+        None,
         "--daemon-workers",
         min=1,
-        max=8,
-        help=(
-            "Daemon mode: worker count requested when a new daemon is spawned. "
-            "Defaults to 1 to keep a single active model in memory."
-        ),
+        max=MAX_PARALLEL_LIMIT,
+        help="Deprecated alias of --max-parallel (used when that is not given).",
     ),
     _internal_child_mode: bool = typer.Option(
         False,
@@ -700,11 +1139,16 @@ def external_transcribe(  # noqa: PLR0913
         hidden=True,
     ),
 ) -> None:
-    """Transcribe one media file and return plain text for external applications."""
-    if not stdout and output_file is None:
-        raise typer.BadParameter(
-            "Either keep --stdout enabled or provide --output-file."
-        )
+    """Transcribe media files and return plain text for external applications.
+
+    By default the inputs go through the shared STT supervisor (a pool of
+    worker processes, one per configuration). One input prints its transcript;
+    several inputs print one JSON line per input. ``--no-daemon`` runs the
+    legacy in-process flow for one input.
+    """
+    if not stdout and output_file is None and output_dir is None:
+        msg = "Either keep --stdout enabled or provide --output-file or --output-dir."
+        raise typer.BadParameter(msg)
     try:
         provider = normalize_stt_provider(stt_provider)
     except ValueError as exc:
@@ -721,11 +1165,15 @@ def external_transcribe(  # noqa: PLR0913
         if _env_path:
             _internal_result_file = Path(_env_path)
 
+    input_path = input_paths[0]
     if _internal_child_mode:
         if _internal_result_file is None:
             raise typer.BadParameter(
                 "Internal child mode requires --_internal-result-file."
             )
+        if len(input_paths) != 1:
+            msg = "Internal child mode accepts exactly one input."
+            raise typer.BadParameter(msg)
         try:
             _run_external_transcribe_once(
                 input_path=input_path,
@@ -757,36 +1205,39 @@ def external_transcribe(  # noqa: PLR0913
             raise
 
     if not no_daemon:
-        _run_external_transcribe_via_daemon(
-            input_path=input_path,
-            language=language,
-            device=device,
-            compute_type=compute_type,
+        request = _build_supervisor_request(
+            input_paths=input_paths,
+            provider=provider,
             whisper_model=whisper_model,
+            compute_type=compute_type,
+            device=device,
+            language=language,
+            priority=priority,
+            max_parallel=max_parallel if max_parallel is not None else daemon_workers,
             client_timeout=client_timeout,
-            daemon_workers=daemon_workers,
-            output_file=output_file,
-            stdout=stdout,
-            stt_provider=provider,
-            # * Bounded CUDA→CPU recovery for CUDA-capable providers only; the
-            # * CPU-only gigaam-ctc head has no GPU state to recover from.
-            cpu_fallback=(
-                None
-                if not provider_may_use_cuda(provider)
-                else lambda: _run_external_transcribe_once(
-                    input_path=input_path,
-                    whisper_model=whisper_model,
-                    language=language,
-                    device="cpu",
-                    compute_type=compute_type,
-                    diarization=diarization,
-                    dialog_blocks=dialog_blocks,
-                    work_dir=work_dir,
-                    stt_provider=provider,
-                )
-            ),
+            diarization=diarization,
+            dialog_blocks=dialog_blocks,
+            work_dir=work_dir,
+        )
+        _note_deprecated_daemon_workers(daemon_workers)
+        _run_external_transcribe_via_supervisor(
+            request, output_file=output_file, output_dir=output_dir, stdout=stdout
         )
         return
+
+    if len(input_paths) != 1:
+        msg = (
+            "--no-daemon accepts exactly one input; drop --no-daemon to "
+            "transcribe several inputs through the supervisor."
+        )
+        raise typer.BadParameter(msg)
+    _note_deprecated_daemon_workers(daemon_workers)
+    # * --priority and --max-parallel only shape supervisor scheduling.
+    output_dir_file = (
+        None
+        if output_dir is None
+        else _resolve_output_dir_files(input_paths, output_dir)[0]
+    )
 
     # * Windows GPU child isolation covers CUDA-capable providers (Whisper and
     # * gigaam-e2e-ctc); gigaam-ctc always runs in-process on CPU.
@@ -812,13 +1263,13 @@ def external_transcribe(  # noqa: PLR0913
                 text=first_attempt.success_text,
                 output_file=output_file,
                 stdout=stdout,
+                output_dir_file=output_dir_file,
             )
             return
 
-        if (
-            not _is_windows_crash_like_return_code(first_attempt.return_code)
-            and not _is_internal_child_ipc_error(first_attempt.stderr)
-        ):
+        if not _is_windows_crash_like_return_code(
+            first_attempt.return_code
+        ) and not _is_internal_child_ipc_error(first_attempt.stderr):
             _raise_external_transcribe_error(first_attempt)
 
         retry_attempt = _run_external_transcribe_isolated_attempt(
@@ -837,6 +1288,7 @@ def external_transcribe(  # noqa: PLR0913
                 text=retry_attempt.success_text,
                 output_file=output_file,
                 stdout=stdout,
+                output_dir_file=output_dir_file,
             )
             return
         _raise_external_transcribe_error(retry_attempt)
@@ -855,6 +1307,7 @@ def external_transcribe(  # noqa: PLR0913
             text=text,
             output_file=output_file,
             stdout=stdout,
+            output_dir_file=output_dir_file,
         ),
     )
 
@@ -878,72 +1331,100 @@ def _install_stop_handlers(stop_event: threading.Event) -> None:
 
 
 @app.command("external-transcribe-daemon")
-def external_transcribe_daemon(
-    workers: int = typer.Option(
-        1, "--workers", min=1, max=8, help="Concurrent resident workers (default: 1)."
-    ),
-    stt_provider: str = typer.Option(
-        STT_PROVIDER_WHISPER,
-        "--stt-provider",
+def external_transcribe_daemon(  # noqa: PLR0913
+    queue_dir: Path | None = typer.Option(
+        None,
+        "--queue-dir",
+        file_okay=False,
         help=(
-            "Resident STT provider: whisper (default), gigaam-ctc (CPU-only), "
-            "or gigaam-e2e-ctc (CPU or CUDA)."
+            "Queue root to serve (default: ASKVLM_EXTERNAL_QUEUE_DIR, then the "
+            "project cache)."
         ),
     ),
-    whisper_model: str = typer.Option(
-        "small", "--whisper-model", help="Resident Whisper model (default: small)."
-    ),
-    device: str = typer.Option(
-        "auto",
-        "--device",
+    config_file: Path | None = typer.Option(
+        None,
+        "--config",
+        dir_okay=False,
         help=(
-            "Device for the resident model: auto|cuda|cpu. "
-            "gigaam-ctc accepts only cpu (auto→cpu); gigaam-e2e-ctc resolves "
-            "auto/cuda when the model loads."
+            "STT pool config JSON (default: ASKVLM_STT_POOL_CONFIG, then "
+            "<project>/stt_pool.json, then built-in conservative limits)."
         ),
     ),
-    compute_type: str = typer.Option(
-        "auto", "--compute-type", help="faster-whisper compute type (default: auto)."
-    ),
-    language: Optional[str] = typer.Option(
-        None, "--language", help="Optional fixed language hint for the resident model."
-    ),
-    queue_dir: Optional[Path] = typer.Option(
-        None, "--queue-dir", help="Queue root to serve (default: project cache)."
-    ),
-    idle_shutdown: float = typer.Option(
-        600.0,
+    idle_shutdown: float | None = typer.Option(
+        None,
         "--idle-shutdown",
-        min=1.0,
-        help="Exit after this many idle seconds to release VRAM (default: 600).",
+        help="Seconds an idle worker stays loaded (default: from the config).",
     ),
+    cpu_slots: int | None = typer.Option(
+        None, "--cpu-slots", help="Concurrent CPU jobs (overrides cpu.max_slots)."
+    ),
+    gpu_workers: int | None = typer.Option(
+        None, "--gpu-workers", help="GPU worker processes (overrides gpu.max_workers)."
+    ),
+    thread_budget: int | None = typer.Option(
+        None,
+        "--thread-budget",
+        help="CPU threads of the pool (overrides threads.budget).",
+    ),
+    commit_budget_gb: float | None = typer.Option(
+        None,
+        "--commit-budget-gb",
+        help="Commit memory budget in GiB (overrides memory.commit_budget_gib).",
+    ),
+    vram_budget_gb: float | None = typer.Option(
+        None,
+        "--vram-budget-gb",
+        help="VRAM budget in GiB (overrides vram.budget_gib).",
+    ),
+    workers: int | None = typer.Option(None, "--workers", hidden=True),
+    stt_provider: str | None = typer.Option(None, "--stt-provider", hidden=True),
+    whisper_model: str | None = typer.Option(None, "--whisper-model", hidden=True),
+    device: str | None = typer.Option(None, "--device", hidden=True),
+    compute_type: str | None = typer.Option(None, "--compute-type", hidden=True),
+    language: str | None = typer.Option(None, "--language", hidden=True),
 ) -> None:
-    """Run the singleton transcription daemon that serves the shared queue.
+    """Run the STT supervisor that serves the shared transcription queue.
 
-    Only one daemon serves a given queue; a second invocation exits immediately
-    when the queue is already owned. The daemon loads the model once and serves
-    every ``external-transcribe`` client through the file-based queue. A live
-    daemon with a different ``--stt-provider`` is a mismatch: clients must
-    restart the singleton rather than silently using the wrong resident model.
+    One supervisor serves a queue root; a second invocation exits at once with
+    code 0. The supervisor runs one worker process per configuration (provider,
+    model, compute type, CPU or GPU) within the limits of the pool config and
+    the overrides above, and exits after idling. ``external-transcribe`` starts
+    it on demand. The legacy flags ``--workers``, ``--stt-provider``,
+    ``--whisper-model``, ``--device``, ``--compute-type`` and ``--language``
+    are accepted and ignored: every job carries its own configuration.
     """
+    for flag, value in (
+        ("--workers", workers),
+        ("--stt-provider", stt_provider),
+        ("--whisper-model", whisper_model),
+        ("--device", device),
+        ("--compute-type", compute_type),
+        ("--language", language),
+    ):
+        if value is not None:
+            typer.secho(
+                f"{_DEPRECATED_MARKER}: {flag} is ignored by the pool supervisor",
+                err=True,
+            )
     try:
-        provider = normalize_stt_provider(stt_provider)
-    except ValueError as exc:
-        raise typer.BadParameter(str(exc)) from exc
-    device = _resolve_external_device(stt_provider=provider, device=device)
-    config = DaemonConfig(
-        max_workers=workers,
-        whisper_model=whisper_model,
-        device=device,
-        compute_type=compute_type,
-        language=language,
-        idle_shutdown_s=idle_shutdown,
-        stt_provider=provider,
-    )
+        config = apply_overrides(
+            load_pool_config(config_file),
+            cpu_slots=cpu_slots,
+            gpu_workers=gpu_workers,
+            thread_budget=thread_budget,
+            commit_budget_gib=commit_budget_gb,
+            vram_budget_gib=vram_budget_gb,
+            worker_idle_ttl_s=idle_shutdown,
+        )
+    except PoolConfigError as exc:
+        typer.secho(str(exc), err=True)
+        raise typer.Exit(code=2) from exc
     stop_event = threading.Event()
     _install_stop_handlers(stop_event)
-    code = run_daemon(queue_dir, config=config, stop_event=stop_event)
-    raise typer.Exit(code=code)
+    # * Imported on use: only the daemon process needs the supervisor.
+    from core.stt_pool.supervisor import run_supervisor  # noqa: PLC0415
+
+    raise typer.Exit(code=run_supervisor(queue_dir, config, stop_event=stop_event))
 
 
 @app.command("external-extract-frames")
@@ -1011,9 +1492,7 @@ def external_extract_frames(  # noqa: PLR0913
             err=True,
         )
         if as_json:
-            typer.echo(
-                _json.dumps({"frames": [], "fps_used": fps, "duration_s": 0.0})
-            )
+            typer.echo(_json.dumps({"frames": [], "fps_used": fps, "duration_s": 0.0}))
         return
 
     # * Select FPS: use target unless frame budget would be exceeded
@@ -1060,5 +1539,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-

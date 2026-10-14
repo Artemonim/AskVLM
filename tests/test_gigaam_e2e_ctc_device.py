@@ -682,7 +682,7 @@ def test_thin_client_path_does_not_import_torch() -> None:
         "import sys\n"
         "sys.path.insert(0, sys.argv[1])\n"
         "import cli\n"
-        "from core import external_client, stt_providers\n"
+        "from core import stt_providers\nfrom core.stt_pool import client\n"
         "for provider, device in (('gigaam-e2e-ctc', 'cuda'),"
         " ('gigaam-e2e-ctc', 'auto'), ('gigaam-ctc', 'auto'), ('whisper', 'cuda')):\n"
         "    cli._resolve_external_device(stt_provider=provider, device=device)\n"

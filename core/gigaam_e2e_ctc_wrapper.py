@@ -6,8 +6,9 @@ Uses the official Transformers API::
     model.transcribe(path)
 
 The v3 ``e2e_ctc`` head returns punctuated, capitalized text (BPE + ITN).
-Windowing, ffmpeg fallback, cancel, result coercion, and the device machinery
-are inherited from :class:`~core.gigaam_ctc_wrapper.GigaAMCtcWrapper`.
+Windowing, ffmpeg fallback, cancel, result coercion, the device machinery, and
+the opt-in pool modes (strict device, thread-safe lock-free path, window
+batches) are inherited from :class:`~core.gigaam_ctc_wrapper.GigaAMCtcWrapper`.
 
 Weights always load on CPU as fp32 under the transformers 5.x compatibility
 patches. For ``--device auto|cuda`` the loaded model then moves to CUDA as a
@@ -131,6 +132,8 @@ class GigaAME2ECtcWrapper(GigaAMCtcWrapper):
         if self._model is not None:
             return
         auto_model_cls, torch_mod = self._ensure_deps()
+        # * Strict device check and torch threads apply before any weight load.
+        self._prepare_load(torch_mod)
         kwargs: dict[str, Any] = {
             "revision": GIGAAM_V3_HF_REVISION,
             "trust_remote_code": True,

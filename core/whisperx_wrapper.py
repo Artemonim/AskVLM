@@ -5,8 +5,12 @@ import gc as _gc
 import importlib
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
+
+from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
+from core.whisper_batch import is_whisper_cuda_memory_error
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -37,6 +41,40 @@ except ModuleNotFoundError:  # pragma: no cover
 # * VRAM thresholds (GiB) for auto model selection
 _VRAM_THRESHOLD_LARGE_GB = 12.0
 _VRAM_THRESHOLD_MEDIUM_GB = 8.0
+# * Device tokens accepted by strict device mode (no ``auto``).
+_STRICT_DEVICES = frozenset({"cpu", "cuda"})
+
+
+def _strict_device_token(device: str) -> str:
+    """Return the canonical explicit device for strict mode.
+
+    Raises:
+        ValueError: When *device* is not ``cpu`` or ``cuda``.
+
+    """
+    token = str(device).strip().lower()
+    if token not in _STRICT_DEVICES:
+        msg = (
+            "Strict Whisper device mode requires an explicit device 'cpu' or "
+            f"'cuda' (got device={device!r})"
+        )
+        raise ValueError(msg)
+    return token
+
+
+def _optional_positive_int(name: str, value: int | None) -> int | None:
+    """Validate an optional positive integer option.
+
+    Raises:
+        ValueError: When *value* is not ``None`` and not an integer >= 1.
+
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        msg = f"{name} must be a positive integer or None (got {value!r})"
+        raise ValueError(msg)
+    return value
 
 
 @dataclass
@@ -63,6 +101,12 @@ class WhisperXWrapper:
 
     This wrapper prefers faster-whisper for speed and uses whisperx for alignment
     when available. All heavy deps are imported lazily.
+
+    Concurrency contract: with ``strict_device=True``, ``num_workers=K`` and the
+    model preloaded by :meth:`ensure_loaded`, up to K threads may call
+    :meth:`transcribe` concurrently (faster-whisper runs them on CTranslate2
+    replicas that share the weights). The default mode's CUDA→CPU recovery
+    reloads the shared model and is not safe under concurrent calls.
     """
 
     def __init__(
@@ -71,15 +115,75 @@ class WhisperXWrapper:
         device: str = "cuda",
         compute_type: str = "auto",
         model_root: Path | None = None,
+        *,
+        strict_device: bool = False,
+        cpu_threads: int | None = None,
+        num_workers: int | None = None,
     ) -> None:
+        """Store the configuration; the model loads lazily.
+
+        Args:
+            model_name: faster-whisper model name or path.
+            device: ``auto``/``cuda``/``cpu`` (strict mode: ``cpu``/``cuda``).
+            compute_type: CTranslate2 compute type, ``auto`` per device.
+            model_root: Optional download root of the model.
+            strict_device: Never fall back to CPU: ``cuda`` without a usable
+                CUDA runtime raises
+                :class:`~core.stt_errors.DeviceUnavailableError`, and a CUDA
+                out-of-memory error at load or inference raises
+                :class:`~core.stt_errors.CudaOutOfMemoryError`.
+            cpu_threads: ``WhisperModel(cpu_threads=...)`` when set.
+            num_workers: ``WhisperModel(num_workers=...)`` when set (the number
+                of concurrent :meth:`transcribe` calls).
+
+        Raises:
+            ValueError: Strict mode without an explicit ``cpu``/``cuda``
+                device, or a thread option that is not a positive integer.
+
+        """
         self.model_name = model_name
-        self.device = device
+        self.device = _strict_device_token(device) if strict_device else device
         self.compute_type = compute_type
         self.model_root = model_root
+        self.strict_device = bool(strict_device)
+        self.cpu_threads = _optional_positive_int("cpu_threads", cpu_threads)
+        self.num_workers = _optional_positive_int("num_workers", num_workers)
         self._model: Any | None = None
         self._align_model: Any | None = None
         self._active_device: str | None = None
         self._active_compute_type: str | None = None
+        # * Serializes lazy model loading per wrapper.
+        self._load_lock = threading.Lock()
+
+    @property
+    def active_device(self) -> str | None:
+        """Device of the loaded model, or ``None`` when no model is loaded."""
+        return self._active_device
+
+    def ensure_loaded(self) -> None:
+        """Load the model once (thread-safe; a no-op when it is loaded).
+
+        Raises:
+            DeviceUnavailableError: Strict ``cuda`` without a usable CUDA runtime.
+            CudaOutOfMemoryError: Strict CUDA load ran out of memory.
+
+        """
+        self._load_model()
+
+    def loaded_model(self) -> Any:  # noqa: ANN401 - untyped faster-whisper model
+        """Return the loaded faster-whisper ``WhisperModel``.
+
+        Used by :func:`core.whisper_batch.transcribe_clips_batched`.
+
+        Raises:
+            RuntimeError: When the model is not loaded (call :meth:`ensure_loaded`).
+
+        """
+        model = getattr(self, "_model", None)
+        if model is None:
+            msg = "Whisper model is not loaded; call ensure_loaded() first"
+            raise RuntimeError(msg)
+        return model
 
     def _cuda_available(self) -> bool:
         return bool(
@@ -97,22 +201,11 @@ class WhisperXWrapper:
         return requested
 
     def _is_cuda_memory_error(self, exc: Exception) -> bool:
-        exc_name = type(exc).__name__.lower()
-        if "outofmemory" in exc_name:
-            return True
-        message = str(exc).lower()
-        return any(
-            token in message
-            for token in (
-                "cuda out of memory",
-                "cuda error: out of memory",
-                "cudnn_status_alloc_failed",
-                "cuda failed with error out of memory",
-                "not enough memory",
-            )
-        )
+        return is_whisper_cuda_memory_error(exc)
 
     def _load_attempts(self, preferred_device: str | None = None) -> list[str]:
+        if self.strict_device:
+            return self._strict_load_attempts()
         if preferred_device is not None:
             return [preferred_device]
         if self.device == "cpu":
@@ -126,10 +219,47 @@ class WhisperXWrapper:
             return ["cpu"]
         return [self.device]
 
+    def _strict_load_attempts(self) -> list[str]:
+        """Return the single strict load device, checking CUDA availability.
+
+        Raises:
+            DeviceUnavailableError: When ``cuda`` is requested and CUDA is unusable.
+
+        """
+        if self.device == "cuda" and not self._cuda_available():
+            msg = (
+                "CUDA is unavailable (strict device=cuda); Whisper is not loaded "
+                "on CPU in strict mode"
+            )
+            raise DeviceUnavailableError(msg)
+        return [self.device]
+
+    def _model_init_kwargs(
+        self, *, device_name: str, compute_type: str, download_root: str | None
+    ) -> dict[str, object]:
+        """Return ``WhisperModel`` keyword arguments; thread options only when set."""
+        kwargs: dict[str, object] = {
+            "device": device_name,
+            "compute_type": compute_type,
+            "download_root": download_root,
+        }
+        if self.cpu_threads is not None:
+            kwargs["cpu_threads"] = self.cpu_threads
+        if self.num_workers is not None:
+            kwargs["num_workers"] = self.num_workers
+        return kwargs
+
     def _load_model(self, *, preferred_device: str | None = None) -> None:
         # Defensive: some callers may reset internals; tolerate missing attrs
         if getattr(self, "_model", None) is not None:
             return
+        lock = getattr(self, "_load_lock", None)
+        with lock if lock is not None else contextlib.nullcontext():
+            if getattr(self, "_model", None) is not None:
+                return
+            self._load_model_unlocked(preferred_device=preferred_device)
+
+    def _load_model_unlocked(self, *, preferred_device: str | None) -> None:
         if fw_whisper_cls is None:
             msg = "faster-whisper is not installed"
             raise RuntimeError(msg)
@@ -151,9 +281,11 @@ class WhisperXWrapper:
             try:
                 self._model = fw_whisper_cls(
                     chosen_model,
-                    device=device_name,
-                    compute_type=compute_type_final,
-                    download_root=download_root,
+                    **self._model_init_kwargs(
+                        device_name=device_name,
+                        compute_type=compute_type_final,
+                        download_root=download_root,
+                    ),
                 )
             except Exception as exc:
                 last_error = exc
@@ -170,6 +302,17 @@ class WhisperXWrapper:
                     )
                     self.unload(safe=False)
                     continue
+                if (
+                    self.strict_device
+                    and device_name == "cuda"
+                    and self._is_cuda_memory_error(exc)
+                ):
+                    self.unload(safe=False)
+                    msg = (
+                        "Whisper load ran out of CUDA memory (strict device=cuda): "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                    raise CudaOutOfMemoryError(msg) from exc
                 raise
             self._active_device = device_name
             self._active_compute_type = compute_type_final
@@ -330,6 +473,13 @@ class WhisperXWrapper:
             )
         except Exception as exc:
             if self._active_device == "cuda" and self._is_cuda_memory_error(exc):
+                if self.strict_device:
+                    # * Strict mode: no unload, no CPU retry; the model stays loaded.
+                    msg = (
+                        "Whisper transcription ran out of CUDA memory "
+                        f"(strict device=cuda): {type(exc).__name__}: {exc}"
+                    )
+                    raise CudaOutOfMemoryError(msg) from exc
                 logging.getLogger(__name__).warning(
                     "Whisper transcription hit CUDA memory pressure; retrying on CPU."
                 )

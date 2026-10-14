@@ -81,8 +81,8 @@ def is_cpu_only_gigaam_provider(provider: str) -> bool:
 def provider_may_use_cuda(provider: str) -> bool:
     """Return whether *provider* can place its model on CUDA.
 
-    Gates the CUDA-related CLI protections (Windows child isolation and the
-    bounded client CPU recovery) per provider.
+    Gates the Windows child isolation (with its single CPU retry) of the legacy
+    ``external-transcribe --no-daemon`` path per provider.
 
     Args:
         provider: Canonical or raw STT provider id.

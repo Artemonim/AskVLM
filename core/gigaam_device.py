@@ -12,6 +12,13 @@ Policy:
 * ``auto`` uses CUDA only when it is available and the free VRAM reported by
   ``torch.cuda.mem_get_info`` is at least
   :data:`GIGAAM_AUTO_CUDA_MIN_FREE_VRAM_BYTES`; otherwise CPU with a warning.
+
+Strict policy (``strict=True``, used by the STT worker pool):
+
+* only an explicit ``cpu`` or ``cuda`` request is accepted;
+* ``cuda`` without a usable CUDA runtime raises
+  :class:`~core.stt_errors.DeviceUnavailableError` instead of degrading to CPU;
+* no free-VRAM threshold is applied.
 """
 
 from __future__ import annotations
@@ -21,7 +28,12 @@ import gc
 import logging
 from typing import Any
 
+from core.stt_errors import DeviceUnavailableError
+
 logger = logging.getLogger(__name__)
+
+# * Device tokens accepted by the strict policy (no ``auto``).
+STRICT_DEVICE_REQUESTS: frozenset[str] = frozenset({"cpu", "cuda"})
 
 _GIB = 1024**3
 
@@ -100,13 +112,71 @@ def _free_vram_bytes(torch_mod: object) -> int | None:
     return int(free_bytes)
 
 
+def _select_strict_device(requested: str, torch_mod: object) -> str:
+    """Resolve an explicit ``cpu``/``cuda`` request without any fallback.
+
+    Args:
+        requested: Canonical request; must be ``cpu`` or ``cuda``.
+        torch_mod: Loaded ``torch`` module (unused for ``cpu``).
+
+    Returns:
+        *requested* unchanged.
+
+    Raises:
+        ValueError: When *requested* is not ``cpu`` or ``cuda``.
+        DeviceUnavailableError: When ``cuda`` is requested and CUDA is not usable.
+
+    """
+    if requested not in STRICT_DEVICE_REQUESTS:
+        msg = (
+            "Strict GigaAM device mode requires an explicit device 'cpu' or "
+            f"'cuda' (got {requested!r})"
+        )
+        raise ValueError(msg)
+    if requested == "cuda" and not _cuda_is_available(torch_mod):
+        msg = (
+            "GigaAM: CUDA is unavailable (strict device=cuda); the model is not "
+            "loaded on CPU in strict mode"
+        )
+        raise DeviceUnavailableError(msg)
+    return requested
+
+
 def select_gigaam_device(
     requested: str,
     torch_mod: object,
     *,
     min_free_bytes: int = GIGAAM_AUTO_CUDA_MIN_FREE_VRAM_BYTES,
+    strict: bool = False,
 ) -> str:
     """Resolve a GigaAM device request against the live CUDA state.
+
+    Args:
+        requested: Canonical request: ``auto``, ``cpu``, or ``cuda``.
+        torch_mod: Loaded ``torch`` module (unused for ``cpu``).
+        min_free_bytes: Free VRAM required for ``auto`` to choose CUDA
+            (ignored in strict mode).
+        strict: Apply the strict policy: only ``cpu``/``cuda`` are accepted
+            and an unusable CUDA runtime raises instead of selecting CPU.
+
+    Returns:
+        ``"cuda"`` or ``"cpu"``.
+
+    Raises:
+        ValueError: In strict mode, when *requested* is not ``cpu``/``cuda``.
+        DeviceUnavailableError: In strict mode, when ``cuda`` is requested and
+            CUDA is not usable.
+
+    """
+    if strict:
+        return _select_strict_device(requested, torch_mod)
+    return _select_lenient_device(requested, torch_mod, min_free_bytes=min_free_bytes)
+
+
+def _select_lenient_device(
+    requested: str, torch_mod: object, *, min_free_bytes: int
+) -> str:
+    """Resolve a request with the default policy (CPU fallback with a warning).
 
     Args:
         requested: Canonical request: ``auto``, ``cpu``, or ``cuda``.
