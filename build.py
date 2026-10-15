@@ -123,7 +123,11 @@ TOOLS: Dict[str, Dict[str, Any]] = {
     },
     "bandit": {
         "command": [sys.executable, "-m", "bandit"],
-        "args": ["-q", "-f", "json"],
+        # * -r scans the target folders (without it bandit skips directories and reports nothing) and
+        # * -c loads [tool.bandit] from pyproject.toml. --exit-zero keeps findings from failing the
+        # * process: run_tool fails the stage on HIGH findings, reports LOW/MEDIUM ones as warnings
+        # * and treats any non-zero exit or unreadable report as a tool failure.
+        "args": ["-q", "-r", "-c", "pyproject.toml", "--exit-zero", "-f", "json"],
         "can_fix": False,
         "critical": False,
         "desc": "Security linter",
@@ -464,21 +468,29 @@ class LocalCI:
                 res["diagnostics"] = data.get("generalDiagnostics", [])
             except json.JSONDecodeError:
                 res["parse_error"] = "pyright JSON parse error"
-        if name == "bandit" and out:
-            try:
-                b = json.loads(out)
-                sev = {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
-                for it in b.get("results", []) or []:
-                    k = str(it.get("issue_severity", "")).upper()
-                    if k in sev:
-                        sev[k] += 1
-                res["bandit_summary"] = sev
-                res["bandit_results"] = b.get("results", []) or []
-                if sev.get("HIGH", 0) > 0:
-                    res["exit_code"] = 1
+        if name == "bandit":
+            # * --exit-zero keeps findings from failing the process, so a non-zero exit or a missing report
+            # * means that bandit itself failed (crash, bad config) and nothing was checked.
+            if code != 0 or not out:
+                res["exit_code"] = code or 1
+                res["critical"] = True
+            if out:
+                try:
+                    b = json.loads(out)
+                    sev = {"LOW": 0, "MEDIUM": 0, "HIGH": 0}
+                    for it in b.get("results", []) or []:
+                        k = str(it.get("issue_severity", "")).upper()
+                        if k in sev:
+                            sev[k] += 1
+                    res["bandit_summary"] = sev
+                    res["bandit_results"] = b.get("results", []) or []
+                    if sev.get("HIGH", 0) > 0:
+                        res["exit_code"] = 1
+                        res["critical"] = True
+                except json.JSONDecodeError:
+                    res["parse_error"] = "bandit JSON parse error"
+                    res["exit_code"] = res["exit_code"] or 1
                     res["critical"] = True
-            except json.JSONDecodeError:
-                res["parse_error"] = "bandit JSON parse error"
         return res
 
     def run(self, only: Optional[str], fix: bool) -> Dict[str, Any]:
@@ -697,7 +709,11 @@ class LocalCI:
                 med = int(sev.get("MEDIUM", 0))
                 high = int(sev.get("HIGH", 0))
                 return f"bandit: HIGH={high}, MEDIUM={med}, LOW={low}"
-            return f"bandit: {self._count_nonempty_lines(text)} findings"
+            # * No severity summary: bandit failed before it produced a readable report.
+            if res.get("parse_error"):
+                return f"bandit: {res['parse_error']}"
+            last = next((ln.strip() for ln in reversed((err or out).splitlines()) if ln.strip()), "no output")
+            return f"bandit: tool failure (exit={res.get('exit_code')}): {last}"
         # * pip-audit: try parse JSON list length
         if name == "pip-audit":
             try:
@@ -836,8 +852,11 @@ class LocalCI:
                     sev = r.get("bandit_summary") or {}
                     if int(sev.get("HIGH", 0)) > 0:
                         msgs = self._limit(self._bandit_messages(r, ["HIGH"]))
-                        if msgs:
-                            detail_errors[name] = msgs
+                    else:
+                        # * Without HIGH findings the stage failed as a tool: show what bandit printed.
+                        msgs = self._first_nonempty_lines((r.get("stderr") or "").strip())
+                    if msgs:
+                        detail_errors[name] = msgs
                 elif name == "pytest":
                     text = ((r.get("stdout") or "") + "\n" + (r.get("stderr") or "")).strip()
                     lines = [ln for ln in text.splitlines() if "FAILED" in ln or "AssertionError" in ln]

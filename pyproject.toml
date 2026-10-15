@@ -165,7 +165,13 @@ ignore_missing_imports = true
 
 # ! Bandit configuration - security analysis
 [tool.bandit]
-exclude_dirs = ["tests", "env", ".git"]
+# * bandit tests every entry both as a glob and as a plain substring of the file path, so a bare name such as
+# * "env" would also drop utils/env.py; the "/*" globs below match whole folders only.
+exclude_dirs = [
+    "tests/*", "*/tests/*",
+    ".venv/*", "*/.venv/*", "venv/*", "*/venv/*", "env/*", "*/env/*",
+    ".git/*", "*/.git/*",
+]
 skips = ["B101"]  # Skip assert_used test
 
 [tool.bandit.assert_used]

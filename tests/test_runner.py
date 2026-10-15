@@ -1,9 +1,10 @@
-"""Regression contracts for test selection, worker limits, and headless Qt."""
+"""Regression contracts for CI stages, test selection, and headless Qt."""
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -16,6 +17,13 @@ from _pytest.mark.expression import Expression
 from build import TOOLS, LocalCI, parse_test_workers
 
 _ROOT = Path(__file__).resolve().parents[1]
+
+# * Bandit scans these samples as text; their unsafe calls are never executed.
+_BANDIT_HIGH_SOURCE = (
+    "import subprocess\n\n"
+    "def launch(command):\n"
+    "    subprocess.run(command, shell=True, check=False)\n"
+)
 
 # * The fake interpreter is the external process boundary of the real wrappers.
 # * Environment probes succeed without installing packages or importing ML stacks.
@@ -184,6 +192,218 @@ def test_pytest_flags_do_not_change_other_tool_commands(
         test_workers="2",
     )
     assert selected._build_command(tool, fix) == baseline._build_command(tool, fix)  # noqa: SLF001 - command builder contract
+
+
+@pytest.fixture
+def bandit_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Run the real Bandit against an isolated tree and the repository config."""
+    shutil.copy2(_ROOT / "pyproject.toml", tmp_path / "pyproject.toml")
+    (tmp_path / "core" / "nested").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    return tmp_path
+
+
+def _run_bandit_stage(targets: list[str]) -> LocalCI:
+    ci = LocalCI(verbose=False, json_output=False, targets=targets)
+    # * Exercise the stage and its real summary without the unrelated network probe in run().
+    ci.results["bandit"] = ci.run_tool("bandit", fix=False)
+    ci.results["summary"] = ci._summary()  # noqa: SLF001 - observable summary contract
+    ci._print_summary()  # noqa: SLF001 - observable console summary
+    return ci
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "relative_path",
+    ["core/nested/unsafe.py", "utils/env.py"],
+    ids=["recursive-scan", "env-module-is-not-an-env-directory"],
+)
+def test_bandit_high_findings_cannot_pass_unscanned(
+    bandit_workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+    relative_path: str,
+) -> None:
+    """Catch omitted recursion or overbroad exclusions hiding shell injection."""
+    source = bandit_workspace / relative_path
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text(_BANDIT_HIGH_SOURCE, encoding="utf-8")
+
+    ci = _run_bandit_stage([Path(relative_path).parts[0]])
+    result = ci.results["bandit"]
+    assert result["exit_code"] != 0
+    assert result["critical"] is True
+    assert any(
+        finding["test_id"] == "B602"
+        and finding["issue_severity"] == "HIGH"
+        and Path(finding["filename"]).resolve() == source.resolve()
+        for finding in result["bandit_results"]
+    )
+    assert ci.results["summary"]["critical_failures"] == 1
+    assert ci.results["summary"]["overall_status"] == "FAIL"
+    console = capsys.readouterr().out
+    assert source.name in console
+    assert "B602" in console
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("source", "expected_rules"),
+    [
+        pytest.param("import subprocess\n", {"B404": "LOW"}, id="low"),
+        pytest.param(
+            "from urllib.request import urlopen\n\n"
+            "def fetch(address):\n"
+            "    return urlopen(address)\n",
+            {"B310": "MEDIUM"},
+            id="medium",
+        ),
+        pytest.param(
+            "import subprocess\n"
+            "from urllib.request import urlopen\n\n"
+            "def fetch(address):\n"
+            "    return urlopen(address)\n",
+            {"B404": "LOW", "B310": "MEDIUM"},
+            id="low-and-medium",
+        ),
+    ],
+)
+def test_bandit_non_high_findings_pass_as_warnings(
+    bandit_workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+    source: str,
+    expected_rules: dict[str, str],
+) -> None:
+    """Catch Bandit's findings exit code turning warnings into stage failures."""
+    (bandit_workspace / "core" / "nested" / "review.py").write_text(
+        source, encoding="utf-8"
+    )
+
+    ci = _run_bandit_stage(["core"])
+    result = ci.results["bandit"]
+    assert result["exit_code"] == 0
+    assert result["critical"] is False
+    findings = {
+        finding["test_id"]: finding["issue_severity"]
+        for finding in result["bandit_results"]
+    }
+    for rule, severity in expected_rules.items():
+        assert findings[rule] == severity
+    assert result["bandit_summary"]["HIGH"] == 0
+    assert ci.results["summary"]["critical_failures"] == 0
+    assert ci.results["summary"]["issues"] == 0
+    assert ci.results["summary"]["overall_status"] == "PASS"
+    console = capsys.readouterr().out
+    # * Check section structure and severity facts, not diagnostic prose.
+    assert re.search(r"(?im)^warnings:\s*$", console)
+    assert not re.search(r"(?im)^errors:\s*$", console)
+    for rule, severity in expected_rules.items():
+        assert rule in console
+        assert f"{severity}=1" in console
+
+
+@pytest.mark.integration
+def test_bandit_applies_project_skips_and_directory_exclusions(
+    bandit_workspace: Path,
+) -> None:
+    """Catch an ignored pyproject or globs that miss root or nested folders."""
+    visible = bandit_workspace / "core" / "nested" / "checked.py"
+    visible.write_text("import subprocess\nassert True\n", encoding="utf-8")
+    for parent in (bandit_workspace, bandit_workspace / "core" / "nested"):
+        for directory in ("tests", ".venv", "venv", "env", ".git"):
+            excluded = parent / directory / "unsafe.py"
+            excluded.parent.mkdir(parents=True)
+            excluded.write_text(_BANDIT_HIGH_SOURCE, encoding="utf-8")
+
+    ci = _run_bandit_stage(["."])
+    result = ci.results["bandit"]
+    assert result["exit_code"] == 0
+    assert [finding["test_id"] for finding in result["bandit_results"]] == ["B404"]
+    report = json.loads(result["stdout"])
+    scanned = {
+        Path(filename).resolve()
+        for filename in report["metrics"]
+        if filename != "_totals"
+    }
+    assert scanned == {visible.resolve()}
+
+
+@pytest.mark.integration
+def test_bandit_clean_tree_passes_after_actually_scanning(
+    bandit_workspace: Path,
+) -> None:
+    """Catch a clean report being mistaken for a tool failure or an empty scan."""
+    (bandit_workspace / "core" / "nested" / "clean.py").write_text(
+        "def add(left, right):\n    return left + right\n", encoding="utf-8"
+    )
+
+    ci = _run_bandit_stage(["core"])
+    result = ci.results["bandit"]
+    assert result["exit_code"] == 0
+    assert result["critical"] is False
+    assert result["bandit_results"] == []
+    assert json.loads(result["stdout"])["metrics"]["_totals"]["loc"] > 0
+    assert ci.results["summary"]["overall_status"] == "PASS"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("config", [None, "[tool.bandit\n"], ids=["missing", "invalid"])
+def test_bandit_config_errors_are_visible_critical_failures(
+    bandit_workspace: Path,
+    capsys: pytest.CaptureFixture[str],
+    config: str | None,
+) -> None:
+    """Catch a failed security tool being reduced to a passing noncritical issue."""
+    config_path = bandit_workspace / "pyproject.toml"
+    if config is None:
+        config_path.unlink()
+    else:
+        config_path.write_text(config, encoding="utf-8")
+    (bandit_workspace / "core" / "nested" / "clean.py").write_text(
+        "value = 1\n", encoding="utf-8"
+    )
+
+    ci = _run_bandit_stage(["core"])
+    result = ci.results["bandit"]
+    assert result["exit_code"] != 0
+    assert result["critical"] is True
+    assert result["stderr"].strip()
+    assert ci.results["summary"]["critical_failures"] == 1
+    assert ci.results["summary"]["overall_status"] == "FAIL"
+    console = capsys.readouterr().out
+    assert re.search(r"(?im)^errors:\s*$", console)
+    assert config_path.name in console
+    assert f"exit={result['exit_code']}" in console
+
+
+@pytest.mark.parametrize(
+    "report", ["", "bandit startup banner\n{}"], ids=["empty", "unparseable"]
+)
+def test_bandit_unreadable_success_reports_fail_closed(
+    bandit_workspace: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    report: str,
+) -> None:
+    """Catch exit-zero masking a missing or corrupted security report."""
+
+    # * Only the external process result is substituted; the runner remains real.
+    def complete_process(
+        command: list[str], **_kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0, stdout=report, stderr="")
+
+    monkeypatch.setattr(subprocess, "run", complete_process)
+    ci = _run_bandit_stage(["core"])
+    result = ci.results["bandit"]
+    assert result["exit_code"] != 0
+    assert result["critical"] is True
+    if report:
+        assert result.get("parse_error")
+    assert ci.results["summary"]["critical_failures"] == 1
+    assert ci.results["summary"]["overall_status"] == "FAIL"
+    console = capsys.readouterr().out
+    assert re.search(r"(?im)^errors:\s*$", console)
+    assert "bandit" in console
 
 
 @pytest.mark.integration
