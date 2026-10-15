@@ -15,7 +15,10 @@ the next free slot, lane, spawn or eviction; running jobs are never preempted
 and busy workers are never stopped.
 
 Terminology (spec 6.5): a CPU *slot* is one concurrently running CPU job; a GPU
-*worker* is one GPU process that batches up to its *lanes*.
+*worker* is one GPU process that batches up to its *lanes*. CPU slots are shared
+by the speech-to-text and the speaker diarization workers; the threads a slot
+holds depend on its key (:func:`threads_for`), and a diarization worker has one
+slot (:func:`worker_capacity`), so diarization scales by more processes.
 """
 
 from __future__ import annotations
@@ -26,13 +29,17 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Protocol, Self, TypeAlias
 
-from core.stt_pool.config import DEFAULT_PRIORITY_AGING_S
+from core.stt_pool.config import (
+    DEFAULT_DIARIZATION_THREADS_PER_SLOT,
+    DEFAULT_PRIORITY_AGING_S,
+)
 from core.stt_pool.keys import (
     DEFAULT_PRIORITY,
     PRIORITY_RANK,
     allowed_backends,
     make_key,
     provider_family,
+    worker_kind,
 )
 
 if TYPE_CHECKING:
@@ -76,8 +83,9 @@ class Limits:
     The per-family mappings are stored as read-only views over private copies.
 
     Attributes:
-        cpu_slots: Concurrent CPU jobs across all CPU workers.
-        threads_per_slot: CPU threads of one running CPU job.
+        cpu_slots: Concurrent CPU jobs across all CPU workers (speech-to-text
+            and speaker diarization).
+        threads_per_slot: CPU threads of one running speech-to-text CPU job.
         cpu_max_slots_per_worker: Largest slot capacity of one CPU worker.
         gpu_workers: Concurrent GPU worker processes.
         batch_lanes: Lanes (batch size) of one GPU worker per provider family.
@@ -101,6 +109,8 @@ class Limits:
             arithmetic of jobs without a known duration.
         priority_aging_s: Waiting time that lifts a pending job by one
             priority class (spec 14, :func:`effective_rank`).
+        diarization_threads_per_slot: CPU threads of one running speaker
+            diarization job.
 
     """
 
@@ -123,6 +133,7 @@ class Limits:
     scale_out_backlog_s: float
     unknown_duration_s: float = DEFAULT_UNKNOWN_DURATION_S
     priority_aging_s: float = DEFAULT_PRIORITY_AGING_S
+    diarization_threads_per_slot: int = DEFAULT_DIARIZATION_THREADS_PER_SLOT
 
     def __post_init__(self) -> None:
         """Replace the per-family mappings with read-only views of copies."""
@@ -168,6 +179,7 @@ class Limits:
             gpu_cpu_contention=config.scheduling.gpu_cpu_contention,
             scale_out_backlog_s=config.gpu.scale_out_backlog_s,
             priority_aging_s=config.scheduling.priority_aging_s,
+            diarization_threads_per_slot=config.diarization.threads_per_slot,
         )
 
 
@@ -340,6 +352,7 @@ class EstimateSource(Protocol):
 
     def estimate(self, key: WorkerKey) -> KeyEstimate:
         """Return the current estimate of *key*."""
+        ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -478,6 +491,28 @@ class Plan:
 # * Public helpers (spec 7.2 and 7.4).
 
 
+def threads_for(key: WorkerKey, limits: Limits) -> int:
+    """Return the CPU threads one running job of *key* holds on a CPU worker.
+
+    Every site that accounts CPU job threads (thread budget, CPU busy
+    fraction, spawn needs, releases, protection) uses this per-key value. GPU
+    workers reserve host threads per worker instead
+    (:attr:`Reservation.host_threads`).
+
+    Args:
+        key: Worker configuration.
+        limits: Pool limits.
+
+    Returns:
+        ``diarization_threads_per_slot`` for a speaker diarization key,
+        otherwise ``threads_per_slot``.
+
+    """
+    if worker_kind(key.provider) == "diarize":
+        return limits.diarization_threads_per_slot
+    return limits.threads_per_slot
+
+
 def worker_capacity(key: WorkerKey, limits: Limits) -> int:
     """Return the largest slot or lane capacity of a new worker of *key*.
 
@@ -490,11 +525,16 @@ def worker_capacity(key: WorkerKey, limits: Limits) -> int:
         limits: Pool limits.
 
     Returns:
-        CPU: ``min(cpu_max_slots_per_worker, cpu_slots, thread_budget //
+        Speaker diarization: 1 (sherpa-onnx holds the GIL for a whole job, so
+        slot threads of one process never diarize in parallel; the pool runs
+        more diarization worker processes instead). Other CPU keys:
+        ``min(cpu_max_slots_per_worker, cpu_slots, thread_budget //
         threads_per_slot)``; GPU: the batch lanes of the provider family.
         Always at least 1.
 
     """
+    if worker_kind(key.provider) == "diarize":
+        return 1
     if key.backend == "gpu":
         lanes = limits.batch_lanes.get(provider_family(key.provider), 1)
         return max(1, lanes)
@@ -1541,9 +1581,10 @@ class _Planner:
         else:
             if limits.cpu_slots < 1:
                 reasons.append(f"{label} needs a CPU slot but the CPU slot limit is 0")
-            if limits.threads_per_slot > limits.thread_budget:
+            threads = threads_for(candidate.key, limits)
+            if threads > limits.thread_budget:
                 reasons.append(
-                    f"{label} needs {limits.threads_per_slot} threads per slot but the "
+                    f"{label} needs {threads} threads per slot but the "
                     f"thread budget is {limits.thread_budget}"
                 )
         return reasons
@@ -1614,7 +1655,7 @@ class _Planner:
         sims = self._serving(candidate.key)
         free = [sim for sim in sims if sim.has_free_capacity]
         if free:
-            if self._cpu_slot_free():
+            if self._cpu_slot_free(candidate.key):
                 target = min(free, key=lambda sim: (sim.load, sim.worker_id))
                 return self._assign_route(job, candidate, target)
             return self._cpu_shortage_route(job, candidate)
@@ -1643,7 +1684,7 @@ class _Planner:
                 reason="no free CPU slot or threads",
                 protectable=math.isfinite(eta),
             )
-        need = _Need(threads=limits.threads_per_slot)
+        need = _Need(threads=threads_for(candidate.key, limits))
         pending = self._pending_freed()
         if not self._resource_blockers(need, pending):
             return _Route(
@@ -1870,7 +1911,9 @@ class _Planner:
                 threads=res.host_threads,
                 gpu_worker=True,
             )
-        return _Need(commit=res.commit_bytes, threads=self._limits.threads_per_slot)
+        return _Need(
+            commit=res.commit_bytes, threads=threads_for(candidate.key, self._limits)
+        )
 
     def _fit_capacity(self, candidate: _Candidate, freed: _Freed) -> int:
         """Return the largest capacity whose spawn fits now, or 0 if none does.
@@ -2069,12 +2112,12 @@ class _Planner:
         freed = self._pending_freed()
         if not self._resource_blockers(need, freed):
             return 0.0
-        job_threads = _Freed(host_threads=self._limits.threads_per_slot)
         events: list[tuple[float, str, _Freed]] = []
         for sim in self._sims:
             if sim.freeing or sim.planned:
                 continue
             if not sim.is_gpu:
+                job_threads = _Freed(host_threads=threads_for(sim.key, self._limits))
                 events.extend(
                     (max(0.0, end - self._now), sim.worker_id, job_threads)
                     for end in sim.ends
@@ -2111,7 +2154,7 @@ class _Planner:
             threads = candidate.min_reservation.host_threads if needs_spawn else 0
         else:
             slots = 1
-            threads = self._limits.threads_per_slot
+            threads = threads_for(candidate.key, self._limits)
         self._protected = _Protected(job.job_id, candidate.key, slots, threads)
         self._notes.append(
             f"{job.job_id}: protected after waiting "
@@ -2139,8 +2182,7 @@ class _Planner:
                 if sim.state == "retiring" and not sim.stopped and sim.key != key
             ),
         )
-        cpu_threads = self._cpu_running() * self._limits.threads_per_slot
-        base = base.add(_Freed(host_threads=cpu_threads))
+        base = base.add(_Freed(host_threads=self._cpu_job_threads()))
         if not self._resource_blockers(need, base):
             self._notes.append(
                 f"{job.job_id}: waits for running jobs and stopping or retiring "
@@ -2320,10 +2362,22 @@ class _Planner:
         """Return the CPU slots in use (running CPU jobs on workers in any state)."""
         return sum(sim.load for sim in self._sims if not sim.is_gpu)
 
+    def _cpu_job_threads(self) -> int:
+        """Return the threads of running CPU jobs (workers in any state).
+
+        Each running job holds the threads of its worker's key
+        (:func:`threads_for`).
+        """
+        return sum(
+            sim.load * threads_for(sim.key, self._limits)
+            for sim in self._sims
+            if not sim.is_gpu
+        )
+
     def _threads_used(self) -> int:
         """Return CPU job threads plus host threads of every GPU worker."""
         host = sum(sim.reservation.host_threads for sim in self._sims)
-        return self._cpu_running() * self._limits.threads_per_slot + host
+        return self._cpu_job_threads() + host
 
     def _gpu_workers(self) -> int:
         """Return the GPU workers whose exit is not confirmed."""
@@ -2339,17 +2393,18 @@ class _Planner:
 
     def _cpu_busy(self) -> float:
         """Return CPU job threads in use divided by the thread budget, in [0, 1]."""
-        used = self._cpu_running() * self._limits.threads_per_slot
+        used = self._cpu_job_threads()
         return min(1.0, used / max(1, self._limits.thread_budget))
 
-    def _cpu_slot_free(self) -> bool:
-        """Return whether a CPU job may take a slot now.
+    def _cpu_slot_free(self, key: WorkerKey) -> bool:
+        """Return whether a CPU job of *key* may take a slot now.
 
-        A later job must leave the protected job's slot and threads free.
+        The job needs one CPU slot and the threads of its key; a later job
+        must leave the protected job's slot and threads free.
         """
         protected = self._protected
         slots = 1 + (protected.slots if protected is not None else 0)
-        threads = self._limits.threads_per_slot + (
+        threads = threads_for(key, self._limits) + (
             protected.threads if protected is not None else 0
         )
         return (

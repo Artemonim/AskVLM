@@ -21,6 +21,9 @@
   "threads": {
     "budget": 28
   },
+  "diarization": {
+    "threads_per_slot": 4
+  },
   "memory": {
     "commit_budget_gib": 24,
     "free_commit_guard_gib": 8,

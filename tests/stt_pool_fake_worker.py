@@ -40,6 +40,8 @@ class MLImportGuard(importlib.abc.MetaPathFinder):
             "faster_whisper",
             "ctranslate2",
             "numpy",
+            "sherpa_onnx",
+            "onnxruntime",
         }:
             msg = f"thin pool imports forbidden dependency {fullname}"
             raise RuntimeError(msg)
@@ -277,6 +279,13 @@ def main() -> int:
         for module in modules:
             importlib.import_module(module.name)
         importlib.import_module("core.whisper_batch")
+        for name in (
+            "core.stt_options",
+            "core.stt_output",
+            "core.diarization_models",
+            "core.sherpa_diarization",
+        ):
+            importlib.import_module(name)
         sys.stdout.write(json.dumps({"imported": len(modules)}) + "\n")
         sys.stdout.flush()
         return 0

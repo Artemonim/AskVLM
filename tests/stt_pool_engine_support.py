@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import core
+from core.sherpa_diarization import DiarizationCancelledError
 from core.stt_pool import engines
 from core.stt_pool.engine_api import WorkerSpec, WorkItem
 from core.stt_pool.keys import make_key
@@ -23,6 +24,7 @@ if TYPE_CHECKING:
     import pytest
     from numpy.typing import NDArray
 
+    from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
     from core.stt_pool.engine_api import EngineResult, PoolEngine
     from core.stt_pool.keys import Backend, Priority
 
@@ -44,6 +46,26 @@ class ProcessCall:
 
 
 @dataclass
+class OptionsCall:
+    """Per-file options received at the substituted recognizer boundary."""
+
+    path: Path
+    window: MediaWindow | None
+    decode: WhisperDecodeOptions | None
+
+
+@dataclass
+class DiarizeCall:
+    """Per-job inputs received at the substituted sherpa boundary."""
+
+    path: Path
+    options: DiarizeOptions
+    window: MediaWindow
+    work_dir: Path
+    thread_name: str
+
+
+@dataclass
 class BatchCall:
     """One external forward call and the clips or windows it consumes."""
 
@@ -56,9 +78,12 @@ class BatchCall:
 class FakeDocument:
     """Document boundary carrying text from the fake recognizer."""
 
-    def __init__(self, text: str) -> None:
+    def __init__(
+        self, text: str, raw_segments: list[dict[str, object]] | None = None
+    ) -> None:
         self._text = text
         self.segments: list[object] = []
+        self.transcript_segments = raw_segments
 
     def get_full_text(self) -> str:
         """Return the recognizer text before the engine normalizes it."""
@@ -146,11 +171,73 @@ class FakePipeline:
         )
         if isinstance(outcome, Exception):
             raise outcome
-        return FakeDocument(outcome)
+        return FakeDocument(outcome, runtime.pipeline_segments.get(path.name))
 
     def close(self, *, aggressive: bool) -> None:  # noqa: ARG002 - production boundary keyword
         """Count external model unloading without changing engine bookkeeping."""
         self._runtime.unload_count += 1
+
+
+class OptionsPipeline(FakePipeline):
+    """Recognizer accepting the optional window and decode contract explicitly."""
+
+    def process(
+        self,
+        path: Path,
+        work_dir: Path,
+        *,
+        should_cancel: Callable[[], bool],
+        language: str | None,
+        media_window: MediaWindow | None = None,
+        decode_options: WhisperDecodeOptions | None = None,
+    ) -> FakeDocument:
+        """Expose optional arguments while keeping plain FakePipeline strict."""
+        self._runtime.options_calls.put(OptionsCall(path, media_window, decode_options))
+        return super().process(
+            path, work_dir, should_cancel=should_cancel, language=language
+        )
+
+
+class FakeDiarizer:
+    """Controllable native diarizer substitute with real engine lifecycle around it."""
+
+    def __init__(self, runtime: EngineRuntime, *, threads: int) -> None:
+        self._runtime = runtime
+        self.threads = threads
+
+    def load(self) -> None:
+        """Expose a model provisioning failure without downloading anything."""
+        self._runtime.load_count += 1
+        if self._runtime.load_error is not None:
+            raise self._runtime.load_error
+
+    def diarize_media(
+        self,
+        path: Path,
+        options: DiarizeOptions,
+        *,
+        window: MediaWindow,
+        work_dir: Path,
+        should_cancel: Callable[[], bool],
+    ) -> list[dict[str, object]]:
+        """Block only at native inference, then return turns or an external error."""
+        runtime = self._runtime
+        runtime.diarize_calls.put(
+            DiarizeCall(
+                path, options, window, work_dir, threading.current_thread().name
+            )
+        )
+        gate = runtime.process_gates.get(path.name)
+        if gate is not None and not gate.wait(GATE_TIMEOUT_S):
+            msg = "test did not release fake diarization"
+            raise TimeoutError(msg)
+        if should_cancel():
+            msg = "fake native diarization cancelled"
+            raise DiarizationCancelledError(msg)
+        result = runtime.diarize_results.get(path.name, [])
+        if isinstance(result, Exception):
+            raise result
+        return result
 
 
 class EngineRuntime:
@@ -163,23 +250,37 @@ class EngineRuntime:
         self.loaded_device: str | None = None
         self.load_error: Exception | None = None
         self.process_calls: queue.Queue[ProcessCall] = queue.Queue()
+        self.options_calls: queue.Queue[OptionsCall] = queue.Queue()
+        self.diarize_calls: queue.Queue[DiarizeCall] = queue.Queue()
         self.batch_calls: queue.Queue[BatchCall] = queue.Queue()
         self.inferences: list[tuple[str, int]] = []
         self.process_gates: dict[str, threading.Event] = {}
         self.batch_gate: threading.Event | None = None
         self.decode_gates: dict[str, threading.Event] = {}
         self.pipeline_texts: dict[str, str | Exception] = {}
+        self.pipeline_segments: dict[str, list[dict[str, object]] | None] = {}
+        self.pipeline_type: type[FakePipeline] = FakePipeline
+        self.diarizers: list[FakeDiarizer] = []
+        self.diarize_results: dict[str, list[dict[str, object]] | Exception] = {}
         self.gigaam_texts: dict[int, str] = {}
         self.batch_errors: dict[int, Exception] = {}
         self.audio: dict[str, NDArray[np.float32] | Exception] = {}
+        self.decode_calls: list[str] = []
+        self.vad_calls: list[int] = []
         self.vad_spans: dict[int, list[dict[str, int]] | Exception] = {}
         self.handles: list[EngineHandle] = []
 
     def new_pipeline(self, **options: object) -> FakePipeline:
         """Construct the stand-in at the production pipeline-constructor boundary."""
-        pipeline = FakePipeline(self, options)
+        pipeline = self.pipeline_type(self, options)
         self.pipelines.append(pipeline)
         return pipeline
+
+    def new_diarizer(self, *, threads: int) -> FakeDiarizer:
+        """Construct the stand-in at the sherpa model boundary."""
+        diarizer = FakeDiarizer(self, threads=threads)
+        self.diarizers.append(diarizer)
+        return diarizer
 
     def record_batch(
         self, markers: list[int], lengths: list[int], language: str | None = None
@@ -203,6 +304,7 @@ class EngineRuntime:
             msg = "fake decoder only accepts 16 kHz audio"
             raise ValueError(msg)
         name = Path(path).name
+        self.decode_calls.append(name)
         gate = self.decode_gates.get(name)
         if gate is not None and not gate.wait(GATE_TIMEOUT_S):
             msg = "test did not release fake audio decoding"
@@ -217,6 +319,7 @@ class EngineRuntime:
     ) -> list[dict[str, int]]:
         """Return VAD boundaries keyed by the constant identity of an audio clip."""
         marker = round(float(audio[0]) * 32768)
+        self.vad_calls.append(marker)
         spans = self.vad_spans.get(marker, [{"start": 0, "end": len(audio)}])
         if isinstance(spans, Exception):
             raise spans
@@ -228,6 +331,7 @@ class EngineRuntime:
         pipeline_module.LocalPipeline = self.new_pipeline
         monkeypatch.setitem(sys.modules, "core.pipelines", pipeline_module)
         monkeypatch.setattr(core, "pipelines", pipeline_module, raising=False)
+        monkeypatch.setattr("core.sherpa_diarization.SherpaDiarizer", self.new_diarizer)
         whisper_module = types.ModuleType("faster_whisper")
         audio_module = types.ModuleType("faster_whisper.audio")
         vad_module = types.ModuleType("faster_whisper.vad")

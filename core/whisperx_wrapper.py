@@ -427,12 +427,31 @@ class WhisperXWrapper:
             raise RuntimeError(msg)
         segments_out: list[dict[str, Any]] = []
         text_parts: list[str] = []
+        # * Marks an attribute that a segment object does not carry at all.
+        absent = object()
         segments, _info = model.transcribe(str(audio_path), language=language, **kwargs)
         for seg in segments:
             start = float(seg.start)
             end = float(seg.end)
             txt = str(seg.text or "").strip()
-            seg_dict = {"start": start, "end": end, "text": txt}
+            seg_dict: dict[str, Any] = {"start": start, "end": end, "text": txt}
+            # * faster-whisper segments also carry scores and raw word timings;
+            # * they are copied when present and never change ``text``.
+            for score in ("no_speech_prob", "avg_logprob"):
+                score_value: Any = getattr(seg, score, absent)
+                if score_value is not absent and score_value is not None:
+                    seg_dict[score] = float(score_value)
+            words: Any = getattr(seg, "words", absent)
+            if words is not absent:
+                seg_dict["words"] = [
+                    {
+                        "word": str(word.word),
+                        "start": float(word.start),
+                        "end": float(word.end),
+                        "probability": float(word.probability),
+                    }
+                    for word in words or []
+                ]
             segments_out.append(seg_dict)
             if txt:
                 text_parts.append(txt)
@@ -457,6 +476,9 @@ class WhisperXWrapper:
         """Transcribe audio and return faster-whisper style result dict.
 
         Returns a dict with keys: text, segments (list of {start,end,text}).
+        Segments of a faster-whisper model also carry ``no_speech_prob``,
+        ``avg_logprob`` (floats) and ``words`` (raw
+        ``{word,start,end,probability}`` dicts, ``[]`` without word timestamps).
         """
         # * Filter out non-faster-whisper kwargs (subtitle layout hints etc.)
         _kwargs_all = dict(kwargs)

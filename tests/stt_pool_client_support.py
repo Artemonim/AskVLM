@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import TYPE_CHECKING
 
 from core.stt_pool.client import ClientRequest, run_client
 from core.stt_pool.queue import JobRecord, read_job_payload
-from tests.stt_pool_supervisor_support import SupervisorHarness
+from tests.stt_pool_supervisor_support import WAIT_TIMEOUT_S, SupervisorHarness
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -71,10 +72,14 @@ class ClientHarness:
 
     def run(self, request: ClientRequest, **seams: object) -> ClientOutcome:
         """Drive the client with policy time and bounded polling."""
+        expires_at = time.monotonic() + WAIT_TIMEOUT_S
 
         def pause(delay: float) -> None:
             if self._failures:
                 raise self._failures[0]
+            if time.monotonic() >= expires_at:
+                msg = "client scenario exceeded its failure deadline"
+                raise TimeoutError(msg)
             threading.Event().wait(min(delay, 0.01))
 
         options = {

@@ -13,13 +13,34 @@ import threading
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import FrameType
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Annotated, Any, Callable, Literal, NoReturn, Optional
 
 import typer
 
-from core.stt_pool.client import ClientRequest, run_client
+from core.stt_options import (
+    DIARIZE_DEFAULT_MIN_DURATION_OFF,
+    DIARIZE_DEFAULT_MIN_DURATION_ON,
+    DIARIZE_DEFAULT_THRESHOLD,
+    MAX_BEAM_SIZE,
+    MIN_BEAM_SIZE,
+    DiarizeOptions,
+    MediaWindow,
+    WhisperDecodeOptions,
+)
+from core.stt_output import (
+    MIN_VOICES_FOR_SPEAKER_PREFIXES,
+    assign_speakers,
+    diarization_document,
+    document_json,
+    segments_json,
+    speaker_text,
+    transcript_document,
+    voice_count,
+)
+from core.stt_pool.client import MODE_DIARIZE, ClientRequest, run_client
 from core.stt_pool.config import PoolConfigError, apply_overrides, load_pool_config
 from core.stt_pool.keys import (
+    DIARIZE_PROVIDER,
     normalize_device_request,
     normalize_language,
     normalize_priority,
@@ -33,12 +54,30 @@ from core.stt_providers import (
     provider_may_use_cuda,
     resolve_gigaam_requested_device,
 )
+from editing.text_model import TextSegment, merge_consecutive_segments_by_speaker
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Mapping, Sequence
 
-    from core.stt_pool.client import InputOutcome
+    from core.stt_pool.client import ClientOutcome, InputOutcome, OutcomeFn
     from core.stt_pool.keys import DeviceRequest
+    from editing.text_model import Document
+
+# * Output formats of ``external-transcribe``: the plain transcript (the default)
+# * or one JSON document per input.
+OUTPUT_FORMAT_TEXT = "text"
+OUTPUT_FORMAT_JSON = "json"
+_OUTPUT_FORMATS = (OUTPUT_FORMAT_TEXT, OUTPUT_FORMAT_JSON)
+
+# * Shortest media window: ffmpeg receives window times with millisecond precision.
+_MIN_WINDOW_DURATION_S = 0.001
+
+# * CPU threads of each network of a one-shot (``--no-daemon``) diarization.
+_ONE_SHOT_DIARIZE_THREADS = 4
+
+# * Model selection of diarize-mode requests; the diarization worker ignores it.
+_EXTERNAL_DEFAULT_WHISPER_MODEL = "small"
+_EXTERNAL_DEFAULT_COMPUTE_TYPE = "auto"
 
 app = typer.Typer(
     help=(
@@ -105,6 +144,8 @@ class _ExternalChildAttemptResult:
     return_code: int
     stdout: str
     stderr: str
+    # * Structured payload of a successful child (segments, turns, speakers).
+    success_data: dict[str, object] | None = None
 
 
 def _normalize_transcript_text(text: Optional[str]) -> str:
@@ -129,7 +170,21 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
-def _read_child_success_result(path: Path) -> Optional[str]:
+def _read_child_success_result(
+    path: Path,
+) -> tuple[str, dict[str, object] | None] | None:
+    """Read the result file of a successful one-shot child.
+
+    Args:
+        path: The child's result file.
+
+    Returns:
+        ``(text, data)`` of an ``ok`` result, where ``data`` is the structured
+        payload (a JSON object) or ``None`` when the result has none; ``None``
+        when the file is missing, unreadable, not ``ok``, or malformed (a
+        non-string ``text`` or a ``data`` that is not an object).
+
+    """
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -141,7 +196,10 @@ def _read_child_success_result(path: Path) -> Optional[str]:
     text = data.get("text")
     if not isinstance(text, str):
         return None
-    return _normalize_transcript_text(text)
+    payload = data.get("data")
+    if "data" in data and not isinstance(payload, dict):
+        return None
+    return _normalize_transcript_text(text), payload
 
 
 def _resolve_external_device(*, stt_provider: str, device: str) -> str:
@@ -170,6 +228,173 @@ def _resolve_external_device(*, stt_provider: str, device: str) -> str:
         raise typer.BadParameter(str(exc)) from exc
 
 
+@contextlib.contextmanager
+def _local_work_dir(work_dir: Path | None) -> Iterator[Path]:
+    """Yield the work directory of a one-shot run.
+
+    Args:
+        work_dir: ``--work-dir`` value; ``None`` uses a temporary directory
+            (prefix ``askvlm-cli-``) that is deleted afterwards.
+
+    Yields:
+        The existing directory for intermediate files.
+
+    """
+    if work_dir is None:
+        with tempfile.TemporaryDirectory(prefix="askvlm-cli-") as temp_dir:
+            yield Path(temp_dir)
+        return
+    work_dir.mkdir(parents=True, exist_ok=True)
+    yield work_dir
+
+
+def _diarize_one_shot(
+    input_path: Path,
+    options: DiarizeOptions,
+    *,
+    window: MediaWindow,
+    work_dir: Path,
+) -> list[dict[str, object]]:
+    """Diarize one input in this process on the CPU (sherpa-onnx).
+
+    Args:
+        input_path: Media file.
+        options: Diarization settings.
+        window: Media window; turn times stay media-relative.
+        work_dir: Folder for the intermediate WAV.
+
+    Returns:
+        ``{start, end, speaker}`` turns in start order (possibly empty).
+
+    Raises:
+        typer.Exit: Code ``1`` after one stderr line when the diarization
+            fails for any reason (missing backend with its install hint, model
+            download, undecodable media, an empty window).
+
+    """
+    try:
+        # * Imported on use: only a one-shot diarization needs the backend.
+        from core.sherpa_diarization import SherpaDiarizer  # noqa: PLC0415
+
+        return SherpaDiarizer(threads=_ONE_SHOT_DIARIZE_THREADS).diarize_media(
+            input_path, options, window=window, work_dir=work_dir
+        )
+    except Exception as exc:
+        # * Every failure becomes the one-line exit-1 report of the one-shot
+        # * contract (the pool reports worker failures the same way).
+        typer.secho(
+            f"speaker diarization failed: {str(exc).strip() or type(exc).__name__}",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+
+def _speaker_lines(
+    segments: Sequence[TextSegment],
+    speakers: Sequence[str | None],
+    *,
+    merge_runs: bool,
+) -> str:
+    """Label the transcript document's segments with their speakers.
+
+    Args:
+        segments: The text segments of the transcript document, one per
+            structured segment.
+        speakers: The speaker of each segment (``None`` when unassigned).
+        merge_runs: Merge consecutive segments of the same speaker into one
+            line first (``--dialog-blocks``).
+
+    Returns:
+        One ``"{speaker}: {text}"`` line (``"{text}"`` when unassigned) per
+        segment or merged run with non-empty text.
+
+    Raises:
+        RuntimeError: When the document and the structured transcript differ
+            in segment count, so speakers cannot be matched to the text.
+
+    """
+    if len(segments) != len(speakers):
+        msg = (
+            f"the transcript document has {len(segments)} segments but the "
+            f"structured transcript has {len(speakers)}; cannot label speakers"
+        )
+        raise RuntimeError(msg)
+    # * A speaker id of "" marks an unassigned segment (labels are never empty).
+    labelled = [
+        TextSegment(
+            speaker_id=speaker or "",
+            start_time=segment.start_time,
+            end_time=segment.end_time,
+            text=segment.text,
+        )
+        for segment, speaker in zip(segments, speakers, strict=True)
+    ]
+    if merge_runs:
+        labelled = merge_consecutive_segments_by_speaker(labelled)
+    return speaker_text(
+        [segment.text.strip() for segment in labelled],
+        [segment.speaker_id or None for segment in labelled],
+    )
+
+
+def _local_transcript(
+    document: Document,
+    *,
+    output_format: str,
+    window: MediaWindow,
+    turns: list[dict[str, object]] | None,
+    dialog_blocks: bool,
+) -> tuple[str, dict[str, object] | None]:
+    """Return the text and the structured payload of a one-shot transcription.
+
+    Args:
+        document: The document returned by ``LocalPipeline.process``.
+        output_format: ``text`` or ``json``.
+        window: Media window of the run (offset of the segment times).
+        turns: Diarization turns, or ``None`` without ``--diarization``.
+        dialog_blocks: ``--dialog-blocks`` was given.
+
+    Returns:
+        ``(text, data)``. The text is the normalized ``get_full_text()``; with
+        diarization, the plain-text format and at least two voices among the
+        segments it holds one speaker-labelled line per segment (per merged run
+        with ``--dialog-blocks``). The JSON format never labels the text: its
+        document carries the speakers per segment. ``data`` is ``None`` for a
+        plain text run, else ``{"segments"}`` plus ``"turns"`` and
+        ``"speakers"`` with diarization.
+
+    Raises:
+        RuntimeError: When the pipeline returned no structured segments, or
+            (plain text with diarization) they do not match the document's
+            segments.
+
+    """
+    text = _normalize_transcript_text(document.get_full_text())
+    if output_format != OUTPUT_FORMAT_JSON and turns is None:
+        return text, None
+    raw_segments = document.transcript_segments
+    if raw_segments is None:
+        msg = "the transcription returned no structured segments"
+        raise RuntimeError(msg)
+    segments = segments_json(raw_segments, window.start_s)
+    if turns is None:
+        return text, {"segments": segments}
+    speakers = assign_speakers(segments, turns)
+    data: dict[str, object] = {
+        "segments": segments,
+        "turns": turns,
+        "speakers": speakers,
+    }
+    if output_format == OUTPUT_FORMAT_JSON:
+        return text, data
+    # * One voice (or none) keeps the plain transcript, byte for byte.
+    if voice_count(speakers) >= MIN_VOICES_FOR_SPEAKER_PREFIXES:
+        labelled = _speaker_lines(document.segments, speakers, merge_runs=dialog_blocks)
+        if labelled.strip():
+            text = labelled
+    return text, data
+
+
 def _run_external_transcribe_once(  # noqa: PLR0913
     *,
     input_path: Path,
@@ -181,31 +406,129 @@ def _run_external_transcribe_once(  # noqa: PLR0913
     dialog_blocks: bool,
     work_dir: Optional[Path],
     stt_provider: str = STT_PROVIDER_WHISPER,
-    before_close: Optional[Callable[[str], None]] = None,
+    before_close: Callable[[str, dict[str, object] | None], None] | None = None,
+    output_format: str = OUTPUT_FORMAT_TEXT,
+    media_window: MediaWindow | None = None,
+    decode_options: WhisperDecodeOptions | None = None,
 ) -> str:
-    pipeline = _create_local_pipeline(
-        whisper_model=whisper_model,
-        engine="whisperx",
-        diarization=diarization,
-        dialog_blocks=dialog_blocks,
-        language=language,
-        device=device,
-        compute_type=compute_type,
-        stt_provider=stt_provider,
-    )
-    try:
-        if work_dir is None:
-            with tempfile.TemporaryDirectory(prefix="askvlm-cli-") as temp_dir:
-                text = pipeline.process(input_path, Path(temp_dir)).get_full_text()
-        else:
-            work_dir.mkdir(parents=True, exist_ok=True)
-            text = pipeline.process(input_path, work_dir).get_full_text()
-        normalized_text = _normalize_transcript_text(text)
-        if before_close is not None:
-            before_close(normalized_text)
-        return normalized_text
-    finally:
-        pipeline.close(aggressive=False)
+    """Transcribe one input in this process (the ``--no-daemon`` flow).
+
+    With ``diarization`` the sherpa-onnx diarization runs first and finishes
+    before the STT pipeline is created, so only one model is loaded at a time;
+    the local pipeline itself never diarizes. ``before_close`` receives the
+    text and the structured payload (see :func:`_local_transcript`) before the
+    pipeline closes.
+
+    Returns:
+        The final transcript text.
+
+    """
+    window = media_window if media_window is not None else MediaWindow()
+    process_kwargs: dict[str, object] = {}
+    if not window.is_default:
+        process_kwargs["media_window"] = window
+    if decode_options is not None and not decode_options.is_default:
+        process_kwargs["decode_options"] = decode_options
+    with _local_work_dir(work_dir) as directory:
+        turns = (
+            _diarize_one_shot(
+                input_path, DiarizeOptions(), window=window, work_dir=directory
+            )
+            if diarization
+            else None
+        )
+        pipeline = _create_local_pipeline(
+            whisper_model=whisper_model,
+            engine="whisperx",
+            diarization=False,
+            dialog_blocks=dialog_blocks,
+            language=language,
+            device=device,
+            compute_type=compute_type,
+            stt_provider=stt_provider,
+        )
+        try:
+            document = pipeline.process(input_path, directory, **process_kwargs)
+            text, data = _local_transcript(
+                document,
+                output_format=output_format,
+                window=window,
+                turns=turns,
+                dialog_blocks=dialog_blocks,
+            )
+            if before_close is not None:
+                before_close(text, data)
+            return text
+        finally:
+            pipeline.close(aggressive=False)
+
+
+def _child_result_writer(
+    result_file: Path,
+) -> Callable[[str, dict[str, object] | None], None]:
+    """Return the ``before_close`` callback of the one-shot child.
+
+    Args:
+        result_file: The child's result file read by the parent.
+
+    Returns:
+        A callback writing ``{"status": "ok", "text", ["data"]}`` atomically.
+
+    """
+
+    def write(text: str, data: dict[str, object] | None = None) -> None:
+        payload: dict[str, Any] = {"status": "ok", "text": text}
+        if data is not None:
+            payload["data"] = data
+        _write_json_atomic(result_file, payload)
+
+    return write
+
+
+def _decode_flags(decode_options: WhisperDecodeOptions | None) -> list[str]:
+    """Return the CLI flags of explicitly set Whisper decoding options.
+
+    Args:
+        decode_options: Decoding overrides, or ``None``.
+
+    Returns:
+        Flags such as ``["--beam-size", "5", "--no-vad"]``; empty when nothing
+        is set.
+
+    """
+    if decode_options is None:
+        return []
+    flags: list[str] = []
+    if decode_options.beam_size is not None:
+        flags.extend(["--beam-size", str(decode_options.beam_size)])
+    for value, name in (
+        (decode_options.vad_filter, "vad"),
+        (decode_options.condition_on_previous_text, "condition-on-previous-text"),
+        (decode_options.word_timestamps, "word-timestamps"),
+    ):
+        if value is not None:
+            flags.append(f"--{name}" if value else f"--no-{name}")
+    return flags
+
+
+def _window_flags(media_window: MediaWindow | None) -> list[str]:
+    """Return the ``--start``/``--duration`` flags of a non-default window.
+
+    Args:
+        media_window: Media window, or ``None``.
+
+    Returns:
+        The flags; empty for the whole media.
+
+    """
+    if media_window is None:
+        return []
+    flags: list[str] = []
+    if media_window.start_s > 0:
+        flags.extend(["--start", repr(media_window.start_s)])
+    if media_window.duration_s is not None:
+        flags.extend(["--duration", repr(media_window.duration_s)])
+    return flags
 
 
 def _build_external_child_command(  # noqa: PLR0913
@@ -220,6 +543,9 @@ def _build_external_child_command(  # noqa: PLR0913
     work_dir: Optional[Path],
     child_result_file: Path,
     stt_provider: str = STT_PROVIDER_WHISPER,
+    output_format: str = OUTPUT_FORMAT_TEXT,
+    media_window: MediaWindow | None = None,
+    decode_options: WhisperDecodeOptions | None = None,
 ) -> list[str]:
     command = [
         sys.executable,
@@ -245,6 +571,9 @@ def _build_external_child_command(  # noqa: PLR0913
         command.append("--dialog-blocks")
     if work_dir is not None:
         command.extend(["--work-dir", str(work_dir)])
+    command.extend(["--format", output_format])
+    command.extend(_decode_flags(decode_options))
+    command.extend(_window_flags(media_window))
     return command
 
 
@@ -259,6 +588,9 @@ def _run_external_transcribe_isolated_attempt(  # noqa: PLR0913
     dialog_blocks: bool,
     work_dir: Optional[Path],
     stt_provider: str = STT_PROVIDER_WHISPER,
+    output_format: str = OUTPUT_FORMAT_TEXT,
+    media_window: MediaWindow | None = None,
+    decode_options: WhisperDecodeOptions | None = None,
 ) -> _ExternalChildAttemptResult:
     with tempfile.TemporaryDirectory(prefix="askvlm-ext-ipc-") as ipc_dir:
         child_result_file = Path(ipc_dir) / "child_result.json"
@@ -273,6 +605,9 @@ def _run_external_transcribe_isolated_attempt(  # noqa: PLR0913
             work_dir=work_dir,
             child_result_file=child_result_file,
             stt_provider=stt_provider,
+            output_format=output_format,
+            media_window=media_window,
+            decode_options=decode_options,
         )
         completed = subprocess.run(
             command,
@@ -281,11 +616,13 @@ def _run_external_transcribe_isolated_attempt(  # noqa: PLR0913
             text=True,
             env={**os.environ, "_ASKVLM_CHILD_RESULT_FILE": str(child_result_file)},
         )
+        success = _read_child_success_result(child_result_file)
         return _ExternalChildAttemptResult(
-            success_text=_read_child_success_result(child_result_file),
+            success_text=None if success is None else success[0],
             return_code=completed.returncode,
             stdout=completed.stdout or "",
             stderr=completed.stderr or "",
+            success_data=None if success is None else success[1],
         )
 
 
@@ -310,7 +647,7 @@ def _is_internal_child_ipc_error(stderr: str) -> bool:
     return _INTERNAL_CHILD_IPC_ERROR in (stderr or "")
 
 
-def _raise_external_transcribe_error(attempt: _ExternalChildAttemptResult) -> None:
+def _raise_external_transcribe_error(attempt: _ExternalChildAttemptResult) -> NoReturn:
     details = (attempt.stderr or "").strip() or (attempt.stdout or "").strip()
     if details:
         typer.secho(details, err=True)
@@ -330,6 +667,242 @@ def _emit_external_transcribe_outputs(
         _write_plain_text(output_dir_file, text)
     if stdout and text:
         typer.echo(text)
+
+
+def _stdout_json(value: object, *, indent: int | None = None) -> str:
+    """Serialize JSON for stdout so that it survives any console encoding.
+
+    A pipe or console on Windows defaults to the ANSI code page, which cannot
+    encode every character Whisper emits (Japanese text on a cp1251 console),
+    so stdout JSON is plain ASCII with escaped non-ASCII characters. Files
+    keep UTF-8 JSON without escapes (:func:`core.stt_output.document_json`).
+
+    Args:
+        value: A JSON-serializable value.
+        indent: Indentation of the document; ``None`` renders one compact line.
+
+    Returns:
+        The JSON text without a trailing line feed.
+
+    """
+    return json.dumps(value, ensure_ascii=True, indent=indent)
+
+
+def _emit_document(
+    document: Mapping[str, object],
+    *,
+    output_file: Path | None,
+    output_dir_file: Path | None,
+    stdout: bool,
+) -> None:
+    """Write one JSON document to the single-input targets.
+
+    stdout gets the indented ASCII-only document and a line feed;
+    ``--output-file`` and the ``--output-dir`` file get the same document as
+    UTF-8 text with unescaped characters (platform line endings, like stdout),
+    also for a document without segments or turns.
+
+    Args:
+        document: Transcript or diarization document.
+        output_file: ``--output-file`` target, if any.
+        output_dir_file: ``--output-dir`` file of the input, if any.
+        stdout: Whether the document goes to stdout.
+
+    """
+    file_text = document_json(document) + "\n"
+    if output_file is not None:
+        _write_plain_text(output_file, file_text)
+    if output_dir_file is not None:
+        _write_plain_text(output_dir_file, file_text)
+    if stdout:
+        typer.echo(_stdout_json(document, indent=2))
+
+
+def _object_list(data: Mapping[str, object], key: str) -> list[dict[str, object]]:
+    """Return ``data[key]`` when it is a list of JSON objects.
+
+    Raises:
+        ValueError: When the key is missing or holds anything else.
+
+    """
+    value = data.get(key)
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return [item for item in value if isinstance(item, dict)]
+    msg = f"malformed result: expected a {key!r} list of objects, got {value!r:.80}"
+    raise ValueError(msg)
+
+
+def _speaker_labels(value: object) -> list[str | None]:
+    """Return *value* when it is a list of speaker labels or nulls.
+
+    Raises:
+        ValueError: When *value* is anything else.
+
+    """
+    if isinstance(value, list) and all(
+        item is None or isinstance(item, str) for item in value
+    ):
+        return [item if isinstance(item, str) else None for item in value]
+    msg = f"malformed result: expected a 'speakers' list, got {value!r:.80}"
+    raise ValueError(msg)
+
+
+def _transcript_document_from_data(
+    media: str, data: Mapping[str, object] | None
+) -> dict[str, object]:
+    """Build the transcript document of one input from its structured payload.
+
+    Args:
+        media: The input path as given.
+        data: ``{"segments"}``, plus ``"turns"`` and ``"speakers"`` with
+            diarization.
+
+    Returns:
+        The document of :func:`core.stt_output.transcript_document`.
+
+    Raises:
+        ValueError: When the payload is missing or malformed.
+
+    """
+    if data is None:
+        msg = "malformed result: the transcript segments are missing"
+        raise ValueError(msg)
+    segments = _object_list(data, "segments")
+    if "turns" not in data:
+        return transcript_document(media, segments)
+    speakers = _speaker_labels(data["speakers"]) if "speakers" in data else None
+    return transcript_document(
+        media, segments, turns=_object_list(data, "turns"), speakers=speakers
+    )
+
+
+def _diarization_document_from_data(
+    media: str, data: Mapping[str, object] | None
+) -> dict[str, object]:
+    """Build the diarization document of one input from its structured payload.
+
+    Args:
+        media: The input path as given.
+        data: ``{"turns"}``.
+
+    Returns:
+        The document of :func:`core.stt_output.diarization_document`.
+
+    Raises:
+        ValueError: When the payload is missing or malformed.
+
+    """
+    if data is None:
+        msg = "malformed result: the diarization turns are missing"
+        raise ValueError(msg)
+    return diarization_document(media, _object_list(data, "turns"))
+
+
+@dataclass(frozen=True)
+class _ResultFormat:
+    """How a call renders the results of its successful inputs.
+
+    Attributes:
+        kind: ``text`` (plain transcripts, the historical contract),
+            ``transcript`` (transcript JSON documents) or ``diarization``
+            (diarization JSON documents).
+
+    """
+
+    kind: Literal["text", "transcript", "diarization"]
+
+    @property
+    def structured(self) -> bool:
+        """Whether every successful input renders as a JSON document."""
+        return self.kind != "text"
+
+    @property
+    def has_text(self) -> bool:
+        """Whether batch rows carry the transcript ``text``."""
+        return self.kind != "diarization"
+
+    @property
+    def output_suffix(self) -> str:
+        """Extension of the ``--output-dir`` files."""
+        return ".json" if self.structured else ".txt"
+
+    @property
+    def failure_detail(self) -> str:
+        """Return the stderr text of a failed single input without a detail."""
+        if self.kind == "diarization":
+            return "speaker diarization failed"
+        return "transcription failed"
+
+    def document(self, outcome: InputOutcome) -> dict[str, object]:
+        """Build the JSON document of a successful outcome.
+
+        Raises:
+            ValueError: When the outcome's payload is missing or malformed.
+
+        """
+        media = str(outcome.input_path)
+        if self.kind == "diarization":
+            return _diarization_document_from_data(media, outcome.data)
+        return _transcript_document_from_data(media, outcome.data)
+
+
+_TEXT_RESULTS = _ResultFormat("text")
+_TRANSCRIPT_DOCUMENTS = _ResultFormat("transcript")
+_DIARIZATION_DOCUMENTS = _ResultFormat("diarization")
+
+
+def _transcribe_result_format(output_format: str) -> _ResultFormat:
+    """Return the result rendering of an ``external-transcribe`` ``--format``."""
+    if output_format == OUTPUT_FORMAT_JSON:
+        return _TRANSCRIPT_DOCUMENTS
+    return _TEXT_RESULTS
+
+
+def _emit_local_transcript(
+    text: str,
+    data: dict[str, object] | None = None,
+    *,
+    input_path: Path,
+    output_format: str,
+    output_file: Path | None,
+    output_dir_file: Path | None,
+    stdout: bool,
+) -> None:
+    """Apply the single-input output rules to a one-shot transcription.
+
+    Args:
+        text: Final transcript text.
+        data: Structured payload (see :func:`_local_transcript`); required for
+            ``--format json``.
+        input_path: The input as given (the document's ``media``).
+        output_format: ``text`` or ``json``.
+        output_file: ``--output-file`` target, if any.
+        output_dir_file: ``--output-dir`` file of the input, if any.
+        stdout: Whether the result goes to stdout.
+
+    Raises:
+        typer.Exit: Code ``1`` when ``--format json`` lacks a valid payload.
+
+    """
+    if output_format != OUTPUT_FORMAT_JSON:
+        _emit_external_transcribe_outputs(
+            text=text,
+            output_file=output_file,
+            stdout=stdout,
+            output_dir_file=output_dir_file,
+        )
+        return
+    try:
+        document = _transcript_document_from_data(str(input_path), data)
+    except ValueError as exc:
+        typer.secho(str(exc), err=True)
+        raise typer.Exit(code=1) from exc
+    _emit_document(
+        document,
+        output_file=output_file,
+        output_dir_file=output_dir_file,
+        stdout=stdout,
+    )
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -435,13 +1008,166 @@ def _client_timeout_callback(value: float) -> float:
     return value
 
 
+def _output_format_callback(value: str) -> str:
+    """Validate ``--format`` case-insensitively.
+
+    Args:
+        value: Raw option value.
+
+    Returns:
+        ``text`` or ``json``.
+
+    Raises:
+        typer.BadParameter: When the value names no output format.
+
+    """
+    token = value.strip().lower()
+    if token in _OUTPUT_FORMATS:
+        return token
+    msg = f"expected one of: {', '.join(_OUTPUT_FORMATS)} (got {value!r})"
+    raise typer.BadParameter(msg)
+
+
+def _whisper_decode_options(
+    provider: str,
+    *,
+    beam_size: int | None,
+    vad: bool | None,
+    condition_on_previous_text: bool | None,
+    word_timestamps: bool | None,
+) -> WhisperDecodeOptions:
+    """Validate the Whisper decoding flags of ``external-transcribe``.
+
+    Args:
+        provider: Canonical STT provider id.
+        beam_size: ``--beam-size``, or ``None`` when not given.
+        vad: ``--vad``/``--no-vad``, or ``None`` when not given.
+        condition_on_previous_text: ``--[no-]condition-on-previous-text``.
+        word_timestamps: ``--[no-]word-timestamps``.
+
+    Returns:
+        The decoding overrides; all ``None`` keeps the pipeline defaults.
+
+    Raises:
+        typer.BadParameter: When a value is out of range, or any of the flags
+            is given with a GigaAM provider (they are Whisper-only).
+
+    """
+    try:
+        options = WhisperDecodeOptions(
+            beam_size=beam_size,
+            vad_filter=vad,
+            condition_on_previous_text=condition_on_previous_text,
+            word_timestamps=word_timestamps,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    if is_gigaam_provider(provider) and not options.is_default:
+        given = " ".join(_decode_flags(options))
+        msg = (
+            f"{given}: these decoding options apply to the whisper provider only; "
+            f"--stt-provider {provider} does not support them (GigaAM JSON has "
+            "only its own segments, without words or scores)"
+        )
+        raise typer.BadParameter(msg, param_hint="'--stt-provider'")
+    return options
+
+
+def _media_window(start: float, duration: float | None) -> MediaWindow:
+    """Validate ``--start``/``--duration``.
+
+    Args:
+        start: Window start in seconds from the media start.
+        duration: Window length in seconds, or ``None`` for "to the end".
+
+    Returns:
+        The media window (the default window for ``0`` and ``None``).
+
+    Raises:
+        typer.BadParameter: When the start is negative or not finite, or the
+            duration is not finite or below :data:`_MIN_WINDOW_DURATION_S`.
+
+    """
+    if not math.isfinite(start) or start < 0:
+        msg = f"must be a finite number of seconds >= 0 (got {start})"
+        raise typer.BadParameter(msg, param_hint="'--start'")
+    if duration is not None and (
+        not math.isfinite(duration) or duration < _MIN_WINDOW_DURATION_S
+    ):
+        msg = (
+            f"must be a finite number of seconds >= {_MIN_WINDOW_DURATION_S} "
+            f"(ffmpeg cuts with millisecond precision; got {duration})"
+        )
+        raise typer.BadParameter(msg, param_hint="'--duration'")
+    return MediaWindow(start_s=start, duration_s=duration)
+
+
+def _diarize_options(
+    *,
+    num_speakers: int | None,
+    threshold: float,
+    min_on: float,
+    min_off: float,
+) -> DiarizeOptions:
+    """Validate the clustering and turn-filter flags of ``external-diarize``.
+
+    Args:
+        num_speakers: ``--num-speakers``, or ``None`` to cluster by threshold.
+        threshold: ``--threshold``.
+        min_on: ``--min-on``.
+        min_off: ``--min-off``.
+
+    Returns:
+        The diarization settings.
+
+    Raises:
+        typer.BadParameter: When a value is out of range or not finite.
+
+    """
+    if num_speakers is not None and num_speakers < 1:
+        msg = f"must be at least 1 (got {num_speakers})"
+        raise typer.BadParameter(msg, param_hint="'--num-speakers'")
+    if not math.isfinite(threshold) or threshold <= 0:
+        msg = f"must be a finite number > 0 (got {threshold})"
+        raise typer.BadParameter(msg, param_hint="'--threshold'")
+    for flag, value in (("--min-on", min_on), ("--min-off", min_off)):
+        if not math.isfinite(value) or value < 0:
+            msg = f"must be a finite number of seconds >= 0 (got {value})"
+            raise typer.BadParameter(msg, param_hint=f"'{flag}'")
+    return DiarizeOptions(
+        num_speakers=num_speakers,
+        threshold=threshold,
+        min_duration_on=min_on,
+        min_duration_off=min_off,
+    )
+
+
+def _diarize_device(device: str) -> DeviceRequest:
+    """Validate ``--device`` of ``external-diarize`` (CPU only).
+
+    Args:
+        device: Raw ``--device`` token.
+
+    Returns:
+        ``cpu`` for ``auto`` and ``cpu``.
+
+    Raises:
+        typer.BadParameter: For ``cuda`` (speaker diarization runs on the CPU
+            only) and for unknown tokens.
+
+    """
+    try:
+        return normalize_device_request(DIARIZE_PROVIDER, device)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="'--device'") from exc
+
+
 def _reject_supervisor_unsupported_flags(
-    *, diarization: bool, dialog_blocks: bool, work_dir: Path | None
+    *, dialog_blocks: bool, work_dir: Path | None
 ) -> None:
     """Refuse flags the transcription supervisor cannot honor.
 
     Args:
-        diarization: ``--diarization`` was given.
         dialog_blocks: ``--dialog-blocks`` was given.
         work_dir: Value of ``--work-dir``.
 
@@ -450,7 +1176,6 @@ def _reject_supervisor_unsupported_flags(
 
     """
     for flag, used in (
-        ("--diarization", diarization),
         ("--dialog-blocks", dialog_blocks),
         ("--work-dir", work_dir is not None),
     ):
@@ -523,6 +1248,9 @@ def _build_supervisor_request(  # noqa: PLR0913 - one argument per CLI option
     diarization: bool,
     dialog_blocks: bool,
     work_dir: Path | None,
+    want_segments: bool = False,
+    decode: WhisperDecodeOptions | None = None,
+    window: MediaWindow | None = None,
 ) -> ClientRequest:
     """Validate the supervisor-mode options and build the client request.
 
@@ -537,9 +1265,13 @@ def _build_supervisor_request(  # noqa: PLR0913 - one argument per CLI option
         max_parallel: Effective per-call cap (``--max-parallel``, else the
             deprecated ``--daemon-workers``), or ``None``.
         client_timeout: ``--client-timeout`` value.
-        diarization: ``--diarization`` was given.
+        diarization: ``--diarization`` was given (a CPU diarization job runs
+            next to every transcription job, with the default settings).
         dialog_blocks: ``--dialog-blocks`` was given.
         work_dir: ``--work-dir`` value.
+        want_segments: ``--format json`` was given.
+        decode: Whisper decoding overrides (``None`` keeps the defaults).
+        window: Media window (``None`` covers the whole media).
 
     Returns:
         The request for :func:`~core.stt_pool.client.run_client`.
@@ -549,9 +1281,7 @@ def _build_supervisor_request(  # noqa: PLR0913 - one argument per CLI option
             token a GigaAM head rejects, or an invalid language token.
 
     """
-    _reject_supervisor_unsupported_flags(
-        diarization=diarization, dialog_blocks=dialog_blocks, work_dir=work_dir
-    )
+    _reject_supervisor_unsupported_flags(dialog_blocks=dialog_blocks, work_dir=work_dir)
     return ClientRequest(
         inputs=tuple(input_paths),
         provider=provider,
@@ -562,6 +1292,10 @@ def _build_supervisor_request(  # noqa: PLR0913 - one argument per CLI option
         priority=normalize_priority(priority),
         max_parallel=max_parallel,
         client_timeout_s=client_timeout,
+        want_segments=want_segments,
+        decode=decode if decode is not None else WhisperDecodeOptions(),
+        window=window if window is not None else MediaWindow(),
+        diarization=DiarizeOptions() if diarization else None,
     )
 
 
@@ -576,16 +1310,20 @@ def _note_deprecated_daemon_workers(daemon_workers: int | None) -> None:
         typer.secho(_DAEMON_WORKERS_DEPRECATION, err=True)
 
 
-def _resolve_output_dir_files(inputs: Sequence[Path], output_dir: Path) -> list[Path]:
+def _resolve_output_dir_files(
+    inputs: Sequence[Path], output_dir: Path, *, extension: str = ".txt"
+) -> list[Path]:
     """Name the ``--output-dir`` file of every input before the run.
 
     The first input with a given stem gets ``<stem>.txt``; a later input whose
     name would collide (compared case-insensitively) gets ``<stem>-2.txt``,
-    ``<stem>-3.txt``, and so on, skipping names already taken.
+    ``<stem>-3.txt``, and so on, skipping names already taken. JSON results
+    use ``.json`` in the same way.
 
     Args:
         inputs: Inputs in input order.
         output_dir: Target directory.
+        extension: File extension with its dot (``.txt`` or ``.json``).
 
     Returns:
         One distinct file path per input, in input order.
@@ -595,11 +1333,11 @@ def _resolve_output_dir_files(inputs: Sequence[Path], output_dir: Path) -> list[
     files: list[Path] = []
     for input_path in inputs:
         stem = input_path.stem
-        name = f"{stem}.txt"
+        name = f"{stem}{extension}"
         suffix = 1
         while name.casefold() in taken:
             suffix += 1
-            name = f"{stem}-{suffix}.txt"
+            name = f"{stem}-{suffix}{extension}"
         taken.add(name.casefold())
         files.append(output_dir / name)
     return files
@@ -624,6 +1362,7 @@ def _report_single_supervisor_outcome(
     output_file: Path | None,
     output_dir_file: Path | None,
     stdout: bool,
+    result_format: _ResultFormat = _TEXT_RESULTS,
 ) -> None:
     """Apply the single-input output rules to a supervisor outcome.
 
@@ -631,22 +1370,38 @@ def _report_single_supervisor_outcome(
         outcome: The outcome of the only input.
         output_file: ``--output-file`` target, if any.
         output_dir_file: ``--output-dir`` file of the input, if any.
-        stdout: Whether the transcript goes to stdout.
+        stdout: Whether the transcript (or the JSON document) goes to stdout.
+        result_format: Plain text, or the JSON document of every success (also
+            of an empty transcript or a diarization without turns).
 
     Raises:
         typer.Exit: :data:`EXTERNAL_TRANSCRIBE_TIMEOUT_EXIT` on a timeout,
             :data:`EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT` when the supervisor is
-            unavailable, ``1`` on an error (stderr carries the worker's detail).
+            unavailable, ``1`` on an error (stderr carries the worker's detail)
+            or a malformed structured result.
 
     """
     for warning in outcome.warnings:
         typer.secho(warning, err=True)
     if outcome.status in _SUCCESS_STATUSES:
-        _emit_external_transcribe_outputs(
-            text=outcome.text,
+        if not result_format.structured:
+            _emit_external_transcribe_outputs(
+                text=outcome.text,
+                output_file=output_file,
+                stdout=stdout,
+                output_dir_file=output_dir_file,
+            )
+            return
+        try:
+            document = result_format.document(outcome)
+        except ValueError as exc:
+            typer.secho(str(exc), err=True)
+            raise typer.Exit(code=1) from exc
+        _emit_document(
+            document,
             output_file=output_file,
-            stdout=stdout,
             output_dir_file=output_dir_file,
+            stdout=stdout,
         )
         return
     if outcome.status == "timeout":
@@ -659,7 +1414,7 @@ def _report_single_supervisor_outcome(
             f"{_DAEMON_UNAVAILABLE_MARKER}: {outcome.detail or ''}".strip(), err=True
         )
         raise typer.Exit(code=EXTERNAL_TRANSCRIBE_UNAVAILABLE_EXIT)
-    typer.secho(outcome.detail or "transcription failed", err=True)
+    typer.secho(outcome.detail or result_format.failure_detail, err=True)
     raise typer.Exit(code=1)
 
 
@@ -668,7 +1423,10 @@ class _BatchReporter:
 
     Outcomes arrive in completion order. Each ``--output-dir`` file is written
     as soon as its outcome arrives; the stdout JSON line and the stderr lines
-    of an input are emitted once every earlier input is final.
+    of an input are emitted once every earlier input is final. With a
+    structured result format every row also carries ``result``: the input's
+    compact JSON document, or ``null`` for a failed input (and diarization
+    rows carry no ``text``).
     """
 
     def __init__(
@@ -677,13 +1435,16 @@ class _BatchReporter:
         *,
         output_dir_files: Sequence[Path] | None,
         stdout: bool,
+        result_format: _ResultFormat = _TEXT_RESULTS,
     ) -> None:
         self._count = len(inputs)
         self._output_dir_files = (
             None if output_dir_files is None else tuple(output_dir_files)
         )
         self._stdout = stdout
+        self._format = result_format
         self._received: dict[int, InputOutcome] = {}
+        self._documents: dict[int, dict[str, object]] = {}
         self._written: dict[int, Path] = {}
         self._next_index = 0
         self._warned: set[str] = set()
@@ -692,7 +1453,8 @@ class _BatchReporter:
         """Accept one final outcome; a repeated index is ignored."""
         if outcome.index in self._received:
             return
-        self._received[outcome.index] = self._write_output_dir_file(outcome)
+        documented = self._with_document(outcome)
+        self._received[outcome.index] = self._write_output_dir_file(documented)
         while self._next_index in self._received:
             self._emit(self._received[self._next_index])
             self._next_index += 1
@@ -701,14 +1463,39 @@ class _BatchReporter:
         """Return the reported outcomes in input order."""
         return [self._received[index] for index in range(self._count)]
 
+    def documents(self) -> list[dict[str, object] | None]:
+        """Return the JSON document of every input, ``None`` for a failed input."""
+        return [self._document_of(outcome) for outcome in self.outcomes()]
+
+    def _document_of(self, outcome: InputOutcome) -> dict[str, object] | None:
+        """Return the document of a successful input, else ``None``."""
+        if outcome.status not in _SUCCESS_STATUSES:
+            return None
+        return self._documents.get(outcome.index)
+
+    def _with_document(self, outcome: InputOutcome) -> InputOutcome:
+        """Build the document of a successful input; a malformed payload is an error."""
+        if not self._format.structured or outcome.status not in _SUCCESS_STATUSES:
+            return outcome
+        try:
+            self._documents[outcome.index] = self._format.document(outcome)
+        except ValueError as exc:
+            return replace(outcome, status="error", text="", detail=str(exc), data=None)
+        return outcome
+
     def _write_output_dir_file(self, outcome: InputOutcome) -> InputOutcome:
-        """Write ``<stem>.txt`` of a successful input; a failed write is an error."""
+        """Write the ``--output-dir`` file of a successful input.
+
+        A failed write turns the input into an error.
+        """
         files = self._output_dir_files
         if files is None or outcome.status not in _SUCCESS_STATUSES:
             return outcome
         target = files[outcome.index]
+        document = self._documents.get(outcome.index)
+        content = outcome.text if document is None else document_json(document) + "\n"
         try:
-            _write_plain_text(target, outcome.text)
+            _write_plain_text(target, content)
         except OSError as exc:
             return replace(
                 outcome,
@@ -739,13 +1526,16 @@ class _BatchReporter:
             "index": outcome.index,
             "input": str(outcome.input_path),
             "status": outcome.status,
-            "text": "" if failed else outcome.text,
-            "error": error,
         }
+        if self._format.has_text:
+            record["text"] = "" if failed else outcome.text
+        record["error"] = error
         if self._output_dir_files is not None:
             written = self._written.get(outcome.index)
             record["output"] = None if written is None else str(written)
-        typer.echo(json.dumps(record))
+        if self._format.structured:
+            record["result"] = self._document_of(outcome)
+        typer.echo(_stdout_json(record))
 
 
 def _batch_exit_code(outcomes: Sequence[InputOutcome]) -> int:
@@ -766,20 +1556,70 @@ def _batch_exit_code(outcomes: Sequence[InputOutcome]) -> int:
     return 0
 
 
-def _run_external_transcribe_via_supervisor(
+def _run_client_checked(
+    request: ClientRequest, *, on_outcome: OutcomeFn | None = None
+) -> ClientOutcome:
+    """Run the client; an invalid request is a usage error.
+
+    Args:
+        request: The client request.
+        on_outcome: Called once per input as soon as its outcome is final.
+
+    Returns:
+        One outcome per input, in input order.
+
+    Raises:
+        typer.BadParameter: When the client rejects the request (exit ``2``)
+            before any job is written.
+
+    """
+    try:
+        return run_client(request, on_outcome=on_outcome)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _aggregate_output(reporter: _BatchReporter, result_format: _ResultFormat) -> str:
+    """Return the batch ``--output-file`` content in input order.
+
+    Args:
+        reporter: The reporter that received every outcome.
+        result_format: How results are rendered.
+
+    Returns:
+        Plain text: the transcripts joined by line feeds (a failed input
+        contributes an empty line). Structured: JSON Lines of the compact
+        documents, ``null`` for a failed input, each line ending with a line
+        feed.
+
+    """
+    if not result_format.structured:
+        return "\n".join(
+            outcome.text if outcome.status in _SUCCESS_STATUSES else ""
+            for outcome in reporter.outcomes()
+        )
+    return "".join(
+        json.dumps(document, ensure_ascii=False) + "\n"
+        for document in reporter.documents()
+    )
+
+
+def _run_via_supervisor(
     request: ClientRequest,
     *,
     output_file: Path | None,
     output_dir: Path | None,
     stdout: bool,
+    result_format: _ResultFormat = _TEXT_RESULTS,
 ) -> None:
-    """Transcribe through the STT supervisor and apply the CLI output rules.
+    """Run a call through the STT supervisor and apply the CLI output rules.
 
-    One input keeps the plain single-file contract (transcript on stdout,
-    exit codes 0/1/10/11). Several inputs produce one JSON line per input on
-    stdout in input order, optional ``--output-dir`` files, one atomic
-    ``--output-file`` with every transcript joined by newlines, and the exit
-    code of :func:`_batch_exit_code`. A failed ``--output-file`` write prints one
+    One input keeps the single-file contract (the transcript, or the indented
+    JSON document, on stdout; exit codes 0/1/10/11). Several inputs produce one
+    JSON line per input on stdout in input order, optional ``--output-dir``
+    files, one atomic ``--output-file`` (transcripts joined by newlines, or
+    JSON Lines of the documents), and the exit code of
+    :func:`_batch_exit_code`. A failed ``--output-file`` write prints one
     stderr line and turns an otherwise successful call into exit ``1``; the
     previous file content stays. There is no in-process recovery.
 
@@ -787,43 +1627,45 @@ def _run_external_transcribe_via_supervisor(
         request: The client request.
         output_file: ``--output-file`` target, if any.
         output_dir: ``--output-dir`` target, if any.
-        stdout: Whether transcripts (or JSON lines) go to stdout.
+        stdout: Whether results (or JSON lines) go to stdout.
+        result_format: Plain transcripts or JSON documents.
 
     Raises:
         typer.Exit: With the exit code of a failed call.
+        typer.BadParameter: When the client rejects the request.
 
     """
     output_dir_files = (
         None
         if output_dir is None
-        else _resolve_output_dir_files(request.inputs, output_dir)
+        else _resolve_output_dir_files(
+            request.inputs, output_dir, extension=result_format.output_suffix
+        )
     )
     if len(request.inputs) == 1:
-        outcome = run_client(request).outcomes[0]
+        outcome = _run_client_checked(request).outcomes[0]
         _report_single_supervisor_outcome(
             outcome,
             output_file=output_file,
             output_dir_file=None if output_dir_files is None else output_dir_files[0],
             stdout=stdout,
+            result_format=result_format,
         )
         return
     reporter = _BatchReporter(
-        request.inputs, output_dir_files=output_dir_files, stdout=stdout
+        request.inputs,
+        output_dir_files=output_dir_files,
+        stdout=stdout,
+        result_format=result_format,
     )
-    result = run_client(request, on_outcome=reporter.on_outcome)
+    result = _run_client_checked(request, on_outcome=reporter.on_outcome)
     for outcome in result.outcomes:
         reporter.on_outcome(outcome)
     outcomes = reporter.outcomes()
     output_file_failed = False
     if output_file is not None:
         try:
-            _write_text_atomic(
-                output_file,
-                "\n".join(
-                    outcome.text if outcome.status in _SUCCESS_STATUSES else ""
-                    for outcome in outcomes
-                ),
-            )
+            _write_text_atomic(output_file, _aggregate_output(reporter, result_format))
         except OSError as exc:
             # * A failed aggregate write counts as an error of the call but never
             # * outranks a timeout (10) or an unavailable supervisor (11).
@@ -836,6 +1678,174 @@ def _run_external_transcribe_via_supervisor(
     code = _batch_exit_code(outcomes) or (1 if output_file_failed else 0)
     if code:
         raise typer.Exit(code=code)
+
+
+@dataclass(frozen=True)
+class _LocalTranscribeJob:
+    """Options of one ``external-transcribe --no-daemon`` run.
+
+    Attributes:
+        input_path: The only input, as given.
+        provider: Canonical STT provider id.
+        whisper_model: ``--whisper-model``.
+        language: ``--language``.
+        device: Device token checked by :func:`_resolve_external_device`.
+        compute_type: ``--compute-type``.
+        diarization: ``--diarization`` (sherpa-onnx, CPU).
+        dialog_blocks: ``--dialog-blocks``.
+        work_dir: ``--work-dir``.
+        output_format: ``text`` or ``json``.
+        window: Media window.
+        decode: Whisper decoding overrides.
+
+    """
+
+    input_path: Path
+    provider: str
+    whisper_model: str
+    language: str | None
+    device: str
+    compute_type: str
+    diarization: bool
+    dialog_blocks: bool
+    work_dir: Path | None
+    output_format: str
+    window: MediaWindow
+    decode: WhisperDecodeOptions
+
+
+def _run_external_transcribe_no_daemon(
+    job: _LocalTranscribeJob,
+    *,
+    output_file: Path | None,
+    output_dir_file: Path | None,
+    stdout: bool,
+) -> None:
+    """Run the one-shot flow of ``--no-daemon`` and apply the output rules.
+
+    On Windows a CUDA-capable provider (Whisper, gigaam-e2e-ctc) without
+    ``--device cpu`` runs in an isolated child process that writes its text
+    and structured payload before its pipeline closes; a crash-like child
+    failure is retried once on the CPU. Otherwise the run stays in-process.
+    Both ways print the same output.
+
+    Args:
+        job: The run's options.
+        output_file: ``--output-file`` target, if any.
+        output_dir_file: ``--output-dir`` file of the input, if any.
+        stdout: Whether the result goes to stdout.
+
+    Raises:
+        typer.Exit: Code ``1`` when the run fails.
+
+    """
+
+    def emit(text: str, data: dict[str, object] | None = None) -> None:
+        _emit_local_transcript(
+            text,
+            data,
+            input_path=job.input_path,
+            output_format=job.output_format,
+            output_file=output_file,
+            output_dir_file=output_dir_file,
+            stdout=stdout,
+        )
+
+    def attempt(device: str) -> _ExternalChildAttemptResult:
+        return _run_external_transcribe_isolated_attempt(
+            input_path=job.input_path,
+            whisper_model=job.whisper_model,
+            language=job.language,
+            device=device,
+            compute_type=job.compute_type,
+            diarization=job.diarization,
+            dialog_blocks=job.dialog_blocks,
+            work_dir=job.work_dir,
+            stt_provider=job.provider,
+            output_format=job.output_format,
+            media_window=job.window,
+            decode_options=job.decode,
+        )
+
+    # * Windows GPU child isolation covers CUDA-capable providers (Whisper and
+    # * gigaam-e2e-ctc); gigaam-ctc always runs in-process on CPU.
+    windows_non_cpu = (
+        provider_may_use_cuda(job.provider)
+        and sys.platform.startswith("win")
+        and job.device.lower() != "cpu"
+    )
+    if windows_non_cpu:
+        first_attempt = attempt(job.device)
+        if first_attempt.success_text is not None:
+            emit(first_attempt.success_text, first_attempt.success_data)
+            return
+
+        if not _is_windows_crash_like_return_code(
+            first_attempt.return_code
+        ) and not _is_internal_child_ipc_error(first_attempt.stderr):
+            _raise_external_transcribe_error(first_attempt)
+
+        retry_attempt = attempt("cpu")
+        if retry_attempt.success_text is not None:
+            emit(retry_attempt.success_text, retry_attempt.success_data)
+            return
+        _raise_external_transcribe_error(retry_attempt)
+
+    _run_external_transcribe_once(
+        input_path=job.input_path,
+        whisper_model=job.whisper_model,
+        language=job.language,
+        device=job.device,
+        compute_type=job.compute_type,
+        diarization=job.diarization,
+        dialog_blocks=job.dialog_blocks,
+        work_dir=job.work_dir,
+        stt_provider=job.provider,
+        before_close=emit,
+        output_format=job.output_format,
+        media_window=job.window,
+        decode_options=job.decode,
+    )
+
+
+def _run_external_diarize_no_daemon(
+    input_path: Path,
+    options: DiarizeOptions,
+    *,
+    window: MediaWindow,
+    output_file: Path | None,
+    output_dir: Path | None,
+    stdout: bool,
+) -> None:
+    """Diarize one input in this process and print its JSON document.
+
+    Args:
+        input_path: The only input, as given.
+        options: Diarization settings.
+        window: Media window.
+        output_file: ``--output-file`` target, if any.
+        output_dir: ``--output-dir`` target, if any.
+        stdout: Whether the document goes to stdout.
+
+    Raises:
+        typer.Exit: Code ``1`` when the diarization fails.
+
+    """
+    output_dir_file = (
+        None
+        if output_dir is None
+        else _resolve_output_dir_files(
+            [input_path], output_dir, extension=_DIARIZATION_DOCUMENTS.output_suffix
+        )[0]
+    )
+    with _local_work_dir(None) as work_dir:
+        turns = _diarize_one_shot(input_path, options, window=window, work_dir=work_dir)
+    _emit_document(
+        diarization_document(str(input_path), turns),
+        output_file=output_file,
+        output_dir_file=output_dir_file,
+        stdout=stdout,
+    )
 
 
 @app.command()
@@ -1003,7 +2013,9 @@ def external_transcribe(  # noqa: PLR0913
         help=(
             "Optional plain-text file to write alongside stdout output. With "
             "several inputs it receives every transcript joined by newlines in "
-            "input order (failed inputs contribute an empty line)."
+            "input order (failed inputs contribute an empty line). With --format "
+            "json it receives the same document as stdout; with several inputs "
+            "JSON Lines of the documents (null for a failed input)."
         ),
     ),
     output_dir: Path | None = typer.Option(
@@ -1012,8 +2024,9 @@ def external_transcribe(  # noqa: PLR0913
         file_okay=False,
         dir_okay=True,
         help=(
-            "Optional directory that receives <stem>.txt for every successful "
-            "input; repeated stems get -2, -3, ... suffixes."
+            "Optional directory that receives <stem>.txt (<stem>.json with "
+            "--format json) for every successful input; repeated stems get -2, "
+            "-3, ... suffixes."
         ),
     ),
     whisper_model: str = typer.Option(
@@ -1053,8 +2066,12 @@ def external_transcribe(  # noqa: PLR0913
         False,
         "--diarization/--no-diarization",
         help=(
-            "Enable speaker diarization (requires --no-daemon). Disabled by "
-            "default for external calls; this can require additional GPU memory."
+            "CPU speaker diarization (sherpa-onnx). Voices are labelled "
+            "speaker_00, speaker_01, ... in order of first appearance. With two "
+            "or more voices every text line starts with 'speaker_xx: '; with one "
+            "voice the text stays unprefixed. With --format json the document "
+            "gains turns and a speaker per segment (null without overlap). "
+            "Disabled by default."
         ),
     ),
     dialog_blocks: bool = typer.Option(
@@ -1069,8 +2086,9 @@ def external_transcribe(  # noqa: PLR0913
         True,
         "--stdout/--no-stdout",
         help=(
-            "Write only the final transcript text to stdout; with several inputs, "
-            "one JSON line per input in input order. Enabled by default."
+            "Write only the final transcript text (or the JSON document with "
+            "--format json) to stdout; with several inputs, one JSON line per "
+            "input in input order. Enabled by default."
         ),
     ),
     work_dir: Optional[Path] = typer.Option(
@@ -1138,13 +2156,92 @@ def external_transcribe(  # noqa: PLR0913
         "--_internal-result-file",
         hidden=True,
     ),
+    *,
+    output_format: Annotated[
+        str,
+        typer.Option(
+            "--format",
+            callback=_output_format_callback,
+            help=(
+                "Output format: text (default; the plain transcript) or json: one "
+                "document {media, sample_rate, segments} per input with "
+                "media-relative segment times, no_speech_prob, avg_logprob and "
+                "words (Whisper; GigaAM segments carry start, end and text only). "
+                "One input prints the indented document, also for an empty "
+                "transcript; several inputs add it to every JSON line as result "
+                "(null for a failed input)."
+            ),
+        ),
+    ] = OUTPUT_FORMAT_TEXT,
+    beam_size: Annotated[
+        int | None,
+        typer.Option(
+            "--beam-size",
+            min=MIN_BEAM_SIZE,
+            max=MAX_BEAM_SIZE,
+            help=(
+                "Whisper only: beam search width (pipeline default: 10). An "
+                "error with a GigaAM provider."
+            ),
+        ),
+    ] = None,
+    vad: Annotated[
+        bool | None,
+        typer.Option(
+            "--vad/--no-vad",
+            help=(
+                "Whisper only: voice-activity filter (pipeline default: on). An "
+                "error with a GigaAM provider."
+            ),
+        ),
+    ] = None,
+    condition_on_previous_text: Annotated[
+        bool | None,
+        typer.Option(
+            "--condition-on-previous-text/--no-condition-on-previous-text",
+            help=(
+                "Whisper only: use the previous text as the decoding prompt "
+                "(default: on). An error with a GigaAM provider."
+            ),
+        ),
+    ] = None,
+    word_timestamps: Annotated[
+        bool | None,
+        typer.Option(
+            "--word-timestamps/--no-word-timestamps",
+            help=(
+                "Whisper only: word-level timestamps, the words of JSON segments "
+                "(pipeline default: on). An error with a GigaAM provider."
+            ),
+        ),
+    ] = None,
+    start: Annotated[
+        float,
+        typer.Option(
+            "--start",
+            help=(
+                "Transcribe from this many seconds after the media start "
+                "(default: 0). JSON times stay relative to the media start."
+            ),
+        ),
+    ] = 0.0,
+    duration: Annotated[
+        float | None,
+        typer.Option(
+            "--duration",
+            help=(
+                "Transcribe at most this many seconds from --start (at least "
+                "0.001; default: to the end)."
+            ),
+        ),
+    ] = None,
 ) -> None:
-    """Transcribe media files and return plain text for external applications.
+    """Transcribe media files for external applications (plain text or JSON).
 
     By default the inputs go through the shared STT supervisor (a pool of
-    worker processes, one per configuration). One input prints its transcript;
-    several inputs print one JSON line per input. ``--no-daemon`` runs the
-    legacy in-process flow for one input.
+    worker processes, one per configuration). One input prints its transcript
+    (its JSON document with --format json); several inputs print one JSON line
+    per input. ``--no-daemon`` runs the legacy in-process flow for one input.
     """
     if not stdout and output_file is None and output_dir is None:
         msg = "Either keep --stdout enabled or provide --output-file or --output-dir."
@@ -1159,6 +2256,20 @@ def external_transcribe(  # noqa: PLR0913
             f"expected one of: {', '.join(STT_PROVIDER_CHOICES)}"
         )
     device = _resolve_external_device(stt_provider=provider, device=device)
+    decode = _whisper_decode_options(
+        provider,
+        beam_size=beam_size,
+        vad=vad,
+        condition_on_previous_text=condition_on_previous_text,
+        word_timestamps=word_timestamps,
+    )
+    window = _media_window(start, duration)
+    if dialog_blocks and output_format == OUTPUT_FORMAT_JSON:
+        msg = (
+            "formats only the plain-text transcript and has no effect on "
+            "--format json; drop one of them."
+        )
+        raise typer.BadParameter(msg, param_hint="'--dialog-blocks'")
     # * Env-var fallback: recover IPC path if CLI arg was not parsed
     if _internal_child_mode and _internal_result_file is None:
         _env_path = os.environ.get("_ASKVLM_CHILD_RESULT_FILE")
@@ -1185,10 +2296,10 @@ def external_transcribe(  # noqa: PLR0913
                 dialog_blocks=dialog_blocks,
                 work_dir=work_dir,
                 stt_provider=provider,
-                before_close=lambda text: _write_json_atomic(
-                    _internal_result_file,
-                    {"status": "ok", "text": text},
-                ),
+                before_close=_child_result_writer(_internal_result_file),
+                output_format=output_format,
+                media_window=window,
+                decode_options=decode,
             )
             return
         except Exception as exc:
@@ -1218,10 +2329,17 @@ def external_transcribe(  # noqa: PLR0913
             diarization=diarization,
             dialog_blocks=dialog_blocks,
             work_dir=work_dir,
+            want_segments=output_format == OUTPUT_FORMAT_JSON,
+            decode=decode,
+            window=window,
         )
         _note_deprecated_daemon_workers(daemon_workers)
-        _run_external_transcribe_via_supervisor(
-            request, output_file=output_file, output_dir=output_dir, stdout=stdout
+        _run_via_supervisor(
+            request,
+            output_file=output_file,
+            output_dir=output_dir,
+            stdout=stdout,
+            result_format=_transcribe_result_format(output_format),
         )
         return
 
@@ -1236,19 +2354,16 @@ def external_transcribe(  # noqa: PLR0913
     output_dir_file = (
         None
         if output_dir is None
-        else _resolve_output_dir_files(input_paths, output_dir)[0]
+        else _resolve_output_dir_files(
+            input_paths,
+            output_dir,
+            extension=_transcribe_result_format(output_format).output_suffix,
+        )[0]
     )
-
-    # * Windows GPU child isolation covers CUDA-capable providers (Whisper and
-    # * gigaam-e2e-ctc); gigaam-ctc always runs in-process on CPU.
-    windows_non_cpu = (
-        provider_may_use_cuda(provider)
-        and sys.platform.startswith("win")
-        and device.lower() != "cpu"
-    )
-    if windows_non_cpu:
-        first_attempt = _run_external_transcribe_isolated_attempt(
+    _run_external_transcribe_no_daemon(
+        _LocalTranscribeJob(
             input_path=input_path,
+            provider=provider,
             whisper_model=whisper_model,
             language=language,
             device=device,
@@ -1256,59 +2371,232 @@ def external_transcribe(  # noqa: PLR0913
             diarization=diarization,
             dialog_blocks=dialog_blocks,
             work_dir=work_dir,
-            stt_provider=provider,
-        )
-        if first_attempt.success_text is not None:
-            _emit_external_transcribe_outputs(
-                text=first_attempt.success_text,
-                output_file=output_file,
-                stdout=stdout,
-                output_dir_file=output_dir_file,
-            )
-            return
-
-        if not _is_windows_crash_like_return_code(
-            first_attempt.return_code
-        ) and not _is_internal_child_ipc_error(first_attempt.stderr):
-            _raise_external_transcribe_error(first_attempt)
-
-        retry_attempt = _run_external_transcribe_isolated_attempt(
-            input_path=input_path,
-            whisper_model=whisper_model,
-            language=language,
-            device="cpu",
-            compute_type=compute_type,
-            diarization=diarization,
-            dialog_blocks=dialog_blocks,
-            work_dir=work_dir,
-            stt_provider=provider,
-        )
-        if retry_attempt.success_text is not None:
-            _emit_external_transcribe_outputs(
-                text=retry_attempt.success_text,
-                output_file=output_file,
-                stdout=stdout,
-                output_dir_file=output_dir_file,
-            )
-            return
-        _raise_external_transcribe_error(retry_attempt)
-
-    _run_external_transcribe_once(
-        input_path=input_path,
-        whisper_model=whisper_model,
-        language=language,
-        device=device,
-        compute_type=compute_type,
-        diarization=diarization,
-        dialog_blocks=dialog_blocks,
-        work_dir=work_dir,
-        stt_provider=provider,
-        before_close=lambda text: _emit_external_transcribe_outputs(
-            text=text,
-            output_file=output_file,
-            stdout=stdout,
-            output_dir_file=output_dir_file,
+            output_format=output_format,
+            window=window,
+            decode=decode,
         ),
+        output_file=output_file,
+        output_dir_file=output_dir_file,
+        stdout=stdout,
+    )
+
+
+@app.command("external-diarize")
+def external_diarize(  # noqa: PLR0913 - one argument per CLI option
+    input_paths: Annotated[
+        list[Path],
+        typer.Argument(
+            exists=True,
+            readable=True,
+            file_okay=True,
+            dir_okay=False,
+            help=(
+                "One or more audio or video files to diarize for an external "
+                "caller (--no-daemon accepts exactly one)."
+            ),
+        ),
+    ],
+    *,
+    num_speakers: Annotated[
+        int | None,
+        typer.Option(
+            "--num-speakers",
+            min=1,
+            help=(
+                "Exact number of speakers; by default the voices are clustered "
+                "by --threshold."
+            ),
+        ),
+    ] = None,
+    threshold: Annotated[
+        float,
+        typer.Option(
+            "--threshold",
+            help=(
+                "Clustering distance threshold (> 0) used without --num-speakers; "
+                "a larger value merges more voices."
+            ),
+        ),
+    ] = DIARIZE_DEFAULT_THRESHOLD,
+    min_on: Annotated[
+        float,
+        typer.Option("--min-on", help="Shortest kept speaker turn in seconds (>= 0)."),
+    ] = DIARIZE_DEFAULT_MIN_DURATION_ON,
+    min_off: Annotated[
+        float,
+        typer.Option(
+            "--min-off",
+            help=(
+                "Shortest pause in seconds (>= 0) that splits two turns of one speaker."
+            ),
+        ),
+    ] = DIARIZE_DEFAULT_MIN_DURATION_OFF,
+    start: Annotated[
+        float,
+        typer.Option(
+            "--start",
+            help=(
+                "Diarize from this many seconds after the media start (default: "
+                "0). Turn times stay relative to the media start."
+            ),
+        ),
+    ] = 0.0,
+    duration: Annotated[
+        float | None,
+        typer.Option(
+            "--duration",
+            help=(
+                "Diarize at most this many seconds from --start (at least 0.001; "
+                "default: to the end)."
+            ),
+        ),
+    ] = None,
+    device: Annotated[
+        str,
+        typer.Option(
+            "--device",
+            help=(
+                "auto|cpu: speaker diarization runs on the CPU only (auto means "
+                "cpu); cuda is an error."
+            ),
+        ),
+    ] = "auto",
+    priority: Annotated[
+        str,
+        typer.Option(
+            "--priority",
+            callback=_priority_callback,
+            help=(
+                "Supervisor mode: priority class of this call: high, normal or "
+                "low. Ignored with --no-daemon."
+            ),
+        ),
+    ] = "normal",
+    max_parallel: Annotated[
+        int | None,
+        typer.Option(
+            "--max-parallel",
+            min=1,
+            max=MAX_PARALLEL_LIMIT,
+            help=(
+                "Supervisor mode: run at most N inputs of this call at once. By "
+                "default the supervisor decides. Ignored with --no-daemon."
+            ),
+        ),
+    ] = None,
+    client_timeout: Annotated[
+        float,
+        typer.Option(
+            "--client-timeout",
+            min=1.0,
+            callback=_client_timeout_callback,
+            help=(
+                "Supervisor mode: seconds for the whole call, queue wait "
+                "included; unfinished inputs are then cancelled and reported as "
+                "timeouts. inf waits without a deadline."
+            ),
+        ),
+    ] = 300.0,
+    output_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-file",
+            "-o",
+            help=(
+                "Optional file that receives the same document as stdout; with "
+                "several inputs JSON Lines of the documents in input order (null "
+                "for a failed input)."
+            ),
+        ),
+    ] = None,
+    output_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--output-dir",
+            file_okay=False,
+            dir_okay=True,
+            help=(
+                "Optional directory that receives <stem>.json for every "
+                "successful input; repeated stems get -2, -3, ... suffixes."
+            ),
+        ),
+    ] = None,
+    stdout: Annotated[
+        bool,
+        typer.Option(
+            "--stdout/--no-stdout",
+            help=(
+                "Write only the JSON document to stdout; with several inputs, one "
+                "JSON line per input in input order. Enabled by default."
+            ),
+        ),
+    ] = True,
+    no_daemon: Annotated[
+        bool,
+        typer.Option(
+            "--no-daemon/--daemon",
+            help=(
+                "Diarize one input in this process instead of routing the request "
+                "through the shared supervisor."
+            ),
+        ),
+    ] = False,
+) -> None:
+    """Find who speaks when (CPU speaker diarization) for external applications.
+
+    One input prints its document {media, turns} with turns {start, end,
+    speaker} in seconds from the media start and speakers speaker_00,
+    speaker_01, ... in order of first appearance (no turns is a success).
+    Several inputs print one JSON line per input {index, input, status, error,
+    result}. Exit codes: 0 success, 1 failure, 2 usage error, 10 client
+    timeout, 11 supervisor unavailable.
+    """
+    if not stdout and output_file is None and output_dir is None:
+        msg = "Either keep --stdout enabled or provide --output-file or --output-dir."
+        raise typer.BadParameter(msg)
+    options = _diarize_options(
+        num_speakers=num_speakers, threshold=threshold, min_on=min_on, min_off=min_off
+    )
+    window = _media_window(start, duration)
+    device_request = _diarize_device(device)
+    if no_daemon:
+        if len(input_paths) != 1:
+            msg = (
+                "--no-daemon accepts exactly one input; drop --no-daemon to "
+                "diarize several inputs through the supervisor."
+            )
+            raise typer.BadParameter(msg)
+        # * --priority, --max-parallel and --client-timeout only shape
+        # * supervisor scheduling.
+        _run_external_diarize_no_daemon(
+            input_paths[0],
+            options,
+            window=window,
+            output_file=output_file,
+            output_dir=output_dir,
+            stdout=stdout,
+        )
+        return
+    request = ClientRequest(
+        inputs=tuple(input_paths),
+        provider=STT_PROVIDER_WHISPER,
+        whisper_model=_EXTERNAL_DEFAULT_WHISPER_MODEL,
+        compute_type=_EXTERNAL_DEFAULT_COMPUTE_TYPE,
+        device=device_request,
+        language=None,
+        priority=normalize_priority(priority),
+        max_parallel=max_parallel,
+        client_timeout_s=client_timeout,
+        mode=MODE_DIARIZE,
+        window=window,
+        diarization=options,
+    )
+    _run_via_supervisor(
+        request,
+        output_file=output_file,
+        output_dir=output_dir,
+        stdout=stdout,
+        result_format=_DIARIZATION_DOCUMENTS,
     )
 
 

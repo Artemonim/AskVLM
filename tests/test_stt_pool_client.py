@@ -2,27 +2,38 @@
 
 from __future__ import annotations
 
+import errno
+import json
 import math
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from itertools import pairwise
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
+from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool.client import run_client, spawn_supervisor
-from core.stt_pool.queue import SupervisorLock, read_heartbeat, write_heartbeat
+from core.stt_pool.queue import (
+    ResultRecord,
+    SupervisorLock,
+    is_cancel_requested,
+    read_heartbeat,
+    write_heartbeat,
+    write_result,
+)
 from core.stt_pool.supervisor import run_supervisor
 from tests.stt_pool_client_support import ClientHarness, PolicyClock
 from tests.stt_pool_supervisor_support import configuration
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-    from pathlib import Path
+    from collections.abc import Callable, Iterator, Mapping
 
     from core.stt_pool.client import InputOutcome
-    from core.stt_pool.queue import QueuePaths
+    from core.stt_pool.queue import QueuePaths, ResultStatus
     from core.temp_gc import TempGcSummary
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group(name="pool_supervisor")]
@@ -57,6 +68,7 @@ def test_run_client_transcribe_result_from_real_worker(
         assert "Too long wav file" in (outcome.detail or "")
         assert "transcribe_longform" in (outcome.detail or "")
     assert reported == [outcome]
+    assert outcome.data is None
     assert not tuple(client.pool.paths.results.glob("*.json"))
     assert len(client.pool.events("submitted")) == 1
     client.pool.until(
@@ -449,3 +461,474 @@ def test_client_respawns_after_idle_exit_with_lock_still_held(
     assert result.outcomes[0].text == "second"
     assert codes == [0, 0]
     assert len(client.pool.events("submitted")) == 2
+
+
+def _result_peer(
+    client: ClientHarness, templates: Mapping[str, ResultRecord]
+) -> Callable[[QueuePaths], None]:
+    """Substitute an external daemon at its real on-disk result boundary."""
+
+    def publish(paths: QueuePaths) -> None:
+        write_heartbeat(paths, {"state": "running"})
+        for job in client.jobs():
+            template = templates.get(job.kind)
+            if template is not None:
+                write_result(paths, replace(template, job_id=job.job_id))
+
+    return publish
+
+
+@pytest.mark.parametrize(
+    ("turns", "expected_speakers", "labelled"),
+    [
+        (
+            [
+                {"start": 10.0, "end": 13.0, "speaker": "speaker_00"},
+                {"start": 100.0, "end": 101.0, "speaker": "speaker_01"},
+            ],
+            ["speaker_00", "speaker_00", None, None],
+            False,
+        ),
+        (
+            [
+                {"start": 10.0, "end": 11.0, "speaker": "speaker_00"},
+                {"start": 12.0, "end": 13.0, "speaker": "speaker_01"},
+                {"start": 14.0, "end": 15.0, "speaker": "speaker_01"},
+            ],
+            ["speaker_00", "speaker_01", None, None],
+            True,
+        ),
+        ([], [None, None, None, None], False),
+    ],
+)
+def test_client_merges_real_worker_parts_by_segment_without_changing_one_voice_text(
+    client: ClientHarness,
+    turns: list[dict[str, object]],
+    expected_speakers: list[str | None],
+    *,
+    labelled: bool,
+) -> None:
+    """Catch labels based on unassigned voices, dropped nulls or lost text/turns across IPC."""
+    plain_text = "  original\nformatting stays\t intact  "
+    segments = [
+        {"start": 10.0, "end": 11.0, "text": "first"},
+        {"start": 12.0, "end": 13.0, "text": "second"},
+        {"start": 14.0, "end": 14.0, "text": "instant"},
+        {"start": 16.0, "end": 17.0, "text": "unassigned"},
+    ]
+    media = client.media(
+        stt={"text": plain_text, "data": {"segments": segments}},
+        diarize={"data": {"turns": turns}},
+    )
+    reported: list[InputOutcome] = []
+    result = client.run(
+        client.request(media, diarization=DiarizeOptions()), on_outcome=reported.append
+    ).outcomes[0]
+    assert result.status == "ok"
+    assert result.backend == "cpu"
+    assert result.data == {
+        "segments": segments,
+        "turns": turns,
+        "speakers": expected_speakers,
+    }
+    if labelled:
+        assert result.text.splitlines() == [
+            "speaker_00: first",
+            "speaker_01: second",
+            "instant",
+            "unassigned",
+        ]
+    else:
+        assert result.text == plain_text.strip()
+    assert reported == [result]
+    events = client.pool.events("submitted")
+    assert {event["kind"] for event in events} == {"stt", "diarize"}
+    assert len({event["call_id"] for event in events}) == 1
+    assert all(event["want_segments"] for event in events if event["kind"] == "stt")
+
+
+@pytest.mark.parametrize("mode", ["transcribe", "diarize"])
+def test_empty_transcript_and_zero_turn_diarization_keep_structured_success(
+    client: ClientHarness, mode: str
+) -> None:
+    """Catch empty text discarding data or a zero-turn diarize job becoming empty/error."""
+    media = client.media(
+        stt={"mode": "empty", "data": {"segments": []}},
+        diarize={"data": {"turns": []}},
+    )
+    result = client.run(
+        client.request(media, mode=mode, language=None, diarization=DiarizeOptions())
+    ).outcomes[0]
+    assert result.text == ""
+    assert result.status == ("empty" if mode == "transcribe" else "ok")
+    assert result.data == (
+        {"segments": [], "turns": [], "speakers": []}
+        if mode == "transcribe"
+        else {"turns": []}
+    )
+
+
+def test_structured_transcribe_without_diarization_returns_only_segments(
+    client: ClientHarness,
+) -> None:
+    """Catch want_segments failing to reach the worker or requiring a diarization sibling."""
+    segments = [{"start": 0.125, "end": 0.875, "text": "spoken"}]
+    media = client.media(data={"segments": segments}, text="spoken")
+    result = client.run(client.request(media, want_segments=True)).outcomes[0]
+    assert result.status == "ok"
+    assert result.text == "spoken"
+    assert result.data == {"segments": segments}
+    assert len(client.pool.events("submitted")) == 1
+    assert client.pool.events("submitted")[0]["want_segments"] is True
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_paired_jobs_share_call_order_options_deadline_and_parallel_cap(
+    client: ClientHarness, device: str
+) -> None:
+    """Catch each part receiving its own call cap, reset deadline or wrong media/options."""
+    client.pool.config = configuration(
+        cpu={"max_slots": 2, "max_slots_per_worker": 2},
+        gpu={"max_workers": 1 if device == "cuda" else 0},
+    )
+    client.pool.hardware.gpu_available = device == "cuda"
+    media = client.media(
+        stt={"mode": "hold", "text": "retained", "data": {"segments": []}},
+        diarize={"mode": "hold", "data": {"turns": []}},
+    )
+    snapshot = []
+    request = client.request(
+        media,
+        media,
+        device=device,
+        max_parallel=1,
+        priority="high",
+        window=MediaWindow(3.25, 2.5),
+        decode=WhisperDecodeOptions(vad_filter=False),
+        diarization=DiarizeOptions(num_speakers=2, threshold=0.7),
+    )
+
+    def release() -> None:
+        jobs = client.pool.until(client.jobs, lambda jobs: len(jobs) == 4)
+        jobs.sort(key=lambda job: job.submitted_at)
+        snapshot.extend(jobs)
+        client.pool.heartbeat(
+            lambda value: value["queue"] == {"running": 1, "pending": 3}
+        )
+        for job in jobs:
+            client.pool.release(job)
+
+    client.background(release)
+    result = client.run(request, probe_duration=lambda _path, _timeout: 8.0)
+    assert [outcome.text for outcome in result.outcomes] == ["retained", "retained"]
+    assert [job.call_index for job in snapshot] == [0, 0, 1, 1]
+    assert [job.kind for job in snapshot] == ["stt", "diarize", "stt", "diarize"]
+    assert len({job.job_id for job in snapshot}) == 4
+    assert len({job.call_id for job in snapshot}) == 1
+    assert len({job.deadline_at for job in snapshot}) == 1
+    assert all(a.submitted_at < b.submitted_at for a, b in pairwise(snapshot))
+    assert all(
+        job.duration_s == 2.5 and job.window == request.window for job in snapshot
+    )
+    assert all(job.max_parallel == 1 and job.priority == "high" for job in snapshot)
+    assert {job.request.device for job in snapshot if job.kind == "stt"} == {device}
+    assert {job.request.device for job in snapshot if job.kind == "diarize"} == {"cpu"}
+    events = client.pool.events("submitted")
+    stt_events = [event for event in events if event["kind"] == "stt"]
+    diarize_events = [event for event in events if event["kind"] == "diarize"]
+    assert all(event["decode"] == {"vad_filter": False} for event in stt_events)
+    assert all(event["diarize"] is None for event in stt_events)
+    assert all(event["diarize"]["num_speakers"] == 2 for event in diarize_events)
+    assert all(
+        event["language"] is None and not event["decode"] for event in diarize_events
+    )
+
+
+@pytest.mark.parametrize("failed_kind", ["stt", "diarize"])
+@pytest.mark.parametrize(
+    ("status", "expected"),
+    [("error", "error"), ("expired", "timeout"), ("unavailable", "unavailable")],
+)
+def test_one_failed_part_finishes_input_once_and_cancels_sibling(
+    client: ClientHarness, failed_kind: str, status: ResultStatus, expected: str
+) -> None:
+    """Catch waiting for a doomed sibling, repeated callbacks or unattributed diarize failures."""
+    peer = _result_peer(
+        client, {failed_kind: ResultRecord("", status, error_detail="part failure")}
+    )
+    reported: list[InputOutcome] = []
+    clock = PolicyClock()
+    result = client.run(
+        client.request(client.media(), diarization=DiarizeOptions()),
+        spawn=peer,
+        clock=clock,
+        sleeper=clock.sleep,
+        on_outcome=reported.append,
+    ).outcomes[0]
+    assert result.status == expected
+    assert result.data is None
+    assert result.text == ""
+    assert "part failure" in (result.detail or "")
+    assert ("speaker diarization" in (result.detail or "")) == (
+        failed_kind == "diarize"
+    )
+    assert reported == [result]
+    jobs = client.jobs()
+    assert {
+        job.kind for job in jobs if is_cancel_requested(client.pool.paths, job.job_id)
+    } == ({"diarize"} if failed_kind == "stt" else {"stt"})
+    assert not list(client.pool.paths.results.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("stt_status", "diarize_status", "expected", "source"),
+    [
+        ("error", "unavailable", "unavailable", "diarize"),
+        ("unavailable", "error", "unavailable", "stt"),
+        ("expired", "unavailable", "timeout", "stt"),
+        ("unavailable", "expired", "timeout", "diarize"),
+        ("expired", "error", "timeout", "stt"),
+        ("error", "expired", "timeout", "diarize"),
+    ],
+)
+def test_simultaneous_part_failures_choose_timeout_then_unavailable_then_error(
+    client: ClientHarness,
+    stt_status: ResultStatus,
+    diarize_status: ResultStatus,
+    expected: str,
+    source: str,
+) -> None:
+    """Catch filesystem/job iteration order replacing the most significant ready failure."""
+    peer = _result_peer(
+        client,
+        {
+            "stt": ResultRecord("", stt_status, error_detail="stt detail"),
+            "diarize": ResultRecord("", diarize_status, error_detail="diarize detail"),
+        },
+    )
+    clock = PolicyClock()
+    result = client.run(
+        client.request(client.media(), diarization=DiarizeOptions()),
+        spawn=peer,
+        clock=clock,
+        sleeper=clock.sleep,
+    ).outcomes[0]
+    assert result.status == expected
+    assert f"{source} detail" in (result.detail or "")
+    assert ("speaker diarization" in (result.detail or "")) == (source == "diarize")
+
+
+@pytest.mark.parametrize("stt_finished", [False, True])
+def test_paired_call_deadline_cancels_all_remaining_parts(
+    client: ClientHarness, *, stt_finished: bool
+) -> None:
+    """Catch a call timing out only its primary job or forgetting an already completed part."""
+    peer = _result_peer(
+        client,
+        {"stt": ResultRecord("", "ok", text="partial", data={"segments": []})}
+        if stt_finished
+        else {},
+    )
+    clock = PolicyClock()
+    reported: list[InputOutcome] = []
+    result = client.run(
+        client.request(
+            client.media(), diarization=DiarizeOptions(), client_timeout_s=5
+        ),
+        spawn=peer,
+        clock=clock,
+        sleeper=clock.sleep,
+        poll_interval_s=1,
+        on_outcome=reported.append,
+    ).outcomes[0]
+    assert clock() == 1005
+    assert result.status == "timeout"
+    assert result.text == ""
+    assert result.data is None
+    assert reported == [result]
+    jobs = client.jobs()
+    assert len(jobs) == 2
+    assert {job.deadline_at for job in jobs} == {1005}
+    assert {
+        job.kind for job in jobs if is_cancel_requested(client.pool.paths, job.job_id)
+    } == ({"diarize"} if stt_finished else {"stt", "diarize"})
+
+
+def test_second_job_disk_failure_cancels_the_published_first_job(
+    client: ClientHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch partial two-job submission leaking STT work or reporting a false successful input."""
+    real_replace = os.replace
+
+    def replace_file(source: str | Path, destination: str | Path) -> None:
+        target = Path(destination)
+        if target.parent == client.pool.paths.incoming:
+            payload = json.loads(Path(source).read_text(encoding="utf-8"))
+            if payload["kind"] == "diarize":
+                raise OSError(errno.ENOSPC, "fixture disk full", str(target))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace_file)
+    reported: list[InputOutcome] = []
+    outcome = client.run(
+        client.request(client.media(), diarization=DiarizeOptions()),
+        on_outcome=reported.append,
+    ).outcomes[0]
+    assert outcome.status == "unavailable"
+    assert "speaker diarization" in (outcome.detail or "")
+    jobs = client.jobs()
+    assert len(jobs) == 1
+    assert jobs[0].kind == "stt"
+    assert is_cancel_requested(client.pool.paths, jobs[0].job_id)
+    assert client.spawned == 0
+    assert reported == [outcome]
+
+
+@pytest.mark.parametrize(
+    ("window", "media_s", "expected"),
+    [
+        (MediaWindow(10.25, 100.0), 60.0, 49.75),
+        (MediaWindow(10.25), 60.0, 49.75),
+        (MediaWindow(0.0, 5.5), 60.0, 5.5),
+        (MediaWindow(10.25, 2.5), None, 2.5),
+        (MediaWindow(10.25), None, None),
+    ],
+)
+def test_client_window_durations_apply_to_both_parts_before_submission(
+    client: ClientHarness,
+    window: MediaWindow,
+    media_s: float | None,
+    expected: float | None,
+) -> None:
+    """Catch full-media ETA reservations for cut jobs or different windows for sibling engines."""
+    peer = _result_peer(
+        client,
+        {
+            "stt": ResultRecord("", "empty", data={"segments": []}),
+            "diarize": ResultRecord("", "ok", data={"turns": []}),
+        },
+    )
+    result = client.run(
+        client.request(client.media(), window=window, diarization=DiarizeOptions()),
+        spawn=peer,
+        probe_duration=lambda _path, _timeout: media_s,
+    ).outcomes[0]
+    assert result.status == "empty"
+    jobs = client.jobs()
+    assert len(jobs) == 2
+    assert all(job.duration_s == expected and job.window == window for job in jobs)
+
+
+@pytest.mark.parametrize("start", [60.0, 61.0])
+def test_window_at_or_beyond_end_fails_before_any_part_is_written(
+    client: ClientHarness, start: float
+) -> None:
+    """Catch empty off-media windows consuming pool capacity or publishing only one sibling."""
+    reported: list[InputOutcome] = []
+    outcome = client.run(
+        client.request(
+            client.media(), window=MediaWindow(start, 1.0), diarization=DiarizeOptions()
+        ),
+        probe_duration=lambda _path, _timeout: 60.0,
+        on_outcome=reported.append,
+    ).outcomes[0]
+    assert outcome.status == "error"
+    assert reported == [outcome]
+    assert not client.jobs()
+    assert client.spawned == 0
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"mode": "invalid"},
+        {"mode": "diarize", "language": "en"},
+        {"mode": "diarize", "language": None, "want_segments": True},
+        {
+            "mode": "diarize",
+            "language": None,
+            "decode": WhisperDecodeOptions(vad_filter=False),
+        },
+        {"mode": "diarize", "language": None, "device": "cuda"},
+        {"provider": "gigaam-ctc", "decode": WhisperDecodeOptions(beam_size=10)},
+        {
+            "provider": "gigaam-e2e-ctc",
+            "decode": WhisperDecodeOptions(word_timestamps=False),
+        },
+    ],
+)
+def test_invalid_option_combinations_raise_without_queue_side_effects(
+    client: ClientHarness, overrides: dict[str, object]
+) -> None:
+    """Catch incompatible options running expensive jobs with silently ignored settings."""
+    with pytest.raises(ValueError):  # noqa: PT011 - validation type and zero side effects are the contract
+        client.run(client.request(client.media(), **overrides))
+    assert not client.jobs()
+    assert client.spawned == 0
+
+
+@pytest.mark.parametrize(
+    ("bad_kind", "data"),
+    [("stt", None), ("stt", {"segments": ["invalid"]}), ("diarize", {"turns": {}})],
+)
+def test_malformed_success_payload_is_an_explicit_input_error(
+    client: ClientHarness, bad_kind: str, data: dict[str, object] | None
+) -> None:
+    """Catch a broken daemon payload being silently emitted as a complete transcript."""
+    templates = {
+        "stt": ResultRecord("", "ok", text="recognized", data={"segments": []}),
+        "diarize": ResultRecord("", "ok", data={"turns": []}),
+    }
+    templates[bad_kind] = replace(templates[bad_kind], data=data)
+    result = client.run(
+        client.request(client.media(), diarization=DiarizeOptions()),
+        spawn=_result_peer(client, templates),
+    ).outcomes[0]
+    assert result.status == "error"
+    assert result.text == ""
+    assert result.data is None
+    assert ("segments" if bad_kind == "stt" else "turns") in (result.detail or "")
+
+
+def test_one_failed_input_cancels_only_its_sibling_and_preserves_other_input(
+    client: ClientHarness,
+) -> None:
+    """Catch a failed input cancelling another input or mixing sibling results in a batch."""
+    segments = [{"start": 1.0, "end": 2.0, "text": "second input"}]
+
+    def publish(paths: QueuePaths) -> None:
+        write_heartbeat(paths, {"state": "running"})
+        for job in client.jobs():
+            if job.call_index == 0:
+                if job.kind == "stt":
+                    write_result(paths, ResultRecord(job.job_id, "error"))
+                continue
+            write_result(
+                paths,
+                ResultRecord(
+                    job.job_id,
+                    "ok",
+                    text="second input" if job.kind == "stt" else "",
+                    data={"segments": segments} if job.kind == "stt" else {"turns": []},
+                ),
+            )
+
+    reported: list[InputOutcome] = []
+    result = client.run(
+        client.request(client.media(), client.media(), diarization=DiarizeOptions()),
+        spawn=publish,
+        on_outcome=reported.append,
+    )
+    assert [outcome.status for outcome in result.outcomes] == ["error", "ok"]
+    assert result.outcomes[1].text == "second input"
+    assert result.outcomes[1].data == {
+        "segments": segments,
+        "turns": [],
+        "speakers": [None],
+    }
+    assert sorted(outcome.index for outcome in reported) == [0, 1]
+    assert {
+        (job.call_index, job.kind)
+        for job in client.jobs()
+        if is_cancel_requested(client.pool.paths, job.job_id)
+    } == {(0, "diarize")}

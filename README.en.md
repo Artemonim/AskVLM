@@ -116,7 +116,16 @@ Prints plain transcript text to stdout. Designed as a machine-friendly endpoint 
 - Several inputs per call return JSON Lines in input order (`--output-dir`, `--max-parallel`); `--priority high|normal|low` orders the queue, with turns between calls.
 - Legacy `--no-daemon`: the model loads in the command's own process and unloads before exit; on Windows a crashing GPU child (OOM) is retried on CPU in an isolated subprocess (Whisper and `gigaam-e2e-ctc`). `gigaam-ctc` does not use CUDA, CUDA fallbacks, or Windows GPU isolation.
 - Optional file output: `--output-file transcript.txt`.
-- Diarization is off by default (saves VRAM).
+- `--format json`: one document per input in the format of the hardsub skill's `transcribe.py` (segments with words, `no_speech_prob`, `avg_logprob`); Whisper options `--beam-size`, `--vad/--no-vad`, `--condition-on-previous-text/...`, `--word-timestamps/...` (an error with GigaAM) and a `--start`/`--duration` window.
+- `--diarization` (off by default): CPU diarization with sherpa-onnx (pyannote segmentation 3.0 + WeSpeaker ResNet34-LM, no token, no GPU) through the supervisor and with `--no-daemon`; labels `speaker_00`, `speaker_01`, …; with one voice the text stays unprefixed.
+
+### `external-diarize` — who speaks when
+
+```bash
+python cli.py external-diarize PATH_TO_MEDIA [--num-speakers N] [--threshold 0.5]
+```
+
+Prints JSON `{"media", "turns": [{"start", "end", "speaker"}]}` in the format of the hardsub skill's `diarize.py`; several inputs give JSON Lines. CPU only; the models (~33 MB) are downloaded on first use with SHA-256 checks into `.cache/models/sherpa-diarization/`.
 
 See [doc/EXTERNAL_CLI_TRANSCRIBER.md](doc/EXTERNAL_CLI_TRANSCRIBER.md) for detailed integration instructions.
 

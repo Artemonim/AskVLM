@@ -37,21 +37,30 @@ from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
-from core.stt_pool import ipc
+from core.stt_pool import fsio, ipc
 from core.stt_pool.config import config_summary, project_root
 from core.stt_pool.engine_api import (
     DEFAULT_ENGINE_FACTORY,
     ERROR_KIND_CUDA_OOM,
     ERROR_KIND_MEMORY_LIMIT,
+    ERROR_KIND_RESULT_TOO_LARGE,
     EngineResult,
     LoadInfo,
     WorkerSpec,
+    job_message_fields,
 )
 from core.stt_pool.estimates import EstimateStore
-from core.stt_pool.keys import device_for_backend, make_key, provider_family
+from core.stt_pool.keys import (
+    device_for_backend,
+    make_key,
+    provider_family,
+    worker_kind,
+)
 from core.stt_pool.procs import WorkerProcess, WorkerSpawnError, default_worker_launch
 from core.stt_pool.queue import (
     ERROR_KIND_INPUT_INVALID,
+    JOB_KIND_DIARIZE,
+    MAX_RESULT_BYTES,
     JobRecord,
     JobValidationError,
     QueuePaths,
@@ -84,6 +93,7 @@ from core.stt_pool.scheduler import (
     WorkerView,
     plan,
     service_seconds,
+    threads_for,
 )
 from core.stt_pool.sysprobe import (
     find_nvidia_smi,
@@ -530,13 +540,17 @@ class _Fatal:
 
 @dataclass(frozen=True, slots=True)
 class _Outcome:
-    """Terminal outcome of a job before it becomes a result record."""
+    """Terminal outcome of a job before it becomes a result record.
+
+    ``data`` is the structured payload of an ``ok``/``empty`` outcome.
+    """
 
     status: ResultStatus
     text: str = ""
     error_kind: str | None = None
     error_detail: str | None = None
     run_s: float = 0.0
+    data: Mapping[str, object] | None = None
 
 
 @dataclass(slots=True, eq=False)
@@ -653,6 +667,125 @@ def _int_or_none(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int):
         return None
     return value
+
+
+def _readable_result(record: ResultRecord) -> ResultRecord:
+    """Return *record*, or an explicit error when clients could not read it.
+
+    A result document larger than the result-file read limit
+    (:data:`~core.stt_pool.queue.MAX_RESULT_BYTES`) would never be read by the
+    client, which would wait until its deadline. Such a result becomes an
+    ``error`` of kind ``result_too_large`` (without text and data) instead.
+
+    Args:
+        record: Result about to be written.
+
+    Returns:
+        *record* when it fits the limit, otherwise its error replacement.
+
+    """
+    size = len(fsio.dumps_json_bytes(record.to_dict()))
+    if size <= MAX_RESULT_BYTES:
+        return record
+    detail = (
+        f"the {record.status} result is {size} bytes, over the result file "
+        f"limit of {MAX_RESULT_BYTES} bytes"
+    )
+    logger.error(
+        "result too large; publishing an error instead: job_id=%s status=%s "
+        "size_bytes=%d limit_bytes=%d",
+        record.job_id,
+        record.status,
+        size,
+        MAX_RESULT_BYTES,
+    )
+    return replace(
+        record,
+        status="error",
+        text="",
+        data=None,
+        error_kind=ERROR_KIND_RESULT_TOO_LARGE,
+        error_detail=detail,
+    )
+
+
+def _missing_payload(record: JobRecord, result: EngineResult) -> str | None:
+    """Describe the structured payload that a successful result lacks.
+
+    A ``diarize`` job needs ``data.turns`` and an ``stt`` job that asked for
+    segments needs ``data.segments``, each a JSON list; an empty list is a
+    valid answer (no speech found, no segments).
+
+    Args:
+        record: Job the result answers.
+        result: Worker result of the job's current attempt.
+
+    Returns:
+        A description of the missing payload, or ``None`` when the result is
+        not ``ok``/``empty`` or carries what the job asked for.
+
+    """
+    if result.status not in {"ok", "empty"}:
+        return None
+    if record.kind == JOB_KIND_DIARIZE:
+        name = "turns"
+    elif record.want_segments:
+        name = "segments"
+    else:
+        return None
+    data = result.data
+    if data is None:
+        found = "the result has no data"
+    elif name not in data:
+        found = f"data has no {name!r} entry"
+    elif isinstance(data[name], list):
+        return None
+    else:
+        found = f"data[{name!r}] is a {type(data[name]).__name__}"
+    return (
+        f"{record.kind} job result ({result.status}) lacks the requested "
+        f"{name!r} list ({found})"
+    )
+
+
+def _with_requested_payload(
+    record: JobRecord, worker: _Worker, result: EngineResult
+) -> EngineResult:
+    """Return *result*, or a ``protocol_error`` when it lacks its payload.
+
+    A success without the structured payload its job asked for would reach
+    the client as a silent drop of the segments or turns, so it is published
+    as an explicit error instead (see :func:`_missing_payload`).
+
+    Args:
+        record: Job the result answers.
+        worker: Worker that sent the result.
+        result: Worker result of the job's current attempt.
+
+    Returns:
+        *result*, or its ``error`` replacement without text and data.
+
+    """
+    problem = _missing_payload(record, result)
+    if problem is None:
+        return result
+    logger.error(
+        "result lacks its requested payload; publishing %s instead: job_id=%s "
+        "worker_id=%s key=%s detail=%s",
+        ERROR_KIND_PROTOCOL_ERROR,
+        result.job_id,
+        worker.worker_id,
+        worker.key.label,
+        problem,
+    )
+    return replace(
+        result,
+        status="error",
+        text="",
+        error_kind=ERROR_KIND_PROTOCOL_ERROR,
+        error_detail=problem,
+        data=None,
+    )
 
 
 # * The supervisor.
@@ -1039,7 +1172,9 @@ class _Supervisor:
         }:
             self._on_resource_error(job, worker, result, now)
         else:
-            if result.status in {"ok", "empty"}:
+            result = _with_requested_payload(job.record, worker, result)
+            succeeded = result.status in {"ok", "empty"}
+            if succeeded:
                 self._observe(job, worker, result)
                 self._book(worker.key).crash_level = 0
             outcome = _Outcome(
@@ -1048,6 +1183,7 @@ class _Supervisor:
                 error_kind=result.error_kind,
                 error_detail=result.error_detail,
                 run_s=result.run_s,
+                data=result.data if succeeded else None,
             )
             self._publish(job, outcome, worker=worker, now=now)
 
@@ -1207,9 +1343,10 @@ class _Supervisor:
             attempts=job.attempts,
             finished_at=now,
             timings={"queued_s": queued_s, "run_s": max(0.0, outcome.run_s)},
+            data=None if outcome.data is None else dict(outcome.data),
         )
         self._write_terminal(
-            record,
+            _readable_result(record),
             key_label=worker.key.label if worker else None,
             now=now,
             deadline_at=job.record.deadline_at,
@@ -1523,11 +1660,12 @@ class _Supervisor:
                 self._cuda_waiting.add(record.job_id)
         self._jobs[record.job_id] = job
         logger.info(
-            "job admitted: job_id=%s call_id=%s seq=%d provider=%s model=%s "
+            "job admitted: job_id=%s call_id=%s seq=%d kind=%s provider=%s model=%s "
             "device=%s priority=%s duration_s=%s attempts=%d",
             record.job_id,
             record.call_id,
             self._seq,
+            record.kind,
             request.provider,
             request.whisper_model,
             request.device,
@@ -1811,6 +1949,13 @@ class _Supervisor:
             "priority": record.priority,
             "call_id": record.call_id,
             "seq": job.pending.seq,
+            **job_message_fields(
+                kind=record.kind,
+                want_segments=record.want_segments,
+                decode=record.decode,
+                window=record.window,
+                diarize=record.diarize,
+            ),
         }
         if not worker.proc.send(message):
             logger.warning(
@@ -1865,7 +2010,7 @@ class _Supervisor:
             instance_id=self._instance_id,
             key=key,
             capacity=action.capacity,
-            threads_per_slot=self._config.cpu.threads_per_slot,
+            threads_per_slot=threads_for(key, self._limits),
             host_threads=action.reservation.host_threads,
             device=device_for_backend(key.backend),
             options=self._spec_options(key, action.capacity),
@@ -1949,8 +2094,17 @@ class _Supervisor:
         A GPU worker batches as many lanes as the capacity it was granted: its
         VRAM and commit reservation is sized for that capacity, which can be
         below the configured lanes when the budgets are tight. CPU engines run
-        ``capacity`` slots and take no lane count.
+        ``capacity`` slots and take no lane count. A speaker diarization
+        worker gets no speech-to-text options: only its compute type, the
+        threads of its slot (``diarization.threads_per_slot``, the same value
+        as the spec's ``threads_per_slot``) and the priority aging.
         """
+        if worker_kind(key.provider) == "diarize":
+            return {
+                "compute_type": key.compute_type,
+                "threads_per_slot": threads_for(key, self._limits),
+                "priority_aging_s": self._config.scheduling.priority_aging_s,
+            }
         family = provider_family(key.provider)
         return {
             "whisper_model": key.model if family == "whisper" else None,
@@ -1961,11 +2115,15 @@ class _Supervisor:
         }
 
     def _thread_env(self, key: WorkerKey, reservation: Reservation) -> dict[str, str]:
-        """Return the BLAS/OpenMP thread caps of a worker process."""
+        """Return the BLAS/OpenMP thread caps of a worker process.
+
+        GPU workers get their reserved host threads; CPU workers the threads of
+        one slot of their key (:func:`~core.stt_pool.scheduler.threads_for`).
+        """
         if key.backend == "gpu":
             threads = max(1, reservation.host_threads)
         else:
-            threads = max(1, self._config.cpu.threads_per_slot)
+            threads = max(1, threads_for(key, self._limits))
         return dict.fromkeys(_THREAD_ENV_VARS, str(threads))
 
     def _launch(self, key: WorkerKey, env: Mapping[str, str]) -> WorkerLaunch:

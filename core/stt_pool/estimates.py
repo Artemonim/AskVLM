@@ -1,7 +1,8 @@
 """Seed and learned estimates of STT worker configurations (spec section 7.7).
 
 The seed table comes from the committed concurrency benchmark
-(``doc/STT_CONCURRENCY_BENCHMARK.en.md``). :class:`EstimateStore` refines it per
+(``doc/STT_CONCURRENCY_BENCHMARK.en.md``); its speaker diarization row is a
+conservative estimate from single runs. :class:`EstimateStore` refines it per
 worker key with what the supervisor observes:
 
 * time: ``service_correction`` is an exponential moving average (alpha 0.2) of
@@ -28,7 +29,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
 
 from core.stt_pool import fsio
-from core.stt_pool.keys import WorkerKey
+from core.stt_pool.keys import DIARIZE_PROVIDER, WorkerKey
 from core.stt_pool.scheduler import KeyEstimate
 
 if TYPE_CHECKING:
@@ -70,12 +71,26 @@ class _Seed:
 
 
 # * Seed table of spec 7.7; Whisper rows describe ``small`` (int8 CPU, fp16 GPU).
+# * The speaker diarization row (sherpa-onnx 1.13.8 on CPU: pyannote
+# * segmentation 3.0 + WeSpeaker ResNet34-LM, ~32 MB of models) is a
+# * conservative seed pending a benchmark run of the pool:
+# * - load 3 s: process start, model hash check and one config validation;
+# * - a 0.5 s: a fresh ``OfflineSpeakerDiarization`` per job (~0.1-0.15 s
+# *   measured) plus the FFmpeg decode of the job's audio;
+# * - 0.15 s of processing per audio second (xrt ~6.7) alone and per worker
+# *   (one slot per process): measured ~0.10-0.12 s with 4 threads on 5 min of
+# *   speech, rounded up;
+# * - commit 0.8 GiB per process plus 1.5 GiB for its one slot: sherpa copies
+# *   the samples natively (~8 bytes per 16 kHz sample while processing,
+# *   ~0.46 GB per hour of audio) next to the float32 samples, which covers
+# *   multi-hour inputs; no VRAM.
 _SEEDS: dict[tuple[str, str], _Seed] = {
     (_GIGAAM_E2E_CTC, "cpu"): _Seed(10.0, 0.13, 16.7, 59.9, 4.5, 0.15),
     (_GIGAAM_CTC, "cpu"): _Seed(10.0, 0.13, 16.7, 60.3, 4.0, 0.15),
     (_WHISPER, "cpu"): _Seed(2.0, 0.9, 4.5, 11.0, 1.8, 0.25),
     (_GIGAAM_E2E_CTC, "gpu"): _Seed(8.0, 0.23, 68.0, 137.5, 6.6, 0.05, 1.8, 0.05),
     (_WHISPER, "gpu"): _Seed(2.0, 0.07, 20.0, 35.4, 3.2, 0.1, 1.2, 0.2),
+    (DIARIZE_PROVIDER, "cpu"): _Seed(3.0, 0.5, 1 / 0.15, 1 / 0.15, 0.8, 1.5),
 }
 
 
@@ -176,11 +191,13 @@ def _bytes(gib: float) -> int:
 def seed_estimate(key: WorkerKey) -> KeyEstimate:
     """Return the seed estimate of a worker key (spec 7.7).
 
-    GigaAM keys use their table rows. Whisper keys scale the ``small`` rows by
-    the model's size class: memory and load time by the memory factor, both
-    throughputs by the speed factor and the per-job overhead by its inverse.
-    Full-precision Whisper compute types (``float32``) double the memory. An
-    unknown provider is treated as a Whisper model of the large class.
+    Speaker diarization keys use their own row (the compute type plays no
+    role). GigaAM keys use their table rows. Whisper keys scale the ``small``
+    rows by the model's size class: memory and load time by the memory
+    factor, both throughputs by the speed factor and the per-job overhead by
+    its inverse. Full-precision Whisper compute types (``float32``) double the
+    memory. An unknown provider is treated as a Whisper model of the large
+    class.
 
     Args:
         key: Normalized worker key.
@@ -190,7 +207,11 @@ def seed_estimate(key: WorkerKey) -> KeyEstimate:
 
     """
     backend = key.backend
-    if key.provider in {_GIGAAM_E2E_CTC, _GIGAAM_CTC}:
+    if key.provider == DIARIZE_PROVIDER:
+        # * Diarization runs on the CPU only; its row serves any backend.
+        seed = _SEEDS[(DIARIZE_PROVIDER, "cpu")]
+        memory, speed = 1.0, 1.0
+    elif key.provider in {_GIGAAM_E2E_CTC, _GIGAAM_CTC}:
         seed = _SEEDS.get((key.provider, backend), _SEEDS[(_GIGAAM_E2E_CTC, backend)])
         memory, speed = 1.0, 1.0
     else:

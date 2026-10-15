@@ -21,8 +21,10 @@ from core.ffmpeg import MediaProbeError, probe_media_duration
 from core.gigaam_ctc_wrapper import GigaAMCtcWrapper, iter_wav_windows
 from core.gigaam_e2e_ctc_wrapper import GigaAME2ECtcWrapper
 from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
+from core.stt_options import MediaWindow, WhisperDecodeOptions
 from core.stt_pool.procs import default_worker_launch
 from core.whisper_batch import speech_span, transcribe_clips_batched
+from tests.bounded_scenario_support import run_bounded_scenario
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -58,6 +60,9 @@ class Runtime:
         self.moves: list[str] = []
         self.inference_devices: list[str] = []
         self.languages: list[str | None] = []
+        self.segments: list[types.SimpleNamespace] | None = None
+        self.decoding: list[dict[str, object]] = []
+        self.prepared_frames: list[int] = []
         self.batches: list[tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]] = []
         self.module = types.ModuleType("torch")
         self.module.cuda = types.SimpleNamespace(
@@ -166,8 +171,8 @@ def _discard_fake_imports(cached: set[str]) -> None:
                 delattr(parent, attribute)
 
 
-@pytest.fixture
-def runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
+@contextlib.contextmanager
+def _runtime_boundary(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
     """Install only external ML modules before importing any heavy wrapper."""
     boundary = Runtime()
     cached = set(sys.modules)
@@ -181,18 +186,27 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
             boundary.fail("load")
 
         def transcribe(
-            self, path: str, *, language: str | None, **_kwargs: object
+            self, path: str, *, language: str | None, **kwargs: object
         ) -> tuple[Iterator[types.SimpleNamespace], dict[str, object]]:
             """Raise OOM on generator iteration or identify the per-call language."""
             boundary.languages.append(language)
+            boundary.decoding.append(dict(kwargs))
+            if Path(path).is_file():
+                with wave.open(path, "rb") as reader:
+                    boundary.prepared_frames.append(reader.getnframes())
 
             def segments() -> Iterator[types.SimpleNamespace]:
                 boundary.inference_devices.append(self.device)
                 if self.device == "cuda":
                     boundary.fail("inference")
-                yield types.SimpleNamespace(
-                    start=0.0, end=0.1, text=f"{language or 'auto'}:{Path(path).name}"
-                )
+                if boundary.segments is not None:
+                    yield from boundary.segments
+                else:
+                    yield types.SimpleNamespace(
+                        start=0.0,
+                        end=0.1,
+                        text=f"{language or 'auto'}:{Path(path).name}",
+                    )
 
             return segments(), {}
 
@@ -240,6 +254,13 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
         _discard_fake_imports(cached)
 
 
+@pytest.fixture
+def runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
+    """Keep external ML substitutes scoped to one test's real components."""
+    with _runtime_boundary(monkeypatch) as boundary:
+        yield boundary
+
+
 def _wav(path: Path, *, frames: int = 800) -> Path:
     """Write a small canonical silence WAV for real streaming code."""
     with wave.open(str(path), "wb") as writer:
@@ -248,6 +269,183 @@ def _wav(path: Path, *, frames: int = 800) -> Path:
         writer.setframerate(_RATE)
         writer.writeframes(b"\x00\x00" * frames)
     return path
+
+
+@pytest.mark.parametrize("word_timestamps", [False, True])
+def test_whisper_wrapper_preserves_raw_scores_and_optional_words(
+    runtime: Runtime, tmp_path: Path, *, word_timestamps: bool
+) -> None:
+    """Catch faster-whisper metadata loss or absent word timestamps causing iteration errors."""
+    runtime.segments = [
+        types.SimpleNamespace(
+            start=0.1251,
+            end=0.4999,
+            text="  слово  ",
+            no_speech_prob=0.01234,
+            avg_logprob=-0.54321,
+            words=[
+                types.SimpleNamespace(
+                    word=" слово", start=0.13, end=0.45, probability=0.98765
+                )
+            ]
+            if word_timestamps
+            else None,
+        )
+    ]
+    wrapper = importlib.import_module("core.whisperx_wrapper").WhisperXWrapper(
+        device="cpu"
+    )
+    result = wrapper.transcribe(
+        _wav(tmp_path / "clip.wav"), word_timestamps=word_timestamps
+    )
+    assert result["text"] == "слово"
+    segment = result["segments"][0]
+    assert segment["start"] == 0.1251
+    assert segment["end"] == 0.4999
+    assert segment["no_speech_prob"] == 0.01234
+    assert segment["avg_logprob"] == -0.54321
+    assert segment["words"] == (
+        [
+            {
+                "word": " слово",
+                "start": 0.13,
+                "end": 0.45,
+                "probability": 0.98765,
+            }
+        ]
+        if word_timestamps
+        else []
+    )
+
+
+def _check_pipeline_window_documents(
+    runtime: Runtime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch ignored windows/false decode flags or per-call raw segments leaking between CPU slots."""
+    for key in (
+        "HF_HOME",
+        "HF_HUB_CACHE",
+        "TRANSFORMERS_CACHE",
+        "TORCH_HOME",
+        "WHISPER_CACHE",
+        "XDG_CACHE_HOME",
+    ):
+        monkeypatch.setenv(key, str(tmp_path / "cache"))
+    module = importlib.import_module("core.pipelines")
+    pipeline = module.LocalPipeline(
+        model_root=tmp_path / "models",
+        device="cpu",
+        strict_device=True,
+        num_workers=2,
+        whisper_model="small",
+    )
+    pipeline.ensure_stt_loaded()
+    audio = _wav(tmp_path / "clip.wav", frames=32000)
+    requests = (
+        (
+            "ru",
+            MediaWindow(0.25, 0.5),
+            WhisperDecodeOptions(
+                beam_size=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                word_timestamps=False,
+            ),
+        ),
+        (
+            "en",
+            MediaWindow(0.5, 1.0),
+            WhisperDecodeOptions(
+                beam_size=10,
+                vad_filter=True,
+                condition_on_previous_text=True,
+                word_timestamps=True,
+            ),
+        ),
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    pipeline.process,
+                    audio,
+                    tmp_path / language,
+                    language=language,
+                    media_window=window,
+                    decode_options=decode,
+                )
+                for language, window, decode in requests
+            ]
+            documents = [future.result(timeout=10) for future in futures]
+        assert sorted(runtime.prepared_frames) == [8000, 16000]
+        changed = next(
+            options for options in runtime.decoding if options["beam_size"] == 1
+        )
+        assert changed["vad_filter"] is False
+        assert changed["word_timestamps"] is False
+        assert changed["condition_on_previous_text"] is False
+        unchanged = next(
+            options for options in runtime.decoding if options["beam_size"] == 10
+        )
+        assert "condition_on_previous_text" not in unchanged
+        assert unchanged["vad_filter"] is True
+        assert documents[0].transcript_segments[0]["text"].startswith("ru:")
+        assert documents[1].transcript_segments[0]["text"].startswith("en:")
+        default = pipeline.process(
+            audio, tmp_path / "default", media_window=MediaWindow()
+        )
+        assert runtime.prepared_frames[-1] == 32000
+        assert documents[0].transcript_segments[0]["text"].startswith("ru:")
+        assert documents[1].transcript_segments[0]["text"].startswith("en:")
+        assert default.transcript_segments[0]["text"].startswith("auto:")
+        assert not list(tmp_path.glob("*/_work/*.wav"))
+    finally:
+        pipeline.close()
+
+
+def _pipeline_window_scenario(tmp_path: Path) -> None:
+    """Run real pipeline stages with external ML substitutes in an owned process."""
+    with pytest.MonkeyPatch.context() as patch, _runtime_boundary(patch) as boundary:
+        _check_pipeline_window_documents(boundary, tmp_path, patch)
+
+
+@pytest.mark.integration
+def test_pipeline_real_windows_and_decode_overrides_keep_concurrent_documents_isolated(
+    tmp_path: Path,
+) -> None:
+    """Catch ignored windows, decode flags or raw segments leaking between slots."""
+    run_bounded_scenario(_pipeline_window_scenario, tmp_path)
+
+
+@pytest.mark.parametrize("provider", ["gigaam-ctc", "gigaam-e2e-ctc"])
+@pytest.mark.parametrize(
+    "decode",
+    [
+        WhisperDecodeOptions(beam_size=10),
+        WhisperDecodeOptions(vad_filter=True),
+        WhisperDecodeOptions(word_timestamps=True),
+        WhisperDecodeOptions(condition_on_previous_text=True),
+    ],
+)
+def test_pipeline_gigaam_rejects_every_explicit_whisper_option_even_at_its_default(
+    runtime: Runtime, tmp_path: Path, provider: str, decode: WhisperDecodeOptions
+) -> None:
+    """Catch explicit default-valued Whisper options silently disappearing in GigaAM requests."""
+    module = importlib.import_module("core.pipelines")
+    pipeline = module.LocalPipeline(
+        stt_provider=provider, device="cpu", model_root=tmp_path
+    )
+    try:
+        with pytest.raises(ValueError) as error:  # noqa: PT011 - inspect provider/field facts
+            pipeline.process(
+                tmp_path / "missing.wav", tmp_path / "work", decode_options=decode
+            )
+        assert provider in str(error.value)
+        assert next(iter(decode.to_wire())) in str(error.value)
+        assert not (tmp_path / "work").exists()
+        assert not runtime.loads
+    finally:
+        pipeline.close()
 
 
 @pytest.mark.parametrize("provider", ["whisper", "gigaam"])

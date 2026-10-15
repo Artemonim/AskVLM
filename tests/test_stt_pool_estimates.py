@@ -91,13 +91,18 @@ def test_service_correction_ema_and_clamps_ignore_invalid_samples() -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize(
+    ("provider", "backend"), [("gigaam-e2e-ctc", "gpu"), ("sherpa-diarize", "cpu")]
+)
 def test_estimates_persist_only_when_due_and_restore_for_matching_hardware(
     tmp_path: Path,
+    provider: str,
+    backend: str,
 ) -> None:
     """Catch lost learned limits, repeated disk writes per tick or reuse on a different host."""
     clock = [1000.0]
     path = tmp_path / "estimates.json"
-    key = make_key("gigaam-e2e-ctc", "ignored", "auto", "gpu")
+    key = make_key(provider, "ignored", "auto", backend)
     store = EstimateStore(path, fingerprint=_FINGERPRINT, clock=lambda: clock[0])
     store.bump_memory(key, commit=True, vram=True)
     assert store.save_if_due()

@@ -16,12 +16,13 @@ import importlib
 import math
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
 from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
+from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import ipc
 from core.stt_pool.keys import (
     DEFAULT_PRIORITY,
@@ -30,10 +31,18 @@ from core.stt_pool.keys import (
     normalize_language,
     normalize_priority,
 )
-from core.stt_pool.queue import MAX_ERROR_DETAIL
+from core.stt_pool.queue import (
+    JOB_KIND_STT,
+    MAX_ERROR_DETAIL,
+    job_kind_conflict,
+    options_from_wire,
+    options_to_wire,
+    parse_job_kind,
+)
 
 if TYPE_CHECKING:
     from core.stt_pool.keys import Backend, Priority
+    from core.stt_pool.queue import JobKind
 
 EngineStatus = Literal["ok", "empty", "error", "cancelled"]
 
@@ -43,6 +52,11 @@ ERROR_KIND_CUDA_OOM = "cuda_oom"
 ERROR_KIND_DEVICE_UNAVAILABLE = "device_unavailable"
 ERROR_KIND_MEMORY_LIMIT = "memory_limit"
 ERROR_KIND_CANCELLED = "cancelled"
+
+# * ``error_kind`` of a finished result that is too large for its transport (a
+# * worker protocol line or the result file); the worker or the supervisor
+# * publishes it in place of the result.
+ERROR_KIND_RESULT_TOO_LARGE = "result_too_large"
 
 # * Production engine factory named in the ``spec`` message.
 DEFAULT_ENGINE_FACTORY = "core.stt_pool.engines:create_engine"
@@ -183,6 +197,60 @@ def _mapping(message: Mapping[str, object], name: str) -> Mapping[str, object]:
         msg = f"field {name!r} must be a JSON object, got {value!r}"
         raise ValueError(msg)
     return MappingProxyType(dict(cast("Mapping[str, object]", value)))
+
+
+def _optional_object(
+    message: Mapping[str, object], name: str
+) -> dict[str, object] | None:
+    """Return an optional JSON-object field as a plain dict (``None`` when absent).
+
+    Raises:
+        ValueError: When the field is present but not an object with string keys.
+
+    """
+    value = message.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, Mapping) or not all(isinstance(k, str) for k in value):
+        msg = (
+            f"field {name!r} must be a JSON object or null, got {type(value).__name__}"
+        )
+        raise ValueError(msg)
+    return dict(cast("Mapping[str, object]", value))
+
+
+def job_message_fields(
+    *,
+    kind: JobKind,
+    want_segments: bool,
+    decode: WhisperDecodeOptions,
+    window: MediaWindow,
+    diarize: DiarizeOptions | None,
+) -> dict[str, object]:
+    """Return the ``job`` message entries of the per-job kind and options.
+
+    Only entries that differ from their defaults are returned, so the message
+    of a plain ``stt`` job is unchanged.
+
+    Args:
+        kind: Job kind.
+        want_segments: Structured segments requested.
+        decode: Whisper decoding overrides.
+        window: Media window.
+        diarize: Diarization settings, or ``None``.
+
+    Returns:
+        ``kind`` (unless ``stt``) plus the entries of
+        :func:`~core.stt_pool.queue.options_to_wire`.
+
+    """
+    fields: dict[str, object] = {} if kind == JOB_KIND_STT else {"kind": kind}
+    fields.update(
+        options_to_wire(
+            want_segments=want_segments, decode=decode, window=window, diarize=diarize
+        )
+    )
+    return fields
 
 
 def _backend(value: object) -> Backend:
@@ -327,6 +395,12 @@ class WorkItem:
         call_id: Identifier of the client call the job belongs to (empty when
             the supervisor does not send one).
         seq: Supervisor admission sequence number of the job.
+        kind: ``stt`` (transcription) or ``diarize`` (speaker diarization).
+        want_segments: Return structured segments in the result ``data``.
+        decode: Whisper-only decoding overrides.
+        window: Time window of the media to process.
+        diarize: Diarization settings of a ``diarize`` item (``None`` selects
+            the defaults, see :attr:`diarize_options`).
 
     """
 
@@ -339,10 +413,23 @@ class WorkItem:
     priority: Priority = DEFAULT_PRIORITY
     call_id: str = ""
     seq: int = 0
+    kind: JobKind = JOB_KIND_STT
+    want_segments: bool = False
+    decode: WhisperDecodeOptions = field(default_factory=WhisperDecodeOptions)
+    window: MediaWindow = field(default_factory=MediaWindow)
+    diarize: DiarizeOptions | None = None
+
+    @property
+    def diarize_options(self) -> DiarizeOptions:
+        """Return the diarization settings to apply (the defaults when unset)."""
+        return DiarizeOptions() if self.diarize is None else self.diarize
 
     @classmethod
     def from_message(cls, message: Mapping[str, object]) -> Self:
         """Parse and validate a ``job`` message.
+
+        Messages without the per-job kind and option entries describe a plain
+        ``stt`` job.
 
         Args:
             message: Decoded protocol message.
@@ -351,27 +438,47 @@ class WorkItem:
             The work item.
 
         Raises:
-            ValueError: When a field is missing or invalid.
+            ValueError: When a field is missing or invalid, or the kind does not
+                take a given option.
 
         """
         _require_type(message, ipc.MSG_JOB)
+        raw_kind = message.get("kind")
+        kind = JOB_KIND_STT if raw_kind is None else parse_job_kind(raw_kind)
+        extra = options_from_wire(message, where="")
+        language = normalize_language(_optional_text(message, "language"))
+        conflict = job_kind_conflict(
+            kind,
+            language=language,
+            want_segments=extra.want_segments,
+            decode=extra.decode,
+            diarize=extra.diarize,
+        )
+        if conflict is not None:
+            raise ValueError(conflict)
         return cls(
             job_id=_text(message, "job_id"),
             attempt_id=_text(message, "attempt_id"),
             input_path=Path(_text(message, "input_path")),
-            language=normalize_language(_optional_text(message, "language")),
+            language=language,
             duration_s=_optional_number(message, "duration_s", minimum=0.0),
             deadline_at=_optional_number(message, "deadline_at"),
             priority=normalize_priority(message.get("priority")),
             call_id=_optional_text(message, "call_id") or "",
             seq=0 if message.get("seq") is None else _integer(message, "seq", 0),
+            kind=kind,
+            want_segments=extra.want_segments,
+            decode=extra.decode,
+            window=extra.window,
+            diarize=extra.diarize,
         )
 
     def to_message(self) -> dict[str, object]:
         """Return the ``job`` protocol message.
 
         Returns:
-            A JSON-serializable mapping accepted by :meth:`from_message`.
+            A JSON-serializable mapping accepted by :meth:`from_message`; the
+            kind and per-job options appear only when not default.
 
         """
         return {
@@ -385,6 +492,13 @@ class WorkItem:
             "priority": self.priority,
             "call_id": self.call_id,
             "seq": self.seq,
+            **job_message_fields(
+                kind=self.kind,
+                want_segments=self.want_segments,
+                decode=self.decode,
+                window=self.window,
+                diarize=self.diarize,
+            ),
         }
 
 
@@ -395,13 +509,17 @@ class EngineResult:
     Attributes:
         job_id: Queue job identifier.
         attempt_id: Attempt identifier of the work item.
-        status: ``ok`` (non-empty text), ``empty``, ``error`` or ``cancelled``.
+        status: ``ok`` (non-empty text, or any finished diarization),
+            ``empty``, ``error`` or ``cancelled``.
         text: Stripped transcript (empty unless ``ok``).
         error_kind: Error category for ``error``/``cancelled``, else ``None``.
         error_detail: Exception text (at most 4000 characters), else ``None``.
         backend: Backend class that ran the item.
         run_s: Wall-clock processing time.
         audio_s: Processed audio duration, when known.
+        data: Structured payload of an ``ok``/``empty`` result (a JSON object:
+            ``{"segments": [...]}`` for transcription, ``{"turns": [...]}`` for
+            diarization), or ``None``.
 
     """
 
@@ -414,6 +532,7 @@ class EngineResult:
     backend: Backend
     run_s: float
     audio_s: float | None
+    data: Mapping[str, object] | None = None
 
     @classmethod
     def for_text(
@@ -424,6 +543,7 @@ class EngineResult:
         backend: Backend,
         run_s: float,
         audio_s: float | None,
+        data: Mapping[str, object] | None = None,
     ) -> Self:
         """Build the result of a finished transcription.
 
@@ -433,6 +553,8 @@ class EngineResult:
             backend: Backend class that ran the item.
             run_s: Wall-clock processing time.
             audio_s: Processed audio duration, when known.
+            data: Structured payload (for example the segments), kept for both
+                ``ok`` and ``empty``.
 
         Returns:
             An ``ok`` result when the stripped text is non-empty, else ``empty``.
@@ -449,6 +571,46 @@ class EngineResult:
             backend=backend,
             run_s=run_s,
             audio_s=audio_s,
+            data=data,
+        )
+
+    @classmethod
+    def for_diarization(
+        cls,
+        item: WorkItem,
+        data: Mapping[str, object],
+        *,
+        backend: Backend,
+        run_s: float,
+        audio_s: float | None,
+    ) -> Self:
+        """Build the result of a finished diarization.
+
+        A diarization that found no speech is still a success: the status is
+        ``ok`` whatever the payload holds, and the text is empty.
+
+        Args:
+            item: Work item that was processed.
+            data: Structured payload (``{"turns": [...]}``).
+            backend: Backend class that ran the item.
+            run_s: Wall-clock processing time.
+            audio_s: Processed audio duration, when known.
+
+        Returns:
+            An ``ok`` result carrying *data*.
+
+        """
+        return cls(
+            job_id=item.job_id,
+            attempt_id=item.attempt_id,
+            status="ok",
+            text="",
+            error_kind=None,
+            error_detail=None,
+            backend=backend,
+            run_s=run_s,
+            audio_s=audio_s,
+            data=data,
         )
 
     @classmethod
@@ -548,6 +710,7 @@ class EngineResult:
             backend=_backend(message.get("backend")),
             run_s=_number(message, "run_s", minimum=0.0),
             audio_s=_optional_number(message, "audio_s", minimum=0.0),
+            data=_optional_object(message, "data"),
         )
 
     def to_message(self) -> dict[str, object]:
@@ -555,10 +718,11 @@ class EngineResult:
 
         Returns:
             A JSON-serializable mapping accepted by :meth:`from_message`; the
-            error detail is cut to 4000 characters.
+            error detail is cut to 4000 characters and ``data`` is present only
+            when set.
 
         """
-        return {
+        message: dict[str, object] = {
             "type": ipc.MSG_RESULT,
             "job_id": self.job_id,
             "attempt_id": self.attempt_id,
@@ -570,6 +734,9 @@ class EngineResult:
             "run_s": self.run_s,
             "audio_s": self.audio_s,
         }
+        if self.data is not None:
+            message["data"] = dict(self.data)
+        return message
 
 
 @dataclass(frozen=True, slots=True)

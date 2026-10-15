@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 import psutil  # type: ignore[import-untyped]
 
 from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
+from core.stt_pool import ipc
 from core.stt_pool.engine_api import EngineResult, LoadInfo
 from core.stt_pool.sysprobe import child_interpreter
 
@@ -84,7 +85,11 @@ class ScenarioEngine:
             run_s=0.0,
             audio_s=item.duration_s,
         )
-        if mode == "bad_result":
+        if mode == "oversized_result":
+            char = str(self._spec.options.get("payload_char", "x"))
+            count = ipc.MAX_LINE_BYTES // len(char.encode("utf-8")) + 1
+            result = replace(result, data={"blob": char * count})
+        elif mode == "bad_result":
             result = replace(result, text=object())  # type: ignore[arg-type]
         elif mode == "error":
             result = EngineResult.for_error(
@@ -148,6 +153,12 @@ class SupervisorEngine:
             created_at=psutil.Process().create_time(),
             capacity=spec.capacity,
             key=spec.key.to_dict(),
+            threads_per_slot=spec.threads_per_slot,
+            options=dict(spec.options),
+            thread_env={
+                name: os.environ.get(name)
+                for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
+            },
         )
 
     def _record(self, event: str, **fields: object) -> None:
@@ -205,6 +216,7 @@ class SupervisorEngine:
         """Start fake recognition without blocking dispatch."""
         instructions = json.loads(item.input_path.read_text(encoding="utf-8"))
         instructions = instructions.get(self._spec.key.backend, instructions)
+        instructions = instructions.get(item.kind, instructions)
         cancel = threading.Event()
         self._cancels[item.job_id, item.attempt_id] = (
             cancel,
@@ -220,6 +232,11 @@ class SupervisorEngine:
             priority=item.priority,
             call_id=item.call_id,
             seq=item.seq,
+            kind=item.kind,
+            want_segments=item.want_segments,
+            decode=item.decode.to_wire(),
+            window=item.window.to_wire(),
+            diarize=None if item.diarize is None else item.diarize.to_wire(),
         )
         thread = threading.Thread(
             target=self._recognize, args=(item, instructions, cancel), daemon=True
@@ -314,15 +331,31 @@ class SupervisorEngine:
                 item, error, backend=self._spec.key.backend, run_s=0.0
             )
         else:
-            result = EngineResult.for_text(
-                item,
-                ""
-                if mode == "empty"
-                else str(instructions.get("text", item.input_path.stem)),
-                backend=self._spec.key.backend,
-                run_s=0.0,
-                audio_s=item.duration_s,
-            )
+            data = instructions.get("data")
+            if data is not None and not isinstance(data, dict):
+                msg = "fake result data must be an object"
+                raise ValueError(msg)
+            if instructions.get("large_segments"):
+                data = {"segments": [{"text": "x" * (17 * 1024**2)}]}
+            if item.kind == "diarize" and data is not None:
+                result = EngineResult.for_diarization(
+                    item,
+                    data,
+                    backend=self._spec.key.backend,
+                    run_s=0.0,
+                    audio_s=item.duration_s,
+                )
+            else:
+                result = EngineResult.for_text(
+                    item,
+                    ""
+                    if mode == "empty"
+                    else str(instructions.get("text", item.input_path.stem)),
+                    backend=self._spec.key.backend,
+                    run_s=0.0,
+                    audio_s=item.duration_s,
+                    data=data,
+                )
             if mode == "blank_ok":
                 result = replace(result, status="ok", text=" \n\t ")
         return result

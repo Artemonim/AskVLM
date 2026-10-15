@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 from typing import TYPE_CHECKING
+
+if "--guard-imports" in sys.argv:
+    from tests.stt_pool_fake_worker import MLImportGuard
+
+    sys.argv.remove("--guard-imports")
+    sys.meta_path.insert(0, MLImportGuard())
 
 import cli
 from core.stt_pool import client

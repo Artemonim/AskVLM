@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, cast
 import pytest
 
 from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
+from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import fsio, ipc
 from core.stt_pool import queue as pool_queue
 from core.stt_pool.config import (
@@ -23,6 +24,7 @@ from core.stt_pool.config import (
 )
 from core.stt_pool.engine_api import EngineResult, WorkerSpec, WorkItem
 from core.stt_pool.keys import (
+    DIARIZE_PROVIDER,
     WorkerKey,
     make_key,
     normalize_device_request,
@@ -134,6 +136,8 @@ def test_gigaam_keys_serve_the_pinned_head_and_ignore_whisper_options(
         ("whisper", "cuda", "cuda"),
         ("gigaam-ctc", "auto", "cpu"),
         ("gigaam-e2e-ctc", "auto", "auto"),
+        ("sherpa-diarize", "auto", "cpu"),
+        ("sherpa-diarize", "cpu", "cpu"),
     ],
 )
 def test_device_requests_preserve_the_requested_device_class(
@@ -149,6 +153,7 @@ def test_device_requests_preserve_the_requested_device_class(
         ("gigaam-ctc", "cuda", "cuda"),
         ("whisper", "gpu", "gpu"),
         ("missing", "cpu", "missing"),
+        ("sherpa-diarize", "cuda", "cuda"),
     ],
 )
 def test_unsupported_provider_device_pairs_fail(
@@ -214,6 +219,12 @@ def test_unknown_priority_values_fail(raw: object) -> None:
         ("memory.free_commit_guard_gib", -1),
         ("vram.budget_gib", 10**400),
         ("threads.budget", 0),
+        ("diarization.threads_per_slot", 0),
+        ("diarization.threads_per_slot", True),
+        ("diarization.threads_per_slot", 1.5),
+        ("diarization.threads_per_slot", None),
+        ("diarization.threads_per_slot", "4"),
+        ("diarization.unknown", 1),
         ("scheduling.spill_ratio", 1.1),
         ("scheduling.priority_aging_s", 0),
         ("lifecycle.stop_grace_s", float("inf")),
@@ -278,7 +289,7 @@ def test_example_configuration_honors_architect_safety_budgets() -> None:
     ("field", "value", "error_kind"),
     [
         ("schema", "other", "input_invalid"),
-        ("version", 2, "unsupported_version"),
+        ("version", 3, "unsupported_version"),
         ("version", True, "input_invalid"),
         ("kind", "diarization", "unsupported_kind"),
         ("job_id", "../outside", "input_invalid"),
@@ -601,3 +612,199 @@ def test_worker_job_rejects_invalid_duration(tmp_path: Path, raw: object) -> Non
     with pytest.raises(ValueError) as error:  # noqa: PT011 - check the malformed field, not human wording
         WorkItem.from_message(message)
     assert "duration_s" in str(error.value)
+
+
+@pytest.mark.parametrize("budget", [1, 2, 4, 8])
+def test_diarization_default_threads_fit_small_budgets_and_overrides(
+    budget: int,
+) -> None:
+    """Catch default diarization becoming impossible on small machines or stale after an override."""
+    config = parse_pool_config(
+        {"threads": {"budget": budget}}, source="test-config", logical_cpus=8
+    )
+    assert config.diarization.threads_per_slot == min(4, budget)
+    adjusted = apply_overrides(config, thread_budget=3)
+    assert adjusted.diarization.threads_per_slot == 3
+    assert config.threads.budget == budget
+
+
+@pytest.mark.parametrize("override", [False, True])
+def test_explicit_diarization_threads_cannot_exceed_the_effective_budget(
+    *, override: bool
+) -> None:
+    """Catch an explicit unschedulable thread setting being silently clamped instead of rejected."""
+    payload: dict[str, object] = {
+        "threads": {"budget": 8 if override else 2},
+        "diarization": {"threads_per_slot": 3},
+    }
+    with pytest.raises(PoolConfigError) as error:  # noqa: PT012 - the parse and the override both raise the asserted error
+        config = parse_pool_config(payload, source="test-config", logical_cpus=8)
+        if override:
+            apply_overrides(config, thread_budget=2)
+    assert error.value.json_path == "diarization.threads_per_slot"
+
+
+@pytest.mark.integration
+def test_plain_job_document_preserves_the_v1_machine_contract(tmp_path: Path) -> None:
+    """Catch ordinary jobs unnecessarily upgrading their schema or changing the legacy wire layout."""
+    payload = _payload(tmp_path)
+    payload["options"] = {"language": "ru"}
+    job = JobRecord.from_dict(payload, expected_job_id=_JOB_ID)
+    assert job.to_dict() == payload
+    assert list(job.to_dict()) == list(payload)
+    paths = QueuePaths(tmp_path / "queue")
+    pool_queue.submit_job(paths, job)
+    expected = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    assert paths.incoming_file(_JOB_ID).read_bytes() == expected
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("kind", ["stt", "diarize"])
+def test_v2_jobs_round_trip_options_through_real_queue_files(
+    tmp_path: Path, kind: str
+) -> None:
+    """Catch lost window/decode/clustering fields or v2 jobs being written as legacy requests."""
+    payload = _payload(tmp_path)
+    payload["version"] = 2
+    payload["kind"] = kind
+    options: dict[str, object] = {"window": {"start_s": 1.25, "duration_s": 2.5}}
+    if kind == "stt":
+        options.update(
+            language="ru", segments=True, decode={"beam_size": 1, "vad_filter": False}
+        )
+    else:
+        payload["request"] = {"provider": "sherpa-diarize", "device": "auto"}
+        options["diarize"] = {
+            "num_speakers": 2,
+            "threshold": 0.7,
+            "min_duration_on": 0,
+            "min_duration_off": 0.2,
+        }
+    payload["options"] = options
+    paths = QueuePaths(tmp_path / "queue")
+    pool_queue.submit_job(paths, JobRecord.from_dict(payload, expected_job_id=_JOB_ID))
+    received = pool_queue.read_job_payload(paths, _JOB_ID)
+    assert received is not None
+    assert received["version"] == 2
+    job = JobRecord.from_dict(received, expected_job_id=_JOB_ID)
+    assert job.window == MediaWindow(1.25, 2.5)
+    assert job.kind == kind
+    if kind == "stt":
+        assert job.want_segments
+        assert job.decode == WhisperDecodeOptions(beam_size=1, vad_filter=False)
+    else:
+        assert job.request.provider == DIARIZE_PROVIDER
+        assert job.request.device == "cpu"
+        assert job.diarize == DiarizeOptions(2, 0.7, 0, 0.2)
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("unknown", 1),
+        ("segments", 1),
+        ("decode", []),
+        ("decode", {"beam_size": True}),
+        ("decode", {"vad_filter": 0}),
+        ("decode", {"temperature": 0}),
+        ("window", {"start_s": -1}),
+        ("window", {"duration_s": 0}),
+        ("window", {"start_s": float("nan")}),
+        ("window", {"end_s": 1}),
+        ("diarize", {"num_speakers": 0}),
+        ("diarize", {"threshold": float("inf")}),
+    ],
+)
+def test_v2_job_options_are_strictly_validated_before_admission(
+    tmp_path: Path, option: str, value: object
+) -> None:
+    """Catch malformed or unknown structured options being silently dropped by admission."""
+    payload = _payload(tmp_path)
+    payload["version"] = 2
+    payload["options"] = {option: value}
+    with pytest.raises(JobValidationError) as error:
+        JobRecord.from_dict(payload, expected_job_id=_JOB_ID)
+    assert error.value.error_kind == "input_invalid"
+    assert option in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("provider", "kind", "options", "device"),
+    [
+        ("gigaam-ctc", "stt", {"decode": {"beam_size": 10}}, "cpu"),
+        ("gigaam-e2e-ctc", "stt", {"decode": {"vad_filter": True}}, "auto"),
+        ("whisper", "stt", {"diarize": {}}, "cpu"),
+        ("whisper", "diarize", {}, "cpu"),
+        ("sherpa-diarize", "stt", {}, "cpu"),
+        ("sherpa-diarize", "diarize", {}, "cuda"),
+        ("sherpa-diarize", "diarize", {"language": "ru"}, "cpu"),
+        ("sherpa-diarize", "diarize", {"segments": True}, "cpu"),
+        ("sherpa-diarize", "diarize", {"decode": {"word_timestamps": False}}, "cpu"),
+    ],
+)
+def test_job_kind_provider_and_explicit_options_cannot_conflict(
+    tmp_path: Path, provider: str, kind: str, options: dict[str, object], device: str
+) -> None:
+    """Catch CPU-only diarization on CUDA or explicit Whisper options silently accepted by GigaAM."""
+    payload = _payload(tmp_path)
+    payload.update(version=2, kind=kind, options=options)
+    payload["request"] = {"provider": provider, "device": device}
+    with pytest.raises(JobValidationError) as error:
+        JobRecord.from_dict(payload, expected_job_id=_JOB_ID)
+    assert error.value.error_kind == "input_invalid"
+
+
+@pytest.mark.parametrize("kind", ["stt", "diarize"])
+def test_worker_packets_preserve_options_and_empty_structured_success(
+    tmp_path: Path, kind: str
+) -> None:
+    """Catch structured payloads disappearing across IPC or no-turn diarization being classified empty."""
+    message: dict[str, object] = {
+        "type": "job",
+        "job_id": _JOB_ID,
+        "attempt_id": f"{_JOB_ID}:1",
+        "input_path": str(tmp_path / "a.wav"),
+        "kind": kind,
+        "window": {"start_s": 10.5, "duration_s": 2.0},
+    }
+    if kind == "stt":
+        message.update(segments=True, decode={"condition_on_previous_text": False})
+    else:
+        message["diarize"] = {"num_speakers": 2, "threshold": 0.7}
+    item = WorkItem.from_message(message)
+    wire = ipc.decode_message(ipc.encode_message(item.to_message()))
+    assert wire is not None
+    received = WorkItem.from_message(wire)
+    assert received.window == MediaWindow(10.5, 2.0)
+    if kind == "stt":
+        assert received.decode.condition_on_previous_text is False
+        result = EngineResult.for_text(
+            received, "", backend="cpu", run_s=0, audio_s=2, data={"segments": []}
+        )
+        expected_status = "empty"
+    else:
+        assert received.diarize_options.num_speakers == 2
+        result = EngineResult.for_diarization(
+            received, {"turns": []}, backend="cpu", run_s=0, audio_s=2
+        )
+        expected_status = "ok"
+    result_wire = ipc.decode_message(ipc.encode_message(result.to_message()))
+    assert result_wire is not None
+    decoded = EngineResult.from_message(result_wire)
+    assert decoded.status == expected_status
+    assert decoded.text == ""
+    assert decoded.data == ({"segments": []} if kind == "stt" else {"turns": []})
+
+
+@pytest.mark.parametrize("data", [[], "{}", False])
+def test_malformed_structured_result_is_an_explicit_protocol_error(
+    data: object,
+) -> None:
+    """Catch non-object result data being dropped while clients still see a successful transcript."""
+    result = ResultRecord.from_dict(
+        {"job_id": _JOB_ID, "status": "ok", "text": "speech", "data": data}
+    )
+    assert result.status == "error"
+    assert result.error_kind == "protocol_error"
+    assert result.text == ""
+    assert result.data is None

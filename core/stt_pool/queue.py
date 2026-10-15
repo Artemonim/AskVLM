@@ -35,32 +35,47 @@ from time import sleep, time
 from typing import TYPE_CHECKING, Literal, Self, TypeGuard
 
 from core.settings import get_project_cache_dir
+from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import fsio
 from core.stt_pool.keys import (
     DEFAULT_PRIORITY,
+    DIARIZE_PROVIDER,
     normalize_device_request,
     normalize_language,
+    normalize_pool_provider,
     normalize_priority,
 )
-from core.stt_providers import normalize_stt_provider
+from core.stt_providers import is_gigaam_provider
 
 if TYPE_CHECKING:
     from core.stt_pool.keys import DeviceRequest, Priority
 
 logger = logging.getLogger(__name__)
 
+JobKind = Literal["stt", "diarize"]
+
 PROTOCOL_VERSION = 2
 JOB_SCHEMA = "askvlm.stt.job"
 RESULT_SCHEMA = "askvlm.stt.result"
 HEARTBEAT_SCHEMA = "askvlm.stt.heartbeat"
-JOB_VERSION = 1
 RESULT_VERSION = 1
-JOB_KIND_STT = "stt"
+
+# * Job document versions. Version 2 adds job kinds and per-job options; a plain
+# * ``stt`` job with default options is still written as version 1, so a
+# * supervisor that predates version 2 keeps serving it.
+JOB_VERSION = 2
+JOB_VERSION_PLAIN = 1
+JOB_KIND_STT: JobKind = "stt"
+JOB_KIND_DIARIZE: JobKind = "diarize"
+JOB_KINDS: frozenset[JobKind] = frozenset({JOB_KIND_STT, JOB_KIND_DIARIZE})
 
 # * ``error_kind`` values of a rejected job file.
 ERROR_KIND_INPUT_INVALID = "input_invalid"
 ERROR_KIND_UNSUPPORTED_KIND = "unsupported_kind"
 ERROR_KIND_UNSUPPORTED_VERSION = "unsupported_version"
+
+# * ``error_kind`` of a result document whose fields cannot be trusted.
+ERROR_KIND_PROTOCOL_ERROR = "protocol_error"
 
 # * Override the queue root for tests or multi-tenant deployments.
 ENV_QUEUE_DIR = "ASKVLM_EXTERNAL_QUEUE_DIR"
@@ -68,6 +83,26 @@ ENV_QUEUE_DIR = "ASKVLM_EXTERNAL_QUEUE_DIR"
 MAX_JOB_BYTES = 64 * 1024
 MAX_ERROR_DETAIL = 4000
 MAX_PARALLEL_LIMIT = 64
+
+# * Largest result document a reader accepts; the supervisor publishes an
+# * explicit ``result_too_large`` error instead of a bigger result.
+MAX_RESULT_BYTES = fsio.DEFAULT_MAX_JSON_BYTES
+
+# * Keys of the version-2 ``options`` object (version 1 knows only ``language``).
+_OPTION_LANGUAGE = "language"
+_OPTION_SEGMENTS = "segments"
+_OPTION_DECODE = "decode"
+_OPTION_WINDOW = "window"
+_OPTION_DIARIZE = "diarize"
+_V2_OPTION_KEYS: frozenset[str] = frozenset(
+    {
+        _OPTION_LANGUAGE,
+        _OPTION_SEGMENTS,
+        _OPTION_DECODE,
+        _OPTION_WINDOW,
+        _OPTION_DIARIZE,
+    }
+)
 
 # * A supervisor is considered dead when its heartbeat is older than this many
 # * seconds. Clients use it to decide whether to spawn a fresh supervisor.
@@ -483,11 +518,183 @@ def _mapping_field(value: object, name: str) -> Mapping[str, object]:
 
 
 @dataclass(frozen=True, slots=True)
+class JobOptions:
+    """Per-job options beyond the language, as carried by the wire forms.
+
+    The job file keeps them in its ``options`` object and the worker ``job``
+    message at its top level; both use :func:`options_to_wire` and
+    :func:`options_from_wire`.
+
+    Attributes:
+        want_segments: Return structured segments next to the text.
+        decode: Whisper-only decoding overrides.
+        window: Time window of the media to process.
+        diarize: Diarization settings of a ``diarize`` job (``None`` selects
+            the defaults); never set for an ``stt`` job.
+
+    """
+
+    want_segments: bool = False
+    decode: WhisperDecodeOptions = field(default_factory=WhisperDecodeOptions)
+    window: MediaWindow = field(default_factory=MediaWindow)
+    diarize: DiarizeOptions | None = None
+
+
+def options_to_wire(
+    *,
+    want_segments: bool,
+    decode: WhisperDecodeOptions,
+    window: MediaWindow,
+    diarize: DiarizeOptions | None,
+) -> dict[str, object]:
+    """Return the per-job options that differ from their defaults, as JSON.
+
+    Args:
+        want_segments: Structured segments requested.
+        decode: Whisper decoding overrides.
+        window: Media window.
+        diarize: Diarization settings, or ``None``.
+
+    Returns:
+        ``segments`` (only ``true``), ``decode`` (the set fields), ``window``
+        and ``diarize`` entries, each present only when not default; empty for
+        a plain job.
+
+    """
+    wire: dict[str, object] = {}
+    if want_segments:
+        wire[_OPTION_SEGMENTS] = True
+    if not decode.is_default:
+        wire[_OPTION_DECODE] = decode.to_wire()
+    if not window.is_default:
+        wire[_OPTION_WINDOW] = window.to_wire()
+    if diarize is not None:
+        wire[_OPTION_DIARIZE] = diarize.to_wire()
+    return wire
+
+
+def options_from_wire(source: Mapping[str, object], *, where: str) -> JobOptions:
+    """Parse the per-job options written by :func:`options_to_wire`.
+
+    Absent and ``null`` entries take the defaults; other keys of *source* are
+    not inspected here.
+
+    Args:
+        source: Job ``options`` object or ``job`` message.
+        where: Prefix of the option names in error messages (``"options."``
+            for a job file, ``""`` for a message).
+
+    Returns:
+        The validated options.
+
+    Raises:
+        ValueError: When an entry has the wrong type or an invalid value; the
+            message names the option.
+
+    """
+    segments = source.get(_OPTION_SEGMENTS)
+    if segments is not None and not isinstance(segments, bool):
+        msg = f"{where}{_OPTION_SEGMENTS} must be true or false (got {segments!r})"
+        raise ValueError(msg)
+    try:
+        raw = source.get(_OPTION_DECODE)
+        decode = (
+            WhisperDecodeOptions()
+            if raw is None
+            else WhisperDecodeOptions.from_wire(raw)
+        )
+    except ValueError as exc:
+        msg = f"{where}{_OPTION_DECODE}: {exc}"
+        raise ValueError(msg) from exc
+    try:
+        raw = source.get(_OPTION_WINDOW)
+        window = MediaWindow() if raw is None else MediaWindow.from_wire(raw)
+    except ValueError as exc:
+        msg = f"{where}{_OPTION_WINDOW}: {exc}"
+        raise ValueError(msg) from exc
+    try:
+        raw = source.get(_OPTION_DIARIZE)
+        diarize = None if raw is None else DiarizeOptions.from_wire(raw)
+    except ValueError as exc:
+        msg = f"{where}{_OPTION_DIARIZE}: {exc}"
+        raise ValueError(msg) from exc
+    return JobOptions(
+        want_segments=bool(segments),
+        decode=decode,
+        window=window,
+        diarize=diarize,
+    )
+
+
+def job_kind_conflict(
+    kind: JobKind,
+    *,
+    language: str | None,
+    want_segments: bool,
+    decode: WhisperDecodeOptions,
+    diarize: DiarizeOptions | None,
+) -> str | None:
+    """Describe an option that the job kind does not take.
+
+    A ``diarize`` job takes no language, segments flag or decode options; an
+    ``stt`` job takes no diarization settings. The media window suits both.
+
+    Args:
+        kind: Job kind.
+        language: Language hint.
+        want_segments: Structured segments requested.
+        decode: Whisper decoding overrides.
+        diarize: Diarization settings.
+
+    Returns:
+        A description of the conflict, or ``None`` when the options fit.
+
+    """
+    if kind == JOB_KIND_DIARIZE:
+        given = [
+            name
+            for name, present in (
+                (_OPTION_LANGUAGE, language is not None),
+                (_OPTION_SEGMENTS, want_segments),
+                (_OPTION_DECODE, not decode.is_default),
+            )
+            if present
+        ]
+        if given:
+            return f"diarize jobs do not take the STT option(s): {', '.join(given)}"
+        return None
+    if diarize is not None:
+        return f"{_OPTION_DIARIZE} options are valid only for {JOB_KIND_DIARIZE} jobs"
+    return None
+
+
+def parse_job_kind(value: object) -> JobKind:
+    """Validate a job kind token.
+
+    Args:
+        value: Candidate kind.
+
+    Returns:
+        ``stt`` or ``diarize``.
+
+    Raises:
+        ValueError: When *value* is not one of the job kinds.
+
+    """
+    for kind in (JOB_KIND_STT, JOB_KIND_DIARIZE):
+        if value == kind:
+            return kind
+    msg = f"unsupported job kind {value!r}; expected stt or diarize"
+    raise ValueError(msg)
+
+
+@dataclass(frozen=True, slots=True)
 class JobRequest:
     """Provider, model and device selection of one job.
 
     Attributes:
-        provider: Canonical STT provider id.
+        provider: Canonical STT provider id, or the diarization pseudo-provider
+            of a ``diarize`` job.
         whisper_model: Requested Whisper model name.
         compute_type: Requested compute type.
         device: Normalized device request.
@@ -502,7 +709,7 @@ class JobRequest:
 
 @dataclass(frozen=True, slots=True)
 class JobRecord:
-    """One transcription job as written by a client.
+    """One transcription or diarization job as written by a client.
 
     Attributes:
         job_id: Unique identifier of this job.
@@ -517,6 +724,12 @@ class JobRecord:
         language: Normalized per-job language hint, or ``None``.
         client_pid: Process id of the submitting client, or ``None``.
         priority: Call priority class shared by all jobs of the call.
+        kind: ``stt`` (transcription) or ``diarize`` (speaker diarization).
+        want_segments: Return structured segments next to the text (``stt``).
+        decode: Whisper-only decoding overrides (``stt`` with Whisper).
+        window: Time window of the media to process.
+        diarize: Diarization settings of a ``diarize`` job (``None`` selects
+            the defaults); never set for an ``stt`` job.
 
     """
 
@@ -532,18 +745,44 @@ class JobRecord:
     language: str | None
     client_pid: int | None = None
     priority: Priority = DEFAULT_PRIORITY
+    kind: JobKind = JOB_KIND_STT
+    want_segments: bool = False
+    decode: WhisperDecodeOptions = field(default_factory=WhisperDecodeOptions)
+    window: MediaWindow = field(default_factory=MediaWindow)
+    diarize: DiarizeOptions | None = None
+
+    def options_wire(self) -> dict[str, object]:
+        """Return the non-default per-job options (see :func:`options_to_wire`).
+
+        Returns:
+            The ``segments``/``decode``/``window``/``diarize`` entries that are
+            set; empty for a plain job.
+
+        """
+        return options_to_wire(
+            want_segments=self.want_segments,
+            decode=self.decode,
+            window=self.window,
+            diarize=self.diarize,
+        )
 
     def to_dict(self) -> dict[str, object]:
         """Return the JSON document of this job.
+
+        A plain ``stt`` job (every per-job option at its default) is written as
+        version 1, exactly the layout that supervisors without job kinds read;
+        any other job is version 2 with the set options added to ``options``.
 
         Returns:
             The ``askvlm.stt.job`` mapping.
 
         """
+        extra = self.options_wire()
+        plain = self.kind == JOB_KIND_STT and not extra
         return {
             "schema": JOB_SCHEMA,
-            "version": JOB_VERSION,
-            "kind": JOB_KIND_STT,
+            "version": JOB_VERSION_PLAIN if plain else JOB_VERSION,
+            "kind": self.kind,
             "job_id": self.job_id,
             "call_id": self.call_id,
             "call_index": self.call_index,
@@ -558,7 +797,7 @@ class JobRecord:
                 "compute_type": self.request.compute_type,
                 "device": self.request.device,
             },
-            "options": {"language": self.language},
+            "options": {_OPTION_LANGUAGE: self.language, **extra},
             "priority": self.priority,
             "client": {"pid": self.client_pid},
         }
@@ -569,7 +808,10 @@ class JobRecord:
     ) -> Self:
         """Validate a job document and build the record.
 
-        Unknown extra fields are ignored for forward compatibility.
+        Unknown top-level fields are ignored for forward compatibility. A
+        version 1 document is read as before: its ``options`` carry only the
+        language and any other option key is ignored. A version 2 document
+        accepts only the known option keys and validates each strictly.
 
         Args:
             payload: Parsed job JSON.
@@ -582,11 +824,12 @@ class JobRecord:
 
         Raises:
             JobValidationError: With ``unsupported_version`` for a newer job
-                version, ``unsupported_kind`` for a kind other than ``stt``, and
-                ``input_invalid`` for any other violation.
+                version, ``unsupported_kind`` for a kind the version does not
+                know, and ``input_invalid`` for any other violation (including
+                options the job kind or provider does not take).
 
         """
-        _check_job_header(payload)
+        version, kind = _check_job_header(payload)
         job_id = payload.get("job_id")
         if not is_valid_id(job_id):
             msg = "job_id must be 32 lowercase hexadecimal characters"
@@ -602,7 +845,10 @@ class JobRecord:
         client = _mapping_field(payload.get("client"), "client")
         pid_raw = client.get("pid")
         options = _mapping_field(payload.get("options"), "options")
-        return cls(
+        extra = (
+            JobOptions() if version == JOB_VERSION_PLAIN else _parse_v2_options(options)
+        )
+        record = cls(
             job_id=job_id,
             call_id=call_id,
             call_index=_int_field(payload.get("call_index"), "call_index", minimum=0),
@@ -622,22 +868,121 @@ class JobRecord:
             ),
             input_path=_parse_input_path(payload.get("input_path")),
             duration_s=_optional_number_field(payload.get("duration_s"), "duration_s"),
-            request=_parse_request(payload.get("request")),
-            language=_parse_language(options.get("language")),
+            request=_parse_request(payload.get("request"), kind=kind),
+            language=_parse_language(options.get(_OPTION_LANGUAGE)),
             client_pid=(
                 None
                 if pid_raw is None
                 else _int_field(pid_raw, "client.pid", minimum=0)
             ),
             priority=_parse_priority(payload.get("priority")),
+            kind=kind,
+            want_segments=extra.want_segments,
+            decode=extra.decode,
+            window=extra.window,
+            diarize=extra.diarize,
         )
+        check_job_options(record)
+        return record
 
 
-def _check_job_header(payload: Mapping[str, object]) -> None:
+def check_job_options(job: JobRecord) -> None:
+    """Validate that a job's kind, provider and per-job options fit together.
+
+    Args:
+        job: Job to check.
+
+    Raises:
+        JobValidationError: With ``unsupported_kind`` for an unknown kind and
+            ``input_invalid`` when the provider does not serve the kind, the
+            kind does not take a given option, or Whisper-only decode options
+            meet a GigaAM provider.
+
+    """
+    try:
+        kind = parse_job_kind(job.kind)
+    except ValueError as exc:
+        raise JobValidationError(ERROR_KIND_UNSUPPORTED_KIND, str(exc)) from exc
+    provider_problem = _provider_kind_conflict(job.request.provider, kind)
+    if provider_problem is not None:
+        raise _invalid(provider_problem)
+    conflict = job_kind_conflict(
+        kind,
+        language=job.language,
+        want_segments=job.want_segments,
+        decode=job.decode,
+        diarize=job.diarize,
+    )
+    if conflict is not None:
+        raise _invalid(conflict)
+    if is_gigaam_provider(job.request.provider) and not job.decode.is_default:
+        names = ", ".join(job.decode.to_wire())
+        msg = (
+            f"Whisper-only decode options ({names}) are not supported by "
+            f"{job.request.provider}; omit them or use the whisper provider"
+        )
+        raise _invalid(msg)
+
+
+def _provider_kind_conflict(provider: str, kind: JobKind) -> str | None:
+    """Describe a provider that does not serve the job kind.
+
+    Args:
+        provider: Canonical provider of the request.
+        kind: Job kind.
+
+    Returns:
+        A description of the mismatch, or ``None`` when the provider fits.
+
+    """
+    if kind == JOB_KIND_DIARIZE and provider != DIARIZE_PROVIDER:
+        return (
+            f"request.provider must be {DIARIZE_PROVIDER!r} for a "
+            f"{JOB_KIND_DIARIZE} job (got {provider!r})"
+        )
+    if kind == JOB_KIND_STT and provider == DIARIZE_PROVIDER:
+        return (
+            f"request.provider {DIARIZE_PROVIDER!r} serves {JOB_KIND_DIARIZE} "
+            f"jobs only, not {JOB_KIND_STT} jobs"
+        )
+    return None
+
+
+def _parse_v2_options(options: Mapping[str, object]) -> JobOptions:
+    """Validate the per-job options of a version 2 job document.
+
+    Args:
+        options: The document's ``options`` object.
+
+    Returns:
+        The parsed options (the language is parsed separately).
+
+    Raises:
+        JobValidationError: With ``input_invalid`` for an unknown option key or
+            an invalid option value.
+
+    """
+    unknown = sorted(str(key) for key in options if key not in _V2_OPTION_KEYS)
+    if unknown:
+        msg = (
+            f"unknown option(s) options.{', options.'.join(unknown)}; "
+            f"expected: {', '.join(sorted(_V2_OPTION_KEYS))}"
+        )
+        raise _invalid(msg)
+    try:
+        return options_from_wire(options, where="options.")
+    except ValueError as exc:
+        raise _invalid(str(exc)) from exc
+
+
+def _check_job_header(payload: Mapping[str, object]) -> tuple[int, JobKind]:
     """Validate the schema, version and kind markers of a job document.
 
     Args:
         payload: Parsed job JSON.
+
+    Returns:
+        The document version and job kind.
 
     Raises:
         JobValidationError: With ``unsupported_version``, ``unsupported_kind`` or
@@ -658,9 +1003,13 @@ def _check_job_header(payload: Mapping[str, object]) -> None:
     if not isinstance(kind, str):
         msg = "kind must be a string"
         raise _invalid(msg)
-    if kind != JOB_KIND_STT:
-        msg = f"unsupported job kind {kind!r}"
+    if version == JOB_VERSION_PLAIN and kind != JOB_KIND_STT:
+        msg = f"unsupported job kind {kind!r} for job version {version}"
         raise JobValidationError(ERROR_KIND_UNSUPPORTED_KIND, msg)
+    try:
+        return version, parse_job_kind(kind)
+    except ValueError as exc:
+        raise JobValidationError(ERROR_KIND_UNSUPPORTED_KIND, str(exc)) from exc
 
 
 def _parse_input_path(value: object) -> str:
@@ -685,17 +1034,19 @@ def _parse_input_path(value: object) -> str:
     return value
 
 
-def _parse_request(value: object) -> JobRequest:
+def _parse_request(value: object, *, kind: JobKind) -> JobRequest:
     """Validate the ``request`` object of a job.
 
     Args:
         value: Candidate ``request`` value.
+        kind: Job kind, which decides the providers the request may name.
 
     Returns:
         The validated request with a canonical provider and device.
 
     Raises:
-        JobValidationError: With ``input_invalid`` when a field is invalid.
+        JobValidationError: With ``input_invalid`` when a field is invalid or
+            the provider does not serve the job kind.
 
     """
     if not isinstance(value, Mapping):
@@ -706,10 +1057,13 @@ def _parse_request(value: object) -> JobRequest:
         msg = "request.provider must be a non-empty string"
         raise _invalid(msg)
     try:
-        provider = normalize_stt_provider(raw_provider)
+        provider = normalize_pool_provider(raw_provider)
     except ValueError as exc:
         msg = f"request.provider: {exc}"
         raise _invalid(msg) from exc
+    provider_problem = _provider_kind_conflict(provider, kind)
+    if provider_problem is not None:
+        raise _invalid(provider_problem)
     raw_device = _text_field(value.get("device"), "request.device", "auto")
     try:
         device = normalize_device_request(provider, raw_device)
@@ -825,6 +1179,9 @@ class ResultRecord:
         attempts: Number of executions the job used.
         finished_at: Unix timestamp of the publication.
         timings: Named durations in seconds (``queued_s``, ``run_s``).
+        data: Structured payload of an ``ok``/``empty`` result (a JSON object
+            such as ``{"segments": [...]}`` or ``{"turns": [...]}``), or
+            ``None``.
 
     """
 
@@ -840,19 +1197,21 @@ class ResultRecord:
     attempts: int = 0
     finished_at: float = 0.0
     timings: dict[str, float] = field(default_factory=dict)
+    data: dict[str, object] | None = None
 
     def to_dict(self) -> dict[str, object]:
         """Return the JSON document of this result.
 
         Returns:
             The ``askvlm.stt.result`` mapping with ``error_detail`` truncated to
-            :data:`MAX_ERROR_DETAIL` characters.
+            :data:`MAX_ERROR_DETAIL` characters; ``data`` is present only when
+            set.
 
         """
         detail = self.error_detail
         if detail is not None and len(detail) > MAX_ERROR_DETAIL:
             detail = detail[:MAX_ERROR_DETAIL]
-        return {
+        document: dict[str, object] = {
             "schema": RESULT_SCHEMA,
             "version": RESULT_VERSION,
             "job_id": self.job_id,
@@ -868,12 +1227,18 @@ class ResultRecord:
             "finished_at": self.finished_at,
             "timings": dict(self.timings),
         }
+        if self.data is not None:
+            document["data"] = dict(self.data)
+        return document
 
     @classmethod
     def from_dict(cls, payload: Mapping[str, object]) -> Self:
         """Build a result from a document, tolerating missing or odd fields.
 
-        An unknown ``status`` becomes ``error``.
+        An unknown ``status`` becomes ``error``. A ``data`` value that is
+        neither an object nor ``null`` cannot be trusted either: the result
+        becomes an ``error`` of kind ``protocol_error`` (its payload is never
+        dropped silently into a seemingly complete success).
 
         Args:
             payload: Parsed result JSON; ``job_id`` must be a string.
@@ -893,12 +1258,28 @@ class ResultRecord:
         worker_key_raw = payload.get("worker_key")
         timings_raw = payload.get("timings")
         attempts_raw = payload.get("attempts")
+        status = _RESULT_STATUSES.get(str(payload.get("status")), "error")
+        text = str(payload.get("text") or "")
+        error_kind = _optional_text(payload.get("error_kind"))
+        error_detail = _optional_text(payload.get("error_detail"))
+        data_raw = payload.get("data")
+        data: dict[str, object] | None = None
+        if isinstance(data_raw, Mapping):
+            data = {str(key): item for key, item in data_raw.items()}
+        elif data_raw is not None:
+            status = "error"
+            text = ""
+            error_kind = ERROR_KIND_PROTOCOL_ERROR
+            error_detail = (
+                "malformed result document: data must be a JSON object or null "
+                f"(got {type(data_raw).__name__})"
+            )
         return cls(
             job_id=job_id,
-            status=_RESULT_STATUSES.get(str(payload.get("status")), "error"),
-            text=str(payload.get("text") or ""),
-            error_kind=_optional_text(payload.get("error_kind")),
-            error_detail=_optional_text(payload.get("error_detail")),
+            status=status,
+            text=text,
+            error_kind=error_kind,
+            error_detail=error_detail,
             warnings=(
                 tuple(str(item) for item in warnings_raw)
                 if isinstance(warnings_raw, list)
@@ -926,6 +1307,7 @@ class ResultRecord:
                 if isinstance(timings_raw, Mapping)
                 else {}
             ),
+            data=data,
         )
 
 
@@ -956,11 +1338,14 @@ def submit_job(paths: QueuePaths, job: JobRecord) -> None:
         job: The job to enqueue.
 
     Raises:
-        ValueError: When the job id is malformed or the serialized job exceeds
+        ValueError: When the job id is malformed, the job's kind, provider and
+            options do not fit together (a :class:`JobValidationError`, the
+            same check the supervisor applies), or the serialized job exceeds
             :data:`MAX_JOB_BYTES`.
 
     """
     target = paths.incoming_file(job.job_id)
+    check_job_options(job)
     payload = job.to_dict()
     size = len(fsio.dumps_json_bytes(payload))
     if size > MAX_JOB_BYTES:
@@ -1103,7 +1488,7 @@ def read_result(paths: QueuePaths, job_id: str) -> ResultRecord | None:
         The result, or ``None`` when it is absent or not yet fully readable.
 
     """
-    payload = fsio.read_json(paths.result_file(job_id))
+    payload = fsio.read_json(paths.result_file(job_id), max_bytes=MAX_RESULT_BYTES)
     if payload is None:
         return None
     # * The file name is authoritative for the job the result belongs to.

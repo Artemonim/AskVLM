@@ -16,6 +16,8 @@ import pytest
 from typer.testing import CliRunner
 
 import cli
+from core.sherpa_diarization import DiarizationBackendMissingError
+from core.stt_options import MediaWindow, WhisperDecodeOptions
 from core.stt_pool import fsio
 from core.stt_pool.queue import (
     JobRecord,
@@ -26,6 +28,7 @@ from core.stt_pool.queue import (
     write_heartbeat,
     write_result,
 )
+from tests.cli_structured_support import LocalModels, queue_peer
 from tests.stt_pool_client_support import ClientHarness
 from tests.stt_pool_supervisor_support import configuration
 
@@ -51,6 +54,13 @@ def _isolate_pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[N
         raise KeyboardInterrupt(msg)
 
     monkeypatch.setattr("core.stt_pool.client.spawn_supervisor", forbidden)
+
+    def forbid_models(*_args: object, **_options: object) -> object:
+        msg = "fast CLI scenarios must substitute their ML endpoints"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(cli, "_load_cli_runtime", forbid_models)
+    monkeypatch.setattr("core.sherpa_diarization.SherpaDiarizer", forbid_models)
     handlers = {
         kind: signal.getsignal(kind) for kind in (signal.SIGINT, signal.SIGTERM)
     }
@@ -148,6 +158,15 @@ def test_degraded_daemon_returns_code_without_client_cpu_recovery(
         pool_client.pool.plan(load_modes={model: "fail"})
     media = pool_client.media(mode="hold")
     local_loads = []
+    monkeypatch.setattr(cli, "run_client", pool_client.run)
+
+    if mode == "hold":
+
+        def expire_running_job() -> None:
+            pool_client.pool.until(lambda: pool_client.pool.events("submitted"), bool)
+            pool_client.pool.clock.advance(2)
+
+        pool_client.background(expire_running_job)
 
     def forbidden() -> object:
         local_loads.append(True)
@@ -407,7 +426,6 @@ def test_batch_exit_priority_and_partial_output_follow_terminal_queue_records(
 @pytest.mark.parametrize(
     "flags",
     [
-        ["--diarization"],
         ["--dialog-blocks"],
         ["--work-dir", "work"],
         ["--no-stdout"],
@@ -429,18 +447,19 @@ def test_daemon_validation_fails_before_queue_submission(
     result = _RUNNER.invoke(cli.app, ["external-transcribe", str(media), *flags])
     assert result.exit_code == 2, result.output
     assert not tuple((tmp_path / "queue").rglob("incoming/*.json"))
-    if flags[0] in {"--diarization", "--dialog-blocks", "--work-dir"}:
+    if flags[0] in {"--dialog-blocks", "--work-dir"}:
         assert flags[0] in result.output
         assert "--no-daemon" in result.output
 
 
-def test_no_daemon_rejects_several_inputs(tmp_path: Path) -> None:
+@pytest.mark.parametrize("command", ["external-transcribe", "external-diarize"])
+def test_no_daemon_rejects_several_inputs(tmp_path: Path, command: str) -> None:
     """Catch the legacy one-shot flow silently dropping all but its first argument."""
     paths = [tmp_path / f"{index}.wav" for index in range(2)]
     for path in paths:
         path.touch()
     result = _RUNNER.invoke(
-        cli.app, ["external-transcribe", *(str(path) for path in paths), "--no-daemon"]
+        cli.app, [command, *(str(path) for path in paths), "--no-daemon"]
     )
     assert result.exit_code == 2
 
@@ -1412,3 +1431,809 @@ def test_external_transcribe_rejects_invalid_gigaam_device(
     )
     assert result.exit_code != 0
     assert created["n"] == 0
+
+
+@pytest.mark.parametrize("command", ["external-transcribe", "external-diarize"])
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--start", "-1"],
+        ["--start", "nan"],
+        ["--start", "inf"],
+        ["--duration", "0"],
+        ["--duration", "0.0009"],
+        ["--duration", "nan"],
+        ["--duration", "inf"],
+    ],
+)
+def test_external_windows_reject_invalid_values_without_queue_or_models(
+    tmp_path: Path, command: str, flags: list[str]
+) -> None:
+    """Catch invalid windows reaching expensive processing on either CLI entry point."""
+    media = tmp_path / "clip.wav"
+    media.touch()
+    result = _RUNNER.invoke(cli.app, [command, str(media), *flags])
+    assert result.exit_code == 2, result.output
+    assert flags[0] in result.stderr
+    assert not list((tmp_path / "queue").rglob("incoming/*.json"))
+
+
+@pytest.mark.parametrize("provider", ["gigaam-ctc", "gigaam-e2e-ctc"])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--beam-size", "10"],
+        ["--vad"],
+        ["--no-vad"],
+        ["--condition-on-previous-text"],
+        ["--no-condition-on-previous-text"],
+        ["--word-timestamps"],
+        ["--no-word-timestamps"],
+    ],
+)
+def test_explicit_whisper_flags_fail_with_gigaam_on_both_execution_paths(
+    tmp_path: Path, provider: str, flags: list[str], *, local: bool
+) -> None:
+    """Catch silently ignored false or default-valued Whisper flags on GigaAM."""
+    media = tmp_path / "clip.wav"
+    media.touch()
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(media),
+            "--stt-provider",
+            provider,
+            "--device",
+            "cpu",
+            *flags,
+            *(["--no-daemon"] if local else []),
+        ],
+    )
+    assert result.exit_code == 2, result.output
+    assert provider in result.stderr
+    assert flags[0] in result.stderr
+    assert not list((tmp_path / "queue").rglob("incoming/*.json"))
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--format", "yaml"],
+        ["--beam-size", "0"],
+        ["--beam-size", "65"],
+        ["--format", "json", "--dialog-blocks", "--no-daemon"],
+    ],
+)
+def test_transcribe_structured_usage_errors_precede_processing(
+    tmp_path: Path, flags: list[str]
+) -> None:
+    """Catch unsupported structured-output combinations executing a model instead of exit 2."""
+    media = tmp_path / "clip.wav"
+    media.touch()
+    result = _RUNNER.invoke(cli.app, ["external-transcribe", str(media), *flags])
+    assert result.exit_code == 2, result.output
+    assert not list((tmp_path / "queue").rglob("incoming/*.json"))
+
+
+@pytest.mark.parametrize(
+    "flags",
+    [
+        ["--num-speakers", "0"],
+        ["--threshold", "0"],
+        ["--threshold", "nan"],
+        ["--threshold", "inf"],
+        ["--min-on", "-0.1"],
+        ["--min-on", "nan"],
+        ["--min-off", "-0.1"],
+        ["--min-off", "inf"],
+        ["--device", "cuda"],
+        ["--device", "invalid"],
+        ["--no-stdout"],
+        ["--priority", "urgent"],
+        ["--max-parallel", "0"],
+        ["--client-timeout", "nan"],
+    ],
+)
+def test_external_diarize_rejects_invalid_options_without_submitting(
+    tmp_path: Path, flags: list[str]
+) -> None:
+    """Catch invalid clustering, CPU-only or scheduling settings starting diarization."""
+    media = tmp_path / "clip.wav"
+    media.touch()
+    result = _RUNNER.invoke(cli.app, ["external-diarize", str(media), *flags])
+    assert result.exit_code == 2, result.output
+    assert flags[0] in result.stderr or flags[0] == "--no-stdout"
+    assert not list((tmp_path / "queue").rglob("incoming/*.json"))
+
+
+@pytest.mark.integration
+@pytest.mark.xdist_group(name="pool_supervisor")
+@pytest.mark.parametrize("provider", ["whisper", "gigaam-ctc", "gigaam-e2e-ctc"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_daemon_json_has_skill_document_null_speaker_and_safe_encodings(
+    pool_client: ClientHarness, tmp_path: Path, provider: str, *, empty: bool
+) -> None:
+    """Catch missing JSON on silence, incompatible envelopes, lost nulls or console encoding errors."""
+    segments = (
+        []
+        if empty
+        else [
+            {"start": 12.5, "end": 13.25, "text": "こんにちは"},
+            {"start": 14.0, "end": 15.0, "text": "Ёж🙂"},
+        ]
+    )
+    if segments and provider == "whisper":
+        segments[0].update(
+            no_speech_prob=0.123,
+            avg_logprob=-0.21,
+            words=[
+                {"word": "こんにちは", "start": 12.5, "end": 13.1, "probability": 0.999}
+            ],
+        )
+    turns = [] if empty else [{"start": 12.5, "end": 13.25, "speaker": "speaker_00"}]
+    media = pool_client.media(
+        stt={
+            "text": "" if empty else "こんにちは\nЁж🙂",
+            "data": {"segments": segments},
+        },
+        diarize={"data": {"turns": turns}},
+    )
+    output = tmp_path / "result.json"
+    output_dir = tmp_path / "documents"
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(media),
+            "--device",
+            "cpu",
+            "--format",
+            "json",
+            "--diarization",
+            "--stt-provider",
+            provider,
+            "--start",
+            "12.5",
+            "--duration",
+            "3",
+            *(
+                [
+                    "--beam-size",
+                    "64",
+                    "--no-vad",
+                    "--word-timestamps",
+                    "--no-condition-on-previous-text",
+                ]
+                if provider == "whisper"
+                else []
+            ),
+            "--output-file",
+            str(output),
+            "--output-dir",
+            str(output_dir),
+        ],
+    )
+    assert result.exit_code == 0, (result.exception, result.output)
+    assert result.stdout_bytes.isascii()
+    document = json.loads(result.stdout)
+    assert list(document) == ["media", "sample_rate", "segments", "turns"]
+    assert document["media"] == str(media)
+    assert document["sample_rate"] == 16000
+    assert [segment["speaker"] for segment in document["segments"]] == (
+        [] if empty else ["speaker_00", None]
+    )
+    assert document["turns"] == turns
+    assert json.loads(output.read_bytes()) == document
+    assert output.read_bytes() == (output_dir / f"{media.stem}.json").read_bytes()
+    assert output.read_bytes().endswith(os.linesep.encode())
+    assert result.stdout.startswith("{\n  ")
+    if not empty:
+        assert "こんにちは".encode() in output.read_bytes()
+        assert b"\\u3053" in result.stdout_bytes
+        if provider == "whisper":
+            assert document["segments"][0]["words"][0]["start"] == 12.5
+        else:
+            assert set(document["segments"][0]) == {"start", "end", "text", "speaker"}
+    events = pool_client.pool.events("submitted")
+    assert len(events) == 2
+    assert {event["kind"] for event in events} == {"stt", "diarize"}
+    assert all(
+        event["window"] == {"start_s": 12.5, "duration_s": 3.0} for event in events
+    )
+    stt_event = next(event for event in events if event["kind"] == "stt")
+    assert stt_event["decode"] == (
+        {
+            "beam_size": 64,
+            "vad_filter": False,
+            "word_timestamps": True,
+            "condition_on_previous_text": False,
+        }
+        if provider == "whisper"
+        else {}
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.xdist_group(name="pool_supervisor")
+@pytest.mark.parametrize("two_voices", [False, True])
+def test_daemon_diarization_queues_pair_and_preserves_text_rule(
+    pool_client: ClientHarness, *, two_voices: bool
+) -> None:
+    """Catch the obsolete supervisor rejection or incorrect one-voice text prefixes."""
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "first"},
+        {"start": 2.0, "end": 3.0, "text": "second"},
+    ]
+    media = pool_client.media(
+        stt={"text": "first\nsecond", "data": {"segments": segments}},
+        diarize={
+            "data": {
+                "turns": [
+                    {"start": 0.0, "end": 1.0, "speaker": "speaker_00"},
+                    {
+                        "start": 2.0,
+                        "end": 3.0,
+                        "speaker": "speaker_01" if two_voices else "speaker_00",
+                    },
+                ]
+            }
+        },
+    )
+    plain = _RUNNER.invoke(
+        cli.app, ["external-transcribe", str(media), "--device", "cpu"]
+    )
+    result = _RUNNER.invoke(
+        cli.app, ["external-transcribe", str(media), "--device", "cpu", "--diarization"]
+    )
+    assert plain.exit_code == result.exit_code == 0, result.output
+    if two_voices:
+        assert result.stdout.splitlines() == ["speaker_00: first", "speaker_01: second"]
+    else:
+        assert result.stdout_bytes == plain.stdout_bytes
+    events = pool_client.pool.events("submitted")
+    pair = events[1:]
+    assert len(pair) == 2
+    assert {event["kind"] for event in pair} == {"stt", "diarize"}
+    assert len({event["call_id"] for event in pair}) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.xdist_group(name="pool_supervisor")
+def test_external_diarize_forwards_options_and_writes_zero_turn_document(
+    pool_client: ClientHarness, tmp_path: Path
+) -> None:
+    """Catch diarize mode loading STT, dropping settings or treating silence as failure."""
+    media = pool_client.media(data={"turns": []})
+    output = tmp_path / "turns.json"
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-diarize",
+            str(media),
+            "--num-speakers",
+            "2",
+            "--threshold",
+            "0.7",
+            "--min-on",
+            "0",
+            "--min-off",
+            "0",
+            "--start",
+            "2.25",
+            "--duration",
+            "0.001",
+            "--priority",
+            "low",
+            "--max-parallel",
+            "1",
+            "--output-file",
+            str(output),
+            "--no-stdout",
+        ],
+    )
+    assert result.exit_code == 0, (result.exception, result.output)
+    assert result.stdout_bytes == b""
+    assert json.loads(output.read_bytes()) == {"media": str(media), "turns": []}
+    submitted = pool_client.pool.events("submitted")
+    assert len(submitted) == 1
+    event = submitted[0]
+    assert event["kind"] == "diarize"
+    assert event["language"] is None
+    assert event["priority"] == "low"
+    assert event["window"] == {"start_s": 2.25, "duration_s": 0.001}
+    assert event["diarize"] == {
+        "num_speakers": 2,
+        "threshold": 0.7,
+        "min_duration_on": 0.0,
+        "min_duration_off": 0.0,
+    }
+    assert {
+        event["key"]["provider"] for event in pool_client.pool.events("constructed")
+    } == {"sherpa-diarize"}
+
+
+@pytest.mark.integration
+@pytest.mark.xdist_group(name="pool_supervisor")
+@pytest.mark.parametrize("command", ["external-transcribe", "external-diarize"])
+def test_structured_batch_emits_documents_null_failures_and_utf8_json_lines(
+    pool_client: ClientHarness, tmp_path: Path, command: str
+) -> None:
+    """Catch wrong batch envelopes, output suffixes, missing empty documents or encoding loss."""
+    segment = {"start": 0.25, "end": 0.75, "text": "日本語"}
+    inputs = [
+        pool_client.media(
+            name="日本語/clip.wav",
+            text="日本語",
+            data={"segments": [segment], "turns": []},
+        ),
+        pool_client.media(
+            name="two/clip.wav", mode="empty", data={"segments": [], "turns": []}
+        ),
+        pool_client.media(name="three/clip.wav", mode="error"),
+    ]
+    output, directory = tmp_path / "batch.jsonl", tmp_path / "documents"
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            command,
+            *(str(path) for path in inputs),
+            "--device",
+            "cpu",
+            *(["--format", "json"] if command == "external-transcribe" else []),
+            "--output-file",
+            str(output),
+            "--output-dir",
+            str(directory),
+        ],
+    )
+    assert result.exit_code == 1, (result.exception, result.output)
+    assert result.stdout_bytes.isascii()
+    rows = [json.loads(line) for line in result.stdout.splitlines()]
+    assert [row["index"] for row in rows] == [0, 1, 2]
+    assert [row["input"] for row in rows] == [str(path) for path in inputs]
+    assert [row["status"] for row in rows] == (
+        ["ok", "empty", "error"]
+        if command == "external-transcribe"
+        else ["ok", "ok", "error"]
+    )
+    assert rows[2]["result"] is None
+    assert rows[2]["output"] is None
+    assert [
+        json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()
+    ] == [row["result"] for row in rows]
+    assert json.loads((directory / "clip.json").read_bytes()) == rows[0]["result"]
+    assert json.loads((directory / "clip-2.json").read_bytes()) == rows[1]["result"]
+    assert not (directory / "clip-3.json").exists()
+    if command == "external-transcribe":
+        assert "日本語".encode() in output.read_bytes()
+        assert rows[0]["result"]["sample_rate"] == 16000
+    else:
+        assert all("text" not in row for row in rows)
+        assert set(rows[0]["result"]) == {"media", "turns"}
+        assert "日本語".encode() in output.read_bytes()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize(
+    ("status", "code", "marker"),
+    [
+        ("ok", 0, None),
+        ("error", 1, None),
+        ("expired", 10, "ASKVLM_CLIENT_TIMEOUT:"),
+        ("unavailable", 11, "ASKVLM_DAEMON_UNAVAILABLE:"),
+    ],
+)
+def test_external_diarize_maps_terminal_records_to_exit_codes_and_markers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    code: int,
+    marker: str | None,
+    *,
+    batch: bool,
+) -> None:
+    """Catch diarize failures returning success, losing markers or contaminating stdout."""
+    media = tmp_path / "clip.wav"
+    media.touch()
+    other = tmp_path / "other.wav"
+    other.touch()
+    monkeypatch.setattr("core.stt_pool.client._probe_with_ffprobe", lambda _p, _t: None)
+    monkeypatch.setattr(
+        "core.stt_pool.client.spawn_supervisor",
+        queue_peer(
+            {
+                (0, "diarize"): ResultRecord("", status, data={"turns": []}),
+                (1, "diarize"): ResultRecord("", "ok", data={"turns": []}),
+            }
+        ),
+    )
+    result = _RUNNER.invoke(
+        cli.app, ["external-diarize", str(media), *([str(other)] if batch else [])]
+    )
+    assert result.exit_code == code, (result.exception, result.output)
+    if batch:
+        rows = [json.loads(line) for line in result.stdout.splitlines()]
+        assert len(rows) == 2
+        assert rows[0]["result"] == (
+            {"media": str(media), "turns": []} if code == 0 else None
+        )
+        assert rows[1]["status"] == "ok"
+    elif code == 0:
+        assert json.loads(result.stdout) == {"media": str(media), "turns": []}
+    else:
+        assert result.stdout_bytes == b""
+    if marker is not None:
+        assert marker in result.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("merge", [False, True])
+@pytest.mark.parametrize("two_voices", [False, True])
+def test_local_diarization_finishes_before_stt_and_merges_formatted_segments(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, merge: bool, two_voices: bool
+) -> None:
+    """Catch concurrent model allocation, pyannote dispatch or lost dialog-block speaker merges."""
+    models = LocalModels()
+    if not two_voices:
+        models.turns = [{"start": 0.0, "end": 4.0, "speaker": "speaker_00"}]
+    models.install(monkeypatch, tmp_path)
+    media = tmp_path / "clip.wav"
+    media.touch()
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(media),
+            "--device",
+            "cpu",
+            "--no-daemon",
+            "--diarization",
+            *(["--dialog-blocks"] if merge else []),
+        ],
+    )
+    assert result.exit_code == 0, (result.exception, result.output)
+    if two_voices:
+        assert result.stdout.splitlines() == (
+            ["speaker_00: first second", "speaker_01: last"]
+            if merge
+            else ["speaker_00: first", "speaker_00: second", "speaker_01: last"]
+        )
+    else:
+        plain = _RUNNER.invoke(
+            cli.app,
+            [
+                "external-transcribe",
+                str(media),
+                "--device",
+                "cpu",
+                "--no-daemon",
+                *(["--dialog-blocks"] if merge else []),
+            ],
+        )
+        assert plain.exit_code == 0, plain.output
+        assert result.stdout_bytes == plain.stdout_bytes
+    assert models.pipeline_options[0]["enable_diarization"] is False
+    assert models.closed
+    assert all(not directory.exists() for directory in models.directories)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("structured", [False, True])
+def test_local_segment_count_mismatch_fails_text_but_keeps_raw_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, structured: bool
+) -> None:
+    """Catch mislabelling formatted text or blocking valid JSON on unrelated document segments."""
+    models = LocalModels()
+    models.document.segments.pop()
+    models.install(monkeypatch, tmp_path)
+    media = tmp_path / "clip.wav"
+    media.touch()
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(media),
+            "--device",
+            "cpu",
+            "--no-daemon",
+            "--diarization",
+            *(["--format", "json"] if structured else []),
+        ],
+    )
+    assert result.exit_code == (0 if structured else 1), result.output
+    assert models.closed
+    if structured:
+        assert len(json.loads(result.stdout)["segments"]) == 3
+    else:
+        assert result.stdout_bytes == b""
+
+
+@pytest.mark.integration
+def test_local_options_reach_models_and_json_times_use_one_offset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch dropped false overrides, ignored cuts or duplicate offsets on the local path."""
+    models = LocalModels()
+    models.require_diarize = False
+    models.install(monkeypatch, tmp_path)
+    media = tmp_path / "clip.wav"
+    media.touch()
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(media),
+            "--device",
+            "cpu",
+            "--no-daemon",
+            "--format",
+            "json",
+            "--start",
+            "12.5",
+            "--duration",
+            "4",
+            "--beam-size",
+            "3",
+            "--no-vad",
+            "--no-word-timestamps",
+            "--no-condition-on-previous-text",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert models.process_options == [
+        {
+            "media_window": MediaWindow(12.5, 4.0),
+            "decode_options": WhisperDecodeOptions(
+                beam_size=3,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                word_timestamps=False,
+            ),
+        }
+    ]
+    assert [segment["start"] for segment in json.loads(result.stdout)["segments"]] == [
+        12.6,
+        13.6,
+        15.6,
+    ]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "error_type", [None, ValueError, DiarizationBackendMissingError]
+)
+def test_external_diarize_local_uses_cpu_options_and_cleans_work_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_type: type[Exception] | None
+) -> None:
+    """Catch local diarize ignoring its options, loading STT or leaking temporary audio on error."""
+    models = LocalModels()
+    models.install(monkeypatch, tmp_path)
+    media = tmp_path / "clip.wav"
+    media.touch()
+    if error_type is not None:
+        models.error = error_type(f"{media}; pip install -e .[ml]")
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-diarize",
+            str(media),
+            "--no-daemon",
+            "--num-speakers",
+            "2",
+            "--threshold",
+            "0.7",
+            "--min-on",
+            "0.2",
+            "--min-off",
+            "0.8",
+            "--start",
+            "1.25",
+            "--duration",
+            "4",
+        ],
+    )
+    assert result.exit_code == (0 if error_type is None else 1), result.output
+    options, window, threads = models.diarize_options[0]
+    assert (
+        options.num_speakers,
+        options.threshold,
+        options.min_duration_on,
+        options.min_duration_off,
+    ) == (2, 0.7, 0.2, 0.8)
+    assert window == MediaWindow(1.25, 4.0)
+    assert threads == 4
+    assert not models.pipeline_options
+    assert all(not directory.exists() for directory in models.directories)
+    if error_type is None:
+        assert json.loads(result.stdout)["turns"] == models.turns
+    else:
+        assert result.stdout_bytes == b""
+        assert str(media) in result.stderr
+        if error_type is DiarizationBackendMissingError:
+            assert "pip install" in result.stderr
+            assert ".[ml]" in result.stderr
+
+
+@pytest.mark.integration
+def test_internal_child_publishes_structured_success_before_model_close_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch cleanup failure destroying the successful child's structured IPC result."""
+    models = LocalModels()
+    models.close_error = RuntimeError("fixture teardown failure")
+    models.child_result = tmp_path / "child.json"
+    models.install(monkeypatch, tmp_path)
+    media = tmp_path / "clip.wav"
+    media.touch()
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(media),
+            "--device",
+            "cpu",
+            "--diarization",
+            "--format",
+            "json",
+            "--_internal-child-mode",
+            f"--_internal-result-file={models.child_result}",
+        ],
+    )
+    assert result.exit_code == 1
+    assert result.stdout_bytes == b""
+    assert models.result_at_close is not None
+    assert models.result_at_close["status"] == "ok"
+    assert set(models.result_at_close["data"]) == {"segments", "turns", "speakers"}
+    assert json.loads(models.child_result.read_bytes()) == models.result_at_close
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("retry", [False, True])
+@pytest.mark.parametrize("enabled", [False, True])
+def test_windows_child_round_trip_preserves_all_options_and_structured_data(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, retry: bool, enabled: bool
+) -> None:
+    """Catch flags lost on child/CPU retry or structured results discarded by the parent."""
+    models = LocalModels()
+    models.turns = [
+        {"start": 12.5, "end": 14.5, "speaker": "speaker_00"},
+        {"start": 15.5, "end": 16.5, "speaker": "speaker_01"},
+    ]
+    models.install(monkeypatch, tmp_path)
+    media = tmp_path / "clip.wav"
+    media.touch()
+    devices = []
+
+    def child(
+        command: list[str], **options: object
+    ) -> subprocess.CompletedProcess[str]:
+        devices.append(command[command.index("--device") + 1])
+        if retry and len(devices) == 1:
+            return subprocess.CompletedProcess(
+                command, 3221226505, "", "native failure"
+            )
+        nested = CliRunner().invoke(cli.app, command[2:], env=options["env"])
+        return subprocess.CompletedProcess(
+            command, nested.exit_code, nested.stdout, nested.stderr
+        )
+
+    monkeypatch.setattr(subprocess, "run", child)
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(media),
+            "--no-daemon",
+            "--device",
+            "cuda",
+            "--diarization",
+            "--format",
+            "json",
+            "--start",
+            "12.5",
+            "--duration",
+            "4",
+            "--beam-size",
+            "3",
+            "--vad" if enabled else "--no-vad",
+            "--word-timestamps" if enabled else "--no-word-timestamps",
+            "--condition-on-previous-text"
+            if enabled
+            else "--no-condition-on-previous-text",
+        ],
+    )
+    assert result.exit_code == 0, (result.exception, result.output)
+    assert devices == (["cuda", "cpu"] if retry else ["cuda"])
+    assert models.process_options[0] == {
+        "media_window": MediaWindow(12.5, 4.0),
+        "decode_options": WhisperDecodeOptions(
+            beam_size=3,
+            vad_filter=enabled,
+            condition_on_previous_text=enabled,
+            word_timestamps=enabled,
+        ),
+    }
+    document = json.loads(result.stdout)
+    assert [segment["start"] for segment in document["segments"]] == [12.6, 13.6, 15.6]
+    assert [segment["speaker"] for segment in document["segments"]] == [
+        "speaker_00",
+        "speaker_00",
+        "speaker_01",
+    ]
+    assert document["turns"] == models.turns
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("data", [None, [], "invalid"])
+def test_windows_parent_rejects_non_object_child_data_without_publishing_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, data: object
+) -> None:
+    """Catch malformed child IPC being accepted as successful structured output."""
+    media = tmp_path / "clip.wav"
+    media.touch()
+    calls = []
+
+    def child(
+        command: list[str], **_options: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        target = Path(
+            next(
+                arg.split("=", 1)[1]
+                for arg in command
+                if arg.startswith("--_internal-result-file=")
+            )
+        )
+        target.write_text(
+            json.dumps({"status": "ok", "text": "text", "data": data}), encoding="utf-8"
+        )
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", child)
+    monkeypatch.setattr(cli.tempfile, "tempdir", str(tmp_path))
+    result = _RUNNER.invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(media),
+            "--no-daemon",
+            "--device",
+            "cuda",
+            "--format",
+            "json",
+        ],
+    )
+    assert result.exit_code == 1, result.output
+    assert result.stdout_bytes == b""
+    assert len(calls) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("command", ["external-transcribe", "external-diarize"])
+def test_external_help_registers_options_without_importing_ml_packages(
+    command: str,
+) -> None:
+    """Catch a CLI help/import path allocating ML runtimes or omitting the new entry point."""
+    result = subprocess.run(  # noqa: S603 - fixed test entry and documented command names
+        [
+            sys.executable,
+            "-m",
+            "tests.stt_pool_cli_entry",
+            "--guard-imports",
+            command,
+            "--help",
+        ],
+        env={**os.environ, "NO_COLOR": "1", "TERM": "dumb", "COLUMNS": "160"},
+        capture_output=True,
+        check=False,
+        timeout=30,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert result.returncode == 0, result.stderr
+    assert b"--start" in result.stdout
+    assert (
+        b"--format" if command == "external-transcribe" else b"--num-speakers"
+    ) in result.stdout

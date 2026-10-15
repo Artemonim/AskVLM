@@ -15,6 +15,7 @@ from .diarization import DiarizationPipeline
 from .ffmpeg import get_media_duration_seconds
 from .llm_formatter import LLMFormatter
 from .settings import configure_ml_caches, get_project_cache_dir
+from .stt_options import WHISPER_PIPELINE_DEFAULTS, MediaWindow, WhisperDecodeOptions
 from .stt_providers import (
     STT_PROVIDER_GIGAAM_E2E_CTC,
     STT_PROVIDER_WHISPER,
@@ -43,6 +44,31 @@ class _Unset(enum.Enum):
 _UNSET: Final = _Unset.TOKEN
 # * Device tokens accepted by strict device mode (no ``auto`` coercion).
 _STRICT_DEVICES = frozenset({"cpu", "cuda"})
+
+
+def _window_duration_s(media_duration_s: float, window: MediaWindow | None) -> float:
+    """Return the length in seconds that segment times are measured against.
+
+    Segment times are relative to the window start, so progress is computed
+    against the window and not against the whole media.
+
+    Args:
+        media_duration_s: Duration of the whole media (``0.0`` when unknown).
+        window: The requested window, or ``None`` for the whole media.
+
+    Returns:
+        *media_duration_s* without a window; otherwise the window length
+        limited by the remaining media (``0.0`` when both are unknown).
+
+    """
+    if window is None:
+        return media_duration_s
+    available_s = media_duration_s - window.start_s if media_duration_s > 0 else 0.0
+    if window.duration_s is None:
+        return max(0.0, available_s)
+    if available_s > 0:
+        return min(window.duration_s, available_s)
+    return window.duration_s
 
 
 def _strict_device(device: str) -> str:
@@ -223,6 +249,32 @@ class LocalPipeline:
             return
         self.require_whisperx().ensure_loaded()
 
+    def _reject_gigaam_decode_options(
+        self, decode_options: WhisperDecodeOptions | None
+    ) -> None:
+        """Fail when Whisper-only decoding options meet a GigaAM provider.
+
+        Args:
+            decode_options: Whisper decoding overrides of the call, if any.
+
+        Raises:
+            ValueError: The provider is GigaAM and any decoding option is set
+                explicitly.
+
+        """
+        if (
+            not is_gigaam_provider(self.stt_provider)
+            or decode_options is None
+            or decode_options.is_default
+        ):
+            return
+        names = ", ".join(sorted(decode_options.to_wire()))
+        msg = (
+            f"The decoding options ({names}) apply to the Whisper STT provider "
+            f"only; the {self.stt_provider} provider does not support them"
+        )
+        raise ValueError(msg)
+
     def _transcribe_audio(
         self,
         audio_path: Path,
@@ -231,6 +283,7 @@ class LocalPipeline:
         on_segment: Callable[[dict[str, object]], None],
         subtitle_max_line_width: int | None,
         subtitle_max_lines: int | None,
+        decode_options: WhisperDecodeOptions | None = None,
     ) -> tuple[dict[str, Any], str]:
         """Dispatch ASR to the selected provider without cross-wiring kwargs.
 
@@ -240,12 +293,18 @@ class LocalPipeline:
             on_segment: Segment streaming callback.
             subtitle_max_line_width: Whisper subtitle layout hint.
             subtitle_max_lines: Whisper subtitle layout hint.
+            decode_options: Whisper decoding overrides of this call; only the
+                values that differ from the pipeline defaults are forwarded.
 
         Returns:
             ``(transcript_dict, asr_label)`` for progress reporting.
 
+        Raises:
+            ValueError: Non-default ``decode_options`` with a GigaAM provider.
+
         """
         if is_gigaam_provider(self.stt_provider):
+            self._reject_gigaam_decode_options(decode_options)
             if self.gigaam is None:
                 msg = "GigaAM CTC backend is not configured"
                 raise RuntimeError(msg)
@@ -263,11 +322,17 @@ class LocalPipeline:
                 self.stt_provider,
             )
         whisper = self.require_whisperx()
+        # * faster-whisper applies ``condition_on_previous_text=True`` by itself, so
+        # * it is forwarded only when a request disables it.
         wx_kwargs: dict[str, object] = {
-            "beam_size": 10,
-            "vad_filter": True,
-            "word_timestamps": True,
+            key: value
+            for key, value in WHISPER_PIPELINE_DEFAULTS.items()
+            if key != "condition_on_previous_text"
         }
+        if decode_options is not None:
+            wx_kwargs.update(
+                decode_options.transcribe_overrides(WHISPER_PIPELINE_DEFAULTS)
+            )
         if subtitle_max_line_width is not None:
             wx_kwargs["max_line_width"] = int(subtitle_max_line_width)
         if subtitle_max_lines is not None:
@@ -321,7 +386,7 @@ class LocalPipeline:
         """Release heavy ML resources when leaving the context manager."""
         self.close(aggressive=True)
 
-    def process(  # noqa: C901, PLR0915
+    def process(  # noqa: C901, PLR0913, PLR0915
         self,
         input_path: Path,
         work_dir: Path = Path(),
@@ -331,6 +396,8 @@ class LocalPipeline:
         subtitle_max_lines: int | None = None,
         should_cancel: Callable[[], bool] | None = None,
         language: str | None | _Unset = _UNSET,
+        media_window: MediaWindow | None = None,
+        decode_options: WhisperDecodeOptions | None = None,
     ) -> Document:
         """Process a media file through the pipeline and return a formatted document.
 
@@ -342,8 +409,8 @@ class LocalPipeline:
         device mode (the default mode's CUDA→CPU recovery reloads the shared
         model), Whisper runs with ``num_workers`` at least the number of
         concurrent calls, and GigaAM runs with ``gigaam_threadsafe=True``. The
-        per-call ``language`` is passed by value and never stored on the
-        instance.
+        per-call ``language``, ``media_window`` and ``decode_options`` are
+        passed by value and never stored on the instance.
 
         Args:
             input_path: Path to media file (audio/video).
@@ -355,9 +422,28 @@ class LocalPipeline:
             language: Language of this call only, overriding the pipeline's
                 ``language`` (``None`` = auto-detect); omitted means the
                 pipeline's ``language``.
+            media_window: Part of the media to transcribe; ``None`` or the
+                default window covers the whole media. Segment times of the
+                result are relative to the window start.
+            decode_options: Whisper decoding overrides of this call; ``None``
+                or all-default keeps the pipeline defaults.
+
+        Returns:
+            The transcript document. ``Document.transcript_segments`` holds the
+            raw backend segments (window-relative times; Whisper segments also
+            carry scores and word timings).
+
+        Raises:
+            ValueError: Non-default ``decode_options`` with a GigaAM provider,
+                or a window that decodes to no audio.
 
         """
         call_language = self.language if isinstance(language, _Unset) else language
+        # * Fail before any audio work.
+        self._reject_gigaam_decode_options(decode_options)
+        window = (
+            None if media_window is None or media_window.is_default else media_window
+        )
 
         def report(msg: str, frac: float) -> None:
             if progress is not None:
@@ -367,15 +453,24 @@ class LocalPipeline:
 
         report("Preparing audio", 0.05)
         # * Step 1: Ensure audio is in WAV format (cancellable)
-        audio_path = prepare_audio(
-            input_path,
-            work_dir,
-            should_cancel=should_cancel,
-        )
+        if window is None:
+            audio_path = prepare_audio(
+                input_path,
+                work_dir,
+                should_cancel=should_cancel,
+            )
+        else:
+            audio_path = prepare_audio(
+                input_path,
+                work_dir,
+                should_cancel=should_cancel,
+                start_s=window.start_s,
+                duration_s=window.duration_s,
+            )
         report("Audio prepared", 0.15)
 
         # * Media duration (for ETA and streaming progress)
-        duration_s = get_media_duration_seconds(input_path)
+        duration_s = _window_duration_s(get_media_duration_seconds(input_path), window)
 
         # * Step 2: Transcribe audio to raw text
         raw_text = ""
@@ -434,6 +529,7 @@ class LocalPipeline:
                 on_segment=_on_segment,
                 subtitle_max_line_width=subtitle_max_line_width,
                 subtitle_max_lines=subtitle_max_lines,
+                decode_options=decode_options,
             )
         except Exception as exc:
             report(f"ASR failed: {exc}", 0.6)
@@ -483,6 +579,8 @@ class LocalPipeline:
         )
         # * Mark document so text/JSON exporters can build dialog blocks when enabled
         doc.dialog_blocks_enabled = bool(self.enable_dialog_blocks)
+        # * Per-call data lives on the returned document, never on the shared pipeline.
+        doc.transcript_segments = transcript_segments
         report("Document built", 0.98)
         # * Export subtitle artifacts are configured later using options passed from GUI
         # * Export-time subtitle layout rules are applied by exporters

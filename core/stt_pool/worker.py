@@ -40,6 +40,7 @@ from typing import IO, TYPE_CHECKING, Literal, NoReturn, TypeGuard
 from core.stt_errors import DeviceUnavailableError
 from core.stt_pool import ipc
 from core.stt_pool.engine_api import (
+    ERROR_KIND_RESULT_TOO_LARGE,
     ERROR_KIND_TRANSCRIBE_FAILED,
     EngineResult,
     WorkerSpec,
@@ -279,8 +280,10 @@ class _ResultEmitter:
 
     After :meth:`seal` nothing more is written, so ``bye`` or ``fatal`` stays
     the last message of the process. A result that cannot be encoded is
-    replaced by a ``protocol_error`` result for the same attempt, so the
-    supervisor never waits for an answer that was lost.
+    replaced by a ``protocol_error`` result for the same attempt, and a result
+    whose protocol line would exceed :data:`~core.stt_pool.ipc.MAX_LINE_BYTES`
+    (the supervisor's reader would skip it) by a ``result_too_large`` result,
+    so the supervisor never waits for an answer that was lost.
     """
 
     def __init__(self, channel: ipc.WorkerChannel, backend: Backend) -> None:
@@ -305,12 +308,18 @@ class _ResultEmitter:
                 )
                 return
             try:
-                self._channel.send(result.to_message())
+                message = result.to_message()
+                size = _line_bytes(message)
+                if size <= ipc.MAX_LINE_BYTES:
+                    self._channel.send(message)
             except Exception as exc:
                 # * The engine thread must survive and the attempt still needs
                 # * its one answer.
                 logger.exception("engine result cannot be encoded")
                 self._send_replacement(result, exc)
+                return
+            if size > ipc.MAX_LINE_BYTES:
+                self._send_oversized(result, size)
 
     def emit_protocol_error(self, job_id: str, attempt_id: str, detail: str) -> None:
         """Answer one attempt with an ``error`` result of kind ``protocol_error``.
@@ -363,6 +372,48 @@ class _ResultEmitter:
         detail = f"engine result cannot be encoded: {error_detail_for_exception(exc)}"
         replacement = self._protocol_error(job_id, attempt_id, detail)
         self._channel.send(replacement.to_message())
+
+    def _send_oversized(self, result: EngineResult, size: int) -> None:
+        """Answer the attempt of a too large *result* (the caller holds the lock)."""
+        logger.error(
+            "engine result too large for the protocol; sending %s instead: "
+            "job_id=%s attempt_id=%s status=%s size_bytes=%d limit_bytes=%d",
+            ERROR_KIND_RESULT_TOO_LARGE,
+            result.job_id,
+            result.attempt_id,
+            result.status,
+            size,
+            ipc.MAX_LINE_BYTES,
+        )
+        replacement = EngineResult(
+            job_id=result.job_id,
+            attempt_id=result.attempt_id,
+            status="error",
+            text="",
+            error_kind=ERROR_KIND_RESULT_TOO_LARGE,
+            error_detail=(
+                f"the {result.status} result is {size} bytes, over the worker "
+                f"protocol line limit of {ipc.MAX_LINE_BYTES} bytes"
+            ),
+            backend=self._backend,
+            run_s=result.run_s,
+            audio_s=result.audio_s,
+        )
+        self._channel.send(replacement.to_message())
+
+
+def _line_bytes(message: Mapping[str, object]) -> int:
+    """Return the UTF-8 size of *message*'s protocol line without its newline.
+
+    The supervisor's reader accepts a line whose content is at most
+    :data:`~core.stt_pool.ipc.MAX_LINE_BYTES` bytes.
+
+    Raises:
+        TypeError: When *message* holds a value JSON cannot serialize.
+        ValueError: When *message* contains a circular reference.
+
+    """
+    return len(ipc.encode_message(message).encode("utf-8")) - 1
 
 
 # * ---------------------------------------------------------------------------

@@ -1,8 +1,11 @@
 """Worker keys and request normalization for the STT worker pool.
 
 A :class:`WorkerKey` names one worker configuration: the provider, the model
-identity, the compute type and the backend class (CPU or GPU). Everything here
-is torch-free so the thin client and the supervisor can import it directly.
+identity, the compute type and the backend class (CPU or GPU). Besides the STT
+providers of :mod:`core.stt_providers`, the pool knows the speaker diarization
+pseudo-provider :data:`DIARIZE_PROVIDER`; :func:`worker_kind` tells the two
+apart. Everything here is torch-free so the thin client and the supervisor can
+import it directly.
 """
 
 from __future__ import annotations
@@ -10,7 +13,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, Self
+from typing import TYPE_CHECKING, Final, Literal, Self
 
 from core.stt_providers import (
     GIGAAM_CPU_ONLY_PROVIDERS,
@@ -33,6 +36,20 @@ Backend = Literal["cpu", "gpu"]
 DeviceRequest = Literal["auto", "cpu", "cuda"]
 ProviderFamily = Literal["whisper", "gigaam"]
 Priority = Literal["high", "normal", "low"]
+WorkerKind = Literal["stt", "diarize"]
+
+# * Pseudo-provider of the speaker diarization workers (sherpa-onnx on CPU). It
+# * is deliberately absent from ``STT_PROVIDER_CHOICES``, so it never reaches
+# * ``--stt-provider`` or the STT pipeline.
+DIARIZE_PROVIDER: Final = "sherpa-diarize"
+
+# * Model identity of the diarization worker key: pyannote segmentation 3.0
+# * plus the WeSpeaker ResNet34-LM speaker embedding (pinned in
+# * ``core.diarization_models``).
+DIARIZE_MODEL_IDENTITY: Final = "pyannote-seg-3.0+wespeaker-resnet34-lm"
+
+# * The diarization networks always run in fp32.
+DIARIZE_COMPUTE_TYPE: Final = "fp32"
 
 # * Call priority classes, most urgent first, and the class used when none is given.
 PRIORITIES: tuple[Priority, ...] = ("high", "normal", "low")
@@ -93,8 +110,62 @@ def _require_backend(value: str) -> Backend:
     raise ValueError(msg)
 
 
+def _is_diarize_provider(provider: str | None) -> bool:
+    """Return whether *provider* names the diarization pseudo-provider.
+
+    Args:
+        provider: Raw provider token (compared stripped and case-insensitively).
+
+    Returns:
+        ``True`` for :data:`DIARIZE_PROVIDER`.
+
+    """
+    return provider is not None and str(provider).strip().lower() == DIARIZE_PROVIDER
+
+
+def normalize_pool_provider(value: str | None) -> str:
+    """Normalize the provider of a pool worker or job.
+
+    Args:
+        value: Raw provider token; ``None`` or blank selects the Whisper default.
+
+    Returns:
+        :data:`DIARIZE_PROVIDER`, or the canonical STT provider id.
+
+    Raises:
+        ValueError: When *value* names neither an STT provider nor the
+            diarization pseudo-provider.
+
+    """
+    if _is_diarize_provider(value):
+        return DIARIZE_PROVIDER
+    return normalize_stt_provider(value)
+
+
+def worker_kind(provider: str) -> WorkerKind:
+    """Return whether a provider serves speech-to-text or speaker diarization.
+
+    Callers that may see a diarization key branch on this before using any
+    STT-only helper such as :func:`provider_family`.
+
+    Args:
+        provider: Raw or canonical provider id.
+
+    Returns:
+        ``diarize`` for :data:`DIARIZE_PROVIDER`, ``stt`` for an STT provider.
+
+    Raises:
+        ValueError: When *provider* is not a supported provider id.
+
+    """
+    return "diarize" if normalize_pool_provider(provider) == DIARIZE_PROVIDER else "stt"
+
+
 def provider_family(provider: str) -> ProviderFamily:
     """Return the provider family that decides batching and host-thread limits.
+
+    STT providers only: callers that may see the diarization pseudo-provider
+    branch on :func:`worker_kind` first.
 
     Args:
         provider: Raw or canonical STT provider id.
@@ -103,7 +174,8 @@ def provider_family(provider: str) -> ProviderFamily:
         ``gigaam`` for both GigaAM heads, otherwise ``whisper``.
 
     Raises:
-        ValueError: When *provider* is not a supported provider id.
+        ValueError: When *provider* is not a supported STT provider id (the
+            diarization pseudo-provider included).
 
     """
     canonical = normalize_stt_provider(provider)
@@ -114,21 +186,24 @@ def model_identity(provider: str, whisper_model: str) -> str:
     """Return the model identity that is part of a worker key.
 
     Args:
-        provider: Raw or canonical STT provider id.
-        whisper_model: Requested Whisper model name; ignored for GigaAM.
+        provider: Raw or canonical provider id.
+        whisper_model: Requested Whisper model name; ignored for GigaAM and
+            diarization.
 
     Returns:
         The stripped Whisper model name in the caller's spelling (model names,
         Hugging Face repo ids and local paths are case-sensitive), ``large-v3``
         for ``auto`` (compared case-insensitively, as the pipeline resolves it),
-        ``small`` when blank, or the fixed ``<repo>@<revision>`` identity of
-        the GigaAM head.
+        ``small`` when blank, the fixed ``<repo>@<revision>`` identity of the
+        GigaAM head, or :data:`DIARIZE_MODEL_IDENTITY`.
 
     Raises:
         ValueError: When *provider* is not a supported provider id.
 
     """
-    canonical = normalize_stt_provider(provider)
+    canonical = normalize_pool_provider(provider)
+    if canonical == DIARIZE_PROVIDER:
+        return DIARIZE_MODEL_IDENTITY
     if canonical == STT_PROVIDER_GIGAAM_CTC:
         return f"{GIGAAM_HF_REPO_ID}@{GIGAAM_HF_REVISION}"
     if canonical == STT_PROVIDER_GIGAAM_E2E_CTC:
@@ -143,21 +218,24 @@ def normalize_compute_type(provider: str, requested: str, backend: Backend) -> s
     """Resolve the requested compute type to the one the backend actually uses.
 
     Args:
-        provider: Raw or canonical STT provider id.
+        provider: Raw or canonical provider id.
         requested: Requested compute type (``auto`` when blank).
         backend: Backend class the worker runs on.
 
     Returns:
-        ``fp32`` for GigaAM. For Whisper on CPU, ``auto``/``float16``/
-        ``int8_float16``/``int8`` resolve to ``int8``; on GPU ``auto`` resolves
-        to ``float16``. Any other token passes through lowercased.
+        ``fp32`` for GigaAM and diarization. For Whisper on CPU, ``auto``/
+        ``float16``/``int8_float16``/``int8`` resolve to ``int8``; on GPU
+        ``auto`` resolves to ``float16``. Any other token passes through
+        lowercased.
 
     Raises:
         ValueError: When the provider or the backend is invalid.
 
     """
-    canonical = normalize_stt_provider(provider)
+    canonical = normalize_pool_provider(provider)
     resolved_backend = _require_backend(backend)
+    if canonical == DIARIZE_PROVIDER:
+        return DIARIZE_COMPUTE_TYPE
     if is_gigaam_provider(canonical):
         return GIGAAM_COMPUTE_TYPE
     compute = str(requested).strip().lower() or "auto"
@@ -166,23 +244,54 @@ def normalize_compute_type(provider: str, requested: str, backend: Backend) -> s
     return "int8" if compute in _WHISPER_CPU_INT8_ALIASES else compute
 
 
+def _diarize_device_request(raw: str) -> DeviceRequest:
+    """Validate a ``--device`` token for speaker diarization (CPU only).
+
+    Args:
+        raw: Requested device token; blank means ``auto``.
+
+    Returns:
+        ``cpu`` for ``auto``, ``cpu`` and blank.
+
+    Raises:
+        ValueError: For ``cuda`` (diarization runs on the CPU only) and for any
+            other unknown token.
+
+    """
+    requested = str(raw).strip().lower()
+    if requested in {"", "auto", "cpu"}:
+        return "cpu"
+    if requested == "cuda":
+        msg = (
+            "speaker diarization runs on the CPU only "
+            f"(got device={raw!r}); use --device cpu or --device auto"
+        )
+    else:
+        msg = (
+            f"Unsupported device {raw!r} for speaker diarization; expected auto or cpu"
+        )
+    raise ValueError(msg)
+
+
 def normalize_device_request(provider: str, raw: str) -> DeviceRequest:
     """Validate and normalize a ``--device`` token for *provider*.
 
     Args:
-        provider: Raw or canonical STT provider id.
+        provider: Raw or canonical provider id.
         raw: Requested device token; blank means ``auto``.
 
     Returns:
-        ``auto``, ``cpu`` or ``cuda``. The CPU-only GigaAM head maps ``auto``
-        and ``cpu`` to ``cpu``.
+        ``auto``, ``cpu`` or ``cuda``. The CPU-only GigaAM head and speaker
+        diarization map ``auto`` and ``cpu`` to ``cpu``.
 
     Raises:
         ValueError: When the token is invalid for the provider (including
-            ``cuda`` for the CPU-only GigaAM head).
+            ``cuda`` for the CPU-only GigaAM head and for diarization).
 
     """
-    canonical = normalize_stt_provider(provider)
+    canonical = normalize_pool_provider(provider)
+    if canonical == DIARIZE_PROVIDER:
+        return _diarize_device_request(raw)
     token = str(raw).strip().lower()
     if is_gigaam_provider(canonical):
         token = resolve_gigaam_requested_device(canonical, token)
@@ -202,17 +311,18 @@ def allowed_backends(provider: str) -> frozenset[Backend]:
     """Return the backend classes a provider can run on.
 
     Args:
-        provider: Raw or canonical STT provider id.
+        provider: Raw or canonical provider id.
 
     Returns:
-        Only ``cpu`` for the CPU-only GigaAM head, otherwise ``cpu`` and ``gpu``.
+        Only ``cpu`` for the CPU-only GigaAM head and for diarization,
+        otherwise ``cpu`` and ``gpu``.
 
     Raises:
         ValueError: When *provider* is not a supported provider id.
 
     """
-    canonical = normalize_stt_provider(provider)
-    if canonical in GIGAAM_CPU_ONLY_PROVIDERS:
+    canonical = normalize_pool_provider(provider)
+    if canonical == DIARIZE_PROVIDER or canonical in GIGAAM_CPU_ONLY_PROVIDERS:
         return _CPU_ONLY_BACKENDS
     return _ALL_BACKENDS
 
@@ -294,8 +404,9 @@ class WorkerKey:
     """Identity of one worker configuration.
 
     Attributes:
-        provider: Canonical STT provider id.
-        model: Whisper model name or the fixed GigaAM ``<repo>@<revision>``.
+        provider: Canonical STT provider id or :data:`DIARIZE_PROVIDER`.
+        model: Whisper model name, the fixed GigaAM ``<repo>@<revision>`` or
+            :data:`DIARIZE_MODEL_IDENTITY`.
         compute_type: Compute type already resolved for the backend.
         backend: Backend class the worker runs on.
 
@@ -350,7 +461,7 @@ class WorkerKey:
                 raise ValueError(msg)
             fields[name] = value.strip()
         provider = fields["provider"]
-        if provider not in STT_PROVIDER_CHOICES:
+        if provider not in STT_PROVIDER_CHOICES and provider != DIARIZE_PROVIDER:
             msg = f"Worker key has unsupported provider {provider!r}"
             raise ValueError(msg)
         backend = _require_backend(fields["backend"])
@@ -374,8 +485,10 @@ def make_key(
     """Build the normalized worker key for a request on a backend.
 
     Args:
-        provider: Raw or canonical STT provider id.
-        whisper_model: Requested Whisper model name; ignored for GigaAM.
+        provider: Raw or canonical provider id (an STT provider or
+            :data:`DIARIZE_PROVIDER`).
+        whisper_model: Requested Whisper model name; ignored for GigaAM and
+            diarization.
         compute_request: Requested compute type.
         backend: Backend class the worker would run on.
 
@@ -386,10 +499,10 @@ def make_key(
         ValueError: When the provider is unsupported or cannot run on *backend*.
 
     """
-    canonical = normalize_stt_provider(provider)
+    canonical = normalize_pool_provider(provider)
     resolved_backend = _require_backend(backend)
     if resolved_backend not in allowed_backends(canonical):
-        msg = f"STT provider {canonical} cannot run on backend {resolved_backend!r}"
+        msg = f"Provider {canonical} cannot run on backend {resolved_backend!r}"
         raise ValueError(msg)
     return WorkerKey(
         provider=canonical,

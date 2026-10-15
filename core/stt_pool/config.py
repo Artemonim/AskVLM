@@ -12,7 +12,7 @@ import json
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING
@@ -51,6 +51,11 @@ DEFAULT_PRIORITY_AGING_S = 300.0
 DEFAULT_LOAD_FAILURE_COOLDOWN_S = 300.0
 DEFAULT_CRASH_COOLDOWN_S = 60.0
 
+# * CPU threads of one running speaker diarization job (the sherpa-onnx
+# * networks). Without an explicit setting the value is clamped to the thread
+# * budget, so the conservative default budget still runs diarization.
+DEFAULT_DIARIZATION_THREADS_PER_SLOT = 4
+
 # * Largest accepted per-worker batch lane count.
 MAX_BATCH_LANES = 64
 
@@ -67,9 +72,12 @@ _TOP_LEVEL_KEYS = frozenset(
         "vram",
         "lifecycle",
         "scheduling",
+        "diarization",
     }
 )
 _CPU_KEYS = frozenset({"max_slots", "threads_per_slot", "max_slots_per_worker"})
+_DIARIZATION_KEYS = frozenset({"threads_per_slot"})
+_DIARIZATION_THREADS_PATH = "diarization.threads_per_slot"
 _GPU_KEYS = frozenset(
     {"max_workers", "batch_lanes", "host_threads", "scale_out_backlog_s"}
 )
@@ -119,8 +127,10 @@ class CpuConfig:
     """CPU slot limits.
 
     Attributes:
-        max_slots: Concurrent CPU jobs across all CPU workers.
-        threads_per_slot: CPU threads used by one running CPU job.
+        max_slots: Concurrent CPU jobs across all CPU workers (speech-to-text
+            and speaker diarization).
+        threads_per_slot: CPU threads used by one running speech-to-text CPU
+            job (diarization jobs use :class:`DiarizationConfig`).
         max_slots_per_worker: Largest slot capacity of one CPU worker process.
 
     """
@@ -250,6 +260,27 @@ class SchedulingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DiarizationConfig:
+    """Speaker diarization worker limits.
+
+    A diarization worker runs one job at a time (one CPU slot per process), so
+    only the threads of that job are configurable.
+
+    Attributes:
+        threads_per_slot: CPU threads of one running diarization job; the
+            effective value (a default clamped to the thread budget when the
+            config does not set it).
+        threads_per_slot_explicit: Whether the config set ``threads_per_slot``
+            explicitly; an explicit value is never clamped and must fit the
+            thread budget.
+
+    """
+
+    threads_per_slot: int = DEFAULT_DIARIZATION_THREADS_PER_SLOT
+    threads_per_slot_explicit: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class PoolConfig:
     """Complete validated pool configuration.
 
@@ -262,6 +293,7 @@ class PoolConfig:
         lifecycle: Worker and supervisor lifetime timings.
         scheduling: Scheduler tuning.
         source: ``defaults`` or the path of the file the values came from.
+        diarization: Speaker diarization worker limits.
 
     """
 
@@ -273,6 +305,7 @@ class PoolConfig:
     lifecycle: LifecycleConfig
     scheduling: SchedulingConfig
     source: str
+    diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
 
 
 # * Field validators: every one names the JSON path in its error.
@@ -713,6 +746,67 @@ def _parse_scheduling(payload: Mapping[str, object]) -> SchedulingConfig:
     )
 
 
+def _fit_diarization(
+    threads_per_slot: int | None, budget: int, *, budget_origin: str
+) -> DiarizationConfig:
+    """Return the diarization limits for a thread budget.
+
+    Args:
+        threads_per_slot: Explicitly configured threads of one diarization
+            job (already validated as an integer >= 1), or ``None`` when the
+            config does not set them.
+        budget: Effective ``threads.budget``.
+        budget_origin: Where the budget comes from, for the error message.
+
+    Returns:
+        The explicit value, or the default clamped to *budget*.
+
+    Raises:
+        PoolConfigError: When an explicit value exceeds *budget*: no
+            diarization job could ever start.
+
+    """
+    if threads_per_slot is None:
+        return DiarizationConfig(
+            threads_per_slot=max(1, min(DEFAULT_DIARIZATION_THREADS_PER_SLOT, budget)),
+            threads_per_slot_explicit=False,
+        )
+    if threads_per_slot > budget:
+        raise _fail(
+            _DIARIZATION_THREADS_PATH,
+            f"must not exceed the thread budget of {budget} ({budget_origin}), "
+            f"got {threads_per_slot}: a diarization job needs all its threads "
+            "within threads.budget, so no diarization job could ever start; "
+            "lower diarization.threads_per_slot or raise threads.budget",
+        )
+    return DiarizationConfig(
+        threads_per_slot=threads_per_slot, threads_per_slot_explicit=True
+    )
+
+
+def _parse_diarization(
+    payload: Mapping[str, object], threads: ThreadsConfig
+) -> DiarizationConfig:
+    """Parse the ``diarization`` section.
+
+    Args:
+        payload: Document root.
+        threads: Parsed thread budget the diarization threads must fit.
+
+    Returns:
+        The diarization limits; an absent ``threads_per_slot`` is the default
+        clamped to the thread budget.
+
+    """
+    section = _section(payload, "diarization", _DIARIZATION_KEYS)
+    explicit = (
+        _as_int(section["threads_per_slot"], _DIARIZATION_THREADS_PATH, minimum=1)
+        if "threads_per_slot" in section
+        else None
+    )
+    return _fit_diarization(explicit, threads.budget, budget_origin="threads.budget")
+
+
 def _check_header(payload: Mapping[str, object]) -> None:
     """Validate the optional ``schema`` and ``version`` markers.
 
@@ -774,15 +868,19 @@ def parse_pool_config(
     try:
         _reject_unknown(payload, _TOP_LEVEL_KEYS, "")
         _check_header(payload)
+        cpu = _parse_cpu(payload)
+        gpu = _parse_gpu(payload)
+        threads = _parse_threads(payload, _logical_cpu_count(logical_cpus))
         return PoolConfig(
-            cpu=_parse_cpu(payload),
-            gpu=_parse_gpu(payload),
-            threads=_parse_threads(payload, _logical_cpu_count(logical_cpus)),
+            cpu=cpu,
+            gpu=gpu,
+            threads=threads,
             memory=_parse_memory(payload),
             vram=_parse_vram(payload),
             lifecycle=_parse_lifecycle(payload),
             scheduling=_parse_scheduling(payload),
             source=source,
+            diarization=_parse_diarization(payload, threads),
         )
     except PoolConfigError as exc:
         msg = f"Invalid STT pool config ({source}): {exc}"
@@ -905,7 +1003,9 @@ def apply_overrides(
 
     Overrides are checked exactly like the matching file keys. A per-worker slot
     cap that equals the old slot limit follows ``cpu_slots``; an explicitly
-    smaller cap is kept.
+    smaller cap is kept. A thread budget override re-fits the diarization
+    threads: a default value is clamped to the new budget again, an explicit
+    value must fit it.
 
     Args:
         config: Base configuration.
@@ -920,7 +1020,8 @@ def apply_overrides(
         The updated configuration; unchanged sections are shared with *config*.
 
     Raises:
-        PoolConfigError: When an override value is invalid.
+        PoolConfigError: When an override value is invalid, or a thread budget
+            override is below an explicit ``diarization.threads_per_slot``.
 
     """
     cpu = config.cpu
@@ -940,9 +1041,19 @@ def apply_overrides(
             gpu, max_workers=_as_int(gpu_workers, "gpu.max_workers", minimum=0)
         )
     threads = config.threads
+    diarization = config.diarization
     if thread_budget is not None:
         threads = replace(
             threads, budget=_as_int(thread_budget, "threads.budget", minimum=1)
+        )
+        diarization = _fit_diarization(
+            (
+                diarization.threads_per_slot
+                if diarization.threads_per_slot_explicit
+                else None
+            ),
+            threads.budget,
+            budget_origin="the thread budget override",
         )
     memory = config.memory
     if commit_budget_gib is not None:
@@ -978,6 +1089,7 @@ def apply_overrides(
         memory=memory,
         vram=vram,
         lifecycle=lifecycle,
+        diarization=diarization,
     )
 
 
@@ -1005,6 +1117,7 @@ def config_summary(config: PoolConfig) -> dict[str, object]:
             "scale_out_backlog_s": config.gpu.scale_out_backlog_s,
         },
         "threads": {"budget": config.threads.budget},
+        "diarization": {"threads_per_slot": config.diarization.threads_per_slot},
         "memory": {
             "commit_budget_bytes": config.memory.commit_budget_bytes,
             "free_commit_guard_bytes": config.memory.free_commit_guard_bytes,

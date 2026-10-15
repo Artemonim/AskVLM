@@ -14,8 +14,10 @@ from typing import TYPE_CHECKING
 import psutil  # type: ignore[import-untyped]
 import pytest
 
+from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import fsio, winjob
 from core.stt_pool.queue import (
+    JobOptions,
     ResultRecord,
     read_attempts,
     read_result,
@@ -34,6 +36,203 @@ if TYPE_CHECKING:
     from core.stt_pool.procs import WorkerLaunch
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group(name="pool_supervisor")]
+
+
+@pytest.mark.parametrize("kind", ["stt", "diarize"])
+@pytest.mark.parametrize("empty", [False, True])
+def test_structured_jobs_transport_options_and_payloads_through_real_workers(
+    pool: SupervisorHarness, kind: str, *, empty: bool
+) -> None:
+    """Catch option/data drops across admission, process IPC or result files, including empty successes."""
+    pool.config = configuration(
+        cpu={"threads_per_slot": 2}, diarization={"threads_per_slot": 3}
+    )
+    window = MediaWindow(10.25, 2.5)
+    payload: dict[str, object]
+    if kind == "stt":
+        options = JobOptions(
+            want_segments=True,
+            decode=WhisperDecodeOptions(
+                beam_size=1,
+                vad_filter=False,
+                condition_on_previous_text=False,
+                word_timestamps=False,
+            ),
+            window=window,
+        )
+        payload = {
+            "segments": [] if empty else [{"start": 10.25, "end": 11.0, "text": "речь"}]
+        }
+    else:
+        options = JobOptions(window=window, diarize=DiarizeOptions(2, 0.7, 0.1, 0))
+        payload = {
+            "turns": []
+            if empty
+            else [{"start": 10.25, "end": 11.0, "speaker": "speaker_00"}]
+        }
+    job = pool.job(
+        kind=kind,
+        provider="whisper" if kind == "stt" else "sherpa-diarize",
+        job_options=options,
+        data=payload,
+        mode="empty" if empty else "ok",
+    )
+    pool.start()
+    receipt = pool.submitted(job)
+    result = pool.result(job)
+    assert receipt["kind"] == kind
+    assert receipt["window"] == {"start_s": 10.25, "duration_s": 2.5}
+    assert result.status == ("empty" if empty and kind == "stt" else "ok")
+    assert result.data == payload
+    assert result.attempts == 1
+    constructed = pool.events("constructed")[0]
+    threads = 2 if kind == "stt" else 3
+    assert constructed["threads_per_slot"] == threads
+    assert constructed["thread_env"] == {
+        "OMP_NUM_THREADS": str(threads),
+        "MKL_NUM_THREADS": str(threads),
+    }
+    if kind == "stt":
+        assert receipt["want_segments"]
+        assert receipt["decode"] == {
+            "beam_size": 1,
+            "vad_filter": False,
+            "condition_on_previous_text": False,
+            "word_timestamps": False,
+        }
+    else:
+        assert result.text == ""
+        assert receipt["language"] is None
+        assert receipt["diarize"] == {
+            "num_speakers": 2,
+            "threshold": 0.7,
+            "min_duration_on": 0.1,
+            "min_duration_off": 0.0,
+        }
+        assert constructed["options"]["threads_per_slot"] == 3
+        heartbeat = pool.heartbeat(lambda value: value["queue"]["running"] == 0)
+        assert heartbeat["limits"]["diarization"]["threads_per_slot"] == 3
+    pool.finish()
+
+
+@pytest.mark.parametrize("kind", ["stt", "diarize"])
+@pytest.mark.parametrize("invalid", ["absent", "wrong_key", "null", "object"])
+def test_success_without_the_requested_payload_becomes_protocol_error(
+    pool: SupervisorHarness, kind: str, invalid: str
+) -> None:
+    """Catch successful-looking transcripts or diarizations with silently missing/malformed payload lists."""
+    key = "segments" if kind == "stt" else "turns"
+    payload = {
+        "absent": None,
+        "wrong_key": {"other": []},
+        "null": {key: None},
+        "object": {key: {}},
+    }[invalid]
+    job = pool.job(
+        kind=kind,
+        provider="whisper" if kind == "stt" else "sherpa-diarize",
+        job_options=JobOptions(want_segments=kind == "stt"),
+        data=payload,
+    )
+    pool.start()
+    result = pool.result(job)
+    assert result.status == "error"
+    assert result.error_kind == "protocol_error"
+    assert result.data is None
+    assert result.text == ""
+    assert result.attempts == 1
+    pool.finish()
+
+
+def test_oversized_structured_result_publishes_a_readable_error_and_keeps_serving(
+    pool: SupervisorHarness,
+) -> None:
+    """Catch 16 MiB result files becoming unreadable and leaving clients waiting until their deadline."""
+    job = pool.job(job_options=JobOptions(want_segments=True), large_segments=True)
+    pool.start()
+    result = pool.result(job)
+    assert result.status == "error"
+    assert result.error_kind == "result_too_large"
+    assert result.data is None
+    assert pool.paths.result_file(job.job_id).stat().st_size < 16 * 1024**2
+    following = pool.job(call=2, text="next transcript")
+    assert pool.result(following).status == "ok"
+    assert pool.result(following).text == "next transcript"
+    pool.finish()
+
+
+def test_mixed_stt_diarization_admission_reserves_each_keys_threads(
+    pool: SupervisorHarness,
+) -> None:
+    """Catch diarization borrowing STT's smaller thread charge and exceeding the shared budget."""
+    pool.config = configuration(
+        cpu={"max_slots": 3, "threads_per_slot": 2, "max_slots_per_worker": 3},
+        threads={"budget": 6},
+        memory={"commit_budget_gib": 8},
+        diarization={"threads_per_slot": 4},
+    )
+    stt = pool.job(mode="hold")
+    first = pool.job(
+        kind="diarize",
+        provider="sherpa-diarize",
+        call=2,
+        mode="hold",
+        data={"turns": []},
+    )
+    pool.start()
+    pool.submitted(stt)
+    pool.submitted(first)
+    waiting = pool.job(
+        kind="diarize",
+        provider="sherpa-diarize",
+        call=3,
+        mode="hold",
+        data={"turns": []},
+    )
+    pool.heartbeat(lambda value: value["queue"] == {"pending": 1, "running": 2})
+    assert not pool.events("submitted", waiting)
+    pool.release(stt)
+    assert pool.result(stt).status == "ok"
+    pool.heartbeat(lambda value: value["queue"] == {"pending": 1, "running": 1})
+    assert not pool.events("submitted", waiting)
+    pool.release(first)
+    assert pool.result(first).status == "ok"
+    pool.submitted(waiting)
+    pool.release(waiting)
+    assert pool.result(waiting).status == "ok"
+    pool.finish()
+
+
+def test_diarization_scales_as_single_slot_processes_with_its_own_memory_seed(
+    pool: SupervisorHarness,
+) -> None:
+    """Catch sherpa jobs sharing a multi-slot worker or falling back to Whisper-large memory estimates."""
+    pool.config = configuration(
+        cpu={"max_slots": 2, "max_slots_per_worker": 8},
+        threads={"budget": 8},
+        memory={"commit_budget_gib": 6},
+    )
+    jobs = [
+        pool.job(
+            kind="diarize",
+            provider="sherpa-diarize",
+            call=call,
+            mode="hold",
+            data={"turns": []},
+        )
+        for call in (1, 2)
+    ]
+    pool.start()
+    receipts = [pool.submitted(job) for job in jobs]
+    assert len({receipt["worker_id"] for receipt in receipts}) == 2
+    constructed = pool.events("constructed")
+    assert len(constructed) == 2
+    assert all(worker["capacity"] == 1 for worker in constructed)
+    assert all(worker["threads_per_slot"] == 4 for worker in constructed)
+    for job in jobs:
+        pool.release(job)
+        assert pool.result(job).status == "ok"
+    pool.finish()
 
 
 @pytest.fixture

@@ -28,7 +28,7 @@ _MEMORY_CAP = 128 * 1024**2
 class WorkerPeer:
     """Drive production worker.py through production process ownership and IPC."""
 
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(self, tmp_path: Path, memory_cap: int = _MEMORY_CAP) -> None:
         self.events: queue.Queue[dict[str, object] | None] = queue.Queue()
         self.log_path = tmp_path / "worker.log"
         self.close_marker = tmp_path / "engine-closed"
@@ -36,7 +36,7 @@ class WorkerPeer:
             "production-entry-test",
             default_worker_launch(project_root=_ROOT),
             log_path=self.log_path,
-            memory_limit_bytes=_MEMORY_CAP,
+            memory_limit_bytes=memory_cap,
             on_event=lambda _worker_id, message: self.events.put(message),
         )
 
@@ -111,6 +111,30 @@ def _item(tmp_path: Path, seq: int = 1) -> WorkItem:
     """Create one Unicode input with an explicit, unique attempt identity."""
     job_id = f"{seq:032x}"
     return WorkItem(job_id, f"{job_id}:2", tmp_path / "русский.wav", "ru", 1.0, None)
+
+
+@pytest.mark.parametrize("payload_char", ["x", "汉"])
+def test_real_worker_replaces_oversized_utf8_payload_for_the_same_attempt(
+    tmp_path: Path, payload_char: str
+) -> None:
+    """Catch oversized IPC payloads being silently skipped or byte limits being counted as characters."""
+    peer = WorkerPeer(tmp_path, memory_cap=384 * 1024**2)
+    try:
+        peer.start(mode="oversized_result", payload_char=payload_char)
+        item = _item(tmp_path)
+        assert peer.worker.send(item.to_message())
+        result = peer.next_message("result")
+        assert result["status"] == "error"
+        assert result["error_kind"] == "result_too_large"
+        assert result["job_id"] == item.job_id
+        assert result["attempt_id"] == item.attempt_id
+        assert not result.get("data")
+        following = _item(tmp_path, 2)
+        assert peer.worker.send(following.to_message())
+        assert peer.next_message("result")["attempt_id"] == following.attempt_id
+        peer.shutdown()
+    finally:
+        peer.worker.close(timeout_s=_TIMEOUT_S)
 
 
 def test_real_worker_handshake_result_stdout_and_bye(

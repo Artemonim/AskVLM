@@ -16,6 +16,7 @@ import psutil  # type: ignore[import-untyped]
 from core.stt_pool.config import parse_pool_config
 from core.stt_pool.procs import default_worker_launch
 from core.stt_pool.queue import (
+    JobOptions,
     JobRecord,
     JobRequest,
     QueuePaths,
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
     from core.stt_pool.config import PoolConfig
     from core.stt_pool.keys import DeviceRequest, Priority, WorkerKey
     from core.stt_pool.procs import WorkerLaunch
-    from core.stt_pool.queue import ResultRecord
+    from core.stt_pool.queue import JobKind, ResultRecord
 
 WAIT_TIMEOUT_S = 30.0
 GIB = 1024**3
@@ -136,7 +137,7 @@ def configuration(**sections: dict[str, object]) -> PoolConfig:
         },
     }
     for section, values in sections.items():
-        payload[section].update(values)
+        payload.setdefault(section, {}).update(values)
     return parse_pool_config(payload, source="explicit supervisor test", logical_cpus=8)
 
 
@@ -188,7 +189,7 @@ class SupervisorHarness:
             json.dumps(instructions), encoding="utf-8"
         )
 
-    def job(
+    def job(  # noqa: PLR0913 - keyword-only options mirror the job wire fields
         self,
         *,
         model: str = "small",
@@ -199,6 +200,8 @@ class SupervisorHarness:
         duration: float | None = 1.0,
         deadline: float | None = None,
         max_parallel: int | None = None,
+        kind: JobKind = "stt",
+        job_options: JobOptions | None = None,
         **instructions: object,
     ) -> JobRecord:
         """Submit v2 jobs that control fake recognition."""
@@ -208,6 +211,7 @@ class SupervisorHarness:
         job_id = f"{self._sequence:032x}"
         path = self.engine_root / f"media-{self._sequence}.json"
         path.write_text(json.dumps(instructions), encoding="utf-8")
+        options = JobOptions() if job_options is None else job_options
         record = JobRecord(
             job_id,
             f"{call:032x}",
@@ -218,9 +222,14 @@ class SupervisorHarness:
             str(path),
             duration,
             JobRequest(provider, model, "auto", device),
-            "ru",
+            "ru" if kind == "stt" else None,
             os.getpid(),
             priority,
+            kind=kind,
+            want_segments=options.want_segments,
+            decode=options.decode,
+            window=options.window,
+            diarize=options.diarize,
         )
         submit_job(self.paths, record)
         return record

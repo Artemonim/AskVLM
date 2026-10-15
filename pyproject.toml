@@ -67,6 +67,10 @@ ml = [
     "hydra-core",
     "omegaconf",
     "sentencepiece",
+    # * CPU speaker diarization for external-transcribe --diarization / external-diarize:
+    # * pyannote segmentation 3.0 + WeSpeaker ResNet34-LM as ONNX (no token, no torch).
+    # * Pinned: the turn output is compared against the hardsub skill's reference runs.
+    "sherpa-onnx==1.13.8",
 ]
 
 # ! Ruff configuration - comprehensive linting and formatting
@@ -154,6 +158,8 @@ module = [
     "odf.*",
     "spellchecker.*",
     "ffmpeg.*",
+    "sherpa_onnx",
+    "sherpa_onnx.*",
 ]
 ignore_missing_imports = true
 

@@ -21,6 +21,11 @@ class Document:
     segments: list[TextSegment] = field(default_factory=list)
     # * When True, text exporters treat consecutive segments of the same speaker as dialog blocks
     dialog_blocks_enabled: bool = False
+    # * Raw wrapper segments of the transcription (times relative to the processed
+    # * window); outside equality and repr so a document still compares by its text.
+    transcript_segments: list[dict[str, object]] | None = field(
+        default=None, compare=False, repr=False
+    )
 
     def add_segment(self, segment: TextSegment) -> None:
         """Add a text segment to the document."""

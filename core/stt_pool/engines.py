@@ -1,14 +1,14 @@
-"""Real STT engines of the worker pool; they run inside a worker process.
+"""Real STT and speaker diarization engines of the worker pool.
 
-The worker process (:mod:`core.stt_pool.worker`) builds an engine with
-:func:`create_engine` and drives it through the
+The engines run inside a worker process (:mod:`core.stt_pool.worker`), which
+builds one with :func:`create_engine` and drives it through the
 :class:`~core.stt_pool.engine_api.PoolEngine` protocol: :meth:`load` once,
 :meth:`start`, any number of :meth:`submit` / :meth:`cancel` calls, and
 finally :meth:`close`.
 
 Engines (spec section 9):
 
-* :class:`CpuPipelineEngine` - any provider on CPU: one strict-``cpu``
+* :class:`CpuPipelineEngine` - any STT provider on CPU: one strict-``cpu``
   :class:`~core.pipelines.LocalPipeline` shared by ``capacity`` slot threads;
   every slot runs ``pipeline.process`` exactly like the one-shot
   ``external-transcribe`` path, so the text is the same.
@@ -16,8 +16,16 @@ Engines (spec section 9):
   prep pool (ffmpeg only) and ONE batch-loop thread that runs zero-padded
   batches of 20 s windows dealt round-robin across the active jobs.
 * :class:`WhisperGpuEngine` - Whisper on CUDA: a prep pool that routes short
-  jobs with an explicit language to cross-file clip batches, and ONE
+  default jobs with an explicit language to cross-file clip batches, and ONE
   inference-loop thread that runs those batches and the sequential jobs.
+* :class:`DiarizeCpuEngine` - speaker diarization (sherpa-onnx) on CPU:
+  ``capacity`` slot threads over one verified model set; every job decodes
+  its media window and returns the speaker turns.
+
+The shared lifecycle (admission, temp directories, keep-alive, cancellation,
+exactly one result, shutdown) lives in :class:`_EngineBase`; the model itself
+is behind its load/release hooks (:class:`_PipelineEngine` for the STT
+engines, :class:`DiarizeCpuEngine` for diarization).
 
 Held work is taken in the admission order of spec section 14 (effective
 priority class with aging from the engine's receipt time, round-robin across
@@ -27,11 +35,13 @@ window lanes, rotation carried between batches) and
 
 Every submitted ``(job_id, attempt_id)`` gets exactly one result until
 :meth:`close` starts; from then on nothing is emitted (the supervisor owns the
-fate of unfinished attempts of a stopping worker).
+fate of unfinished attempts of a stopping worker). An item of a kind or with
+options the engine does not serve gets an ``error`` result, never a silent
+default.
 
 Importing this module loads no ML package: the pipeline (torch,
-faster-whisper), numpy and ffmpeg helpers are imported inside :meth:`load` and
-the engine threads.
+faster-whisper), sherpa-onnx, numpy and ffmpeg helpers are imported inside
+:meth:`load` and the engine threads.
 """
 
 from __future__ import annotations
@@ -49,9 +59,18 @@ from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Generic, Literal, NamedTuple, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Generic,
+    Literal,
+    NamedTuple,
+    TypedDict,
+    TypeVar,
+)
 
 from core.stt_errors import DeviceUnavailableError
+from core.stt_output import segments_json
 from core.stt_pool.config import DEFAULT_PRIORITY_AGING_S
 from core.stt_pool.engine_api import EngineResult, LoadInfo
 from core.stt_pool.keys import (
@@ -61,7 +80,9 @@ from core.stt_pool.keys import (
     device_for_backend,
     model_identity,
     provider_family,
+    worker_kind,
 )
+from core.stt_pool.queue import JOB_KIND_DIARIZE, JOB_KIND_STT, job_kind_conflict
 from core.stt_providers import STT_PROVIDER_GIGAAM_E2E_CTC
 from core.whisper_batch import (
     MAX_CLIP_S,
@@ -79,6 +100,8 @@ if TYPE_CHECKING:
 
     from core.gigaam_ctc_wrapper import WavWindow
     from core.pipelines import LocalPipeline
+    from core.sherpa_diarization import SherpaDiarizer
+    from core.stt_options import MediaWindow, WhisperDecodeOptions
     from core.stt_pool.engine_api import EmitFn, PoolEngine, WorkerSpec, WorkItem
     from core.stt_pool.keys import Backend, Priority
 
@@ -507,6 +530,8 @@ class _Job:
     exhausted: bool = False
     read_error: Exception | None = None
     texts: list[str] = field(default_factory=list)
+    # * ``(start, end)`` of every transcribed window, parallel to ``texts``.
+    spans: list[tuple[float, float]] = field(default_factory=list)
     audio_end_s: float | None = None
     # * Whisper GPU batch state.
     clip: NDArray[np.float32] | None = None
@@ -524,7 +549,11 @@ class _Job:
         return max(0.0, time.perf_counter() - self.started_at)
 
     def audio_s(self) -> float | None:
-        """Return the item's duration, else the measured audio duration."""
+        """Return the item's duration, else the measured audio duration.
+
+        The client sends the window length as the duration of a windowed job,
+        and the measured duration is that of the processed window.
+        """
         if self.item.duration_s is not None:
             return self.item.duration_s
         return self.audio_end_s
@@ -760,6 +789,105 @@ def _close_pipeline(pipeline: LocalPipeline) -> None:
         logger.exception("pipeline close failed")
 
 
+class _ProcessOptions(TypedDict, total=False):
+    """Per-job keyword arguments of ``LocalPipeline.process`` beyond the language."""
+
+    media_window: MediaWindow
+    decode_options: WhisperDecodeOptions
+
+
+def _process_options(item: WorkItem) -> _ProcessOptions:
+    """Return the item's non-default window and decoding options.
+
+    A default option is left out, so a plain job calls ``pipeline.process``
+    exactly like the one-shot path.
+    """
+    options: _ProcessOptions = {}
+    if not item.window.is_default:
+        options["media_window"] = item.window
+    if not item.decode.is_default:
+        options["decode_options"] = item.decode
+    return options
+
+
+def _has_job_options(item: WorkItem) -> bool:
+    """Return whether *item* asks for segments, decoding options or a window."""
+    return (
+        item.want_segments or not item.decode.is_default or not item.window.is_default
+    )
+
+
+def _document_segments(document: object, item: WorkItem) -> list[dict[str, object]]:
+    """Return the skill-format segments of a pipeline document.
+
+    Args:
+        document: Document returned by ``pipeline.process``; its
+            ``transcript_segments`` hold window-relative times.
+        item: The job; its window start makes the times media-relative.
+
+    Returns:
+        The segments of :func:`~core.stt_output.segments_json`.
+
+    Raises:
+        RuntimeError: When the document carries no transcript segments (a
+            requested payload is never replaced by an empty list).
+
+    """
+    raw: object = getattr(document, "transcript_segments", None)
+    if not isinstance(raw, list):
+        msg = (
+            "the pipeline returned no transcript segments "
+            f"(got {type(raw).__name__}), but the job asked for segments"
+        )
+        raise RuntimeError(msg)  # noqa: TRY004 - a broken pipeline contract, not a caller type error
+    return segments_json(raw, item.window.start_s)
+
+
+def _window_segments(job: _Job) -> list[dict[str, object]]:
+    """Return the skill-format segments of a GigaAM batch job's 20 s windows."""
+    return segments_json(
+        (
+            {"start": start, "end": end, "text": text}
+            for (start, end), text in zip(job.spans, job.texts, strict=True)
+        ),
+        job.item.window.start_s,
+    )
+
+
+def _window_seconds(window: MediaWindow, media_s: float | None) -> float | None:
+    """Return the length of *window* within media of *media_s* seconds.
+
+    Args:
+        window: The processed window.
+        media_s: Duration of the whole media, or ``None`` when unknown.
+
+    Returns:
+        The window length limited by the media end; the requested window
+        length when the media duration is unknown or ends before the window
+        start; ``None`` when neither is known.
+
+    """
+    if media_s is None or media_s - window.start_s <= 0:
+        return window.duration_s
+    available = media_s - window.start_s
+    return available if window.duration_s is None else min(window.duration_s, available)
+
+
+def _processed_seconds(item: WorkItem) -> float | None:
+    """Return the processed audio length of a finished job without a duration.
+
+    The media duration comes from ffprobe and is limited to the job's window;
+    the measurement is optional, so any failure yields ``None`` (or the
+    window length) instead of failing the finished job.
+    """
+    try:
+        media_s = _probe_duration(item.input_path)
+    except Exception:  # noqa: BLE001 - an optional measurement never fails a finished job
+        logger.warning("duration probe of %s failed", item.input_path, exc_info=True)
+        media_s = None
+    return _window_seconds(item.window, media_s)
+
+
 def _probe_duration(path: Path) -> float | None:
     """Return the media duration from ffprobe, or ``None`` when it fails."""
     from core.ffmpeg import (  # noqa: PLC0415 - ffmpeg-python only inside the worker
@@ -798,6 +926,13 @@ def _join_all(threads: Sequence[threading.Thread], timeout_s: float) -> list[str
 class _EngineBase(abc.ABC):
     """Shared job bookkeeping, ordering, cancellation, emission and shutdown.
 
+    The model is behind three hooks: :meth:`_load_model` (load it on the
+    strict device and return the device it ended up on), :meth:`_release_model`
+    (unload it once every engine thread stopped) and :meth:`_unsupported`
+    (which items the model can serve). Everything else - admission, temp
+    directories, keep-alive, cancellation, exactly one result per attempt and
+    the bounded shutdown - is common to every engine.
+
     Locks: ``_cond`` (a re-entrant condition) guards the job registry and the
     held lists and is never held while a result is emitted or a directory is
     removed; ``_emit_lock`` serializes emission against :meth:`close`;
@@ -807,7 +942,6 @@ class _EngineBase(abc.ABC):
     def __init__(self, spec: WorkerSpec) -> None:
         self._spec = spec
         self._backend: Backend = spec.key.backend
-        self._gigaam = provider_family(spec.key.provider) == "gigaam"
         self._aging_s = _positive_seconds(
             spec.options, "priority_aging_s", DEFAULT_PRIORITY_AGING_S
         )
@@ -825,25 +959,40 @@ class _EngineBase(abc.ABC):
         self._close_lock = threading.Lock()
         self._closed = False
         self._threads: list[threading.Thread] = []
-        self._pipeline: LocalPipeline | None = None
+        # * True from a successful load until close() releases the model.
+        self._model_loaded = False
         self._load_info: LoadInfo | None = None
         self._keepalive = _KeepAlive(KEEPALIVE_INTERVAL_S)
 
     # * ---- engine-specific hooks --------------------------------------------
 
     @abc.abstractmethod
-    def _build_pipeline(self) -> LocalPipeline:
-        """Construct the engine's pipeline (not loaded yet)."""
+    def _load_model(self) -> str:
+        """Load the engine's model on the strict spec device.
+
+        Returns:
+            The device the model is loaded on (checked with
+            :meth:`_checked_device`).
+
+        Raises:
+            Exception: Any load failure; nothing stays loaded when it raises.
+
+        """
+
+    @abc.abstractmethod
+    def _release_model(self) -> None:
+        """Release the loaded model (best effort; never raises).
+
+        :meth:`close` calls it once, after every engine thread stopped.
+        """
+
+    @abc.abstractmethod
+    def _unsupported(self, item: WorkItem) -> str | None:
+        """Return why the engine cannot run *item*, or ``None`` when it can."""
 
     @abc.abstractmethod
     def _thread_targets(self) -> list[tuple[str, Callable[[], None]]]:
         """Return ``(thread name, target)`` of every engine thread."""
-
-    def _on_loaded(self, pipeline: LocalPipeline) -> None:  # noqa: B027 - optional hook
-        """Keep references the engine needs after a successful load."""
-
-    def _drop_model_refs(self) -> None:  # noqa: B027 - optional hook
-        """Drop the engine's own model references before the pipeline unloads."""
 
     def _details(self) -> dict[str, object]:
         """Return engine-specific ``loaded`` details."""
@@ -866,15 +1015,8 @@ class _EngineBase(abc.ABC):
         if self._load_info is not None:
             return self._load_info
         started = time.perf_counter()
-        pipeline = self._build_pipeline()
-        try:
-            pipeline.ensure_stt_loaded()
-            active = self._verified_device(pipeline)
-            self._on_loaded(pipeline)
-        except BaseException:
-            _close_pipeline(pipeline)
-            raise
-        self._pipeline = pipeline
+        active = self._load_model()
+        self._model_loaded = True
         spec = self._spec
         details: dict[str, object] = {
             "engine": type(self).__name__,
@@ -889,19 +1031,20 @@ class _EngineBase(abc.ABC):
             "priority_aging_s": self._aging_s,
             **self._details(),
         }
-        self._load_info = LoadInfo(
+        info = LoadInfo(
             device=spec.device,
             load_s=time.perf_counter() - started,
             details=details,
         )
+        self._load_info = info
         logger.info(
             "%s loaded %s on %s in %.2f s",
             type(self).__name__,
             spec.key.label,
             spec.device,
-            self._load_info.load_s,
+            info.load_s,
         )
-        return self._load_info
+        return info
 
     def start(self, emit: EmitFn) -> None:
         """Start the engine threads and the keep-alive thread.
@@ -920,7 +1063,7 @@ class _EngineBase(abc.ABC):
             if self._threads:
                 logger.warning("start() called twice; ignored")
                 return
-            if self._pipeline is None:
+            if not self._model_loaded:
                 msg = "load() must succeed before start()"
                 raise RuntimeError(msg)
             with self._emit_lock:
@@ -1030,29 +1173,40 @@ class _EngineBase(abc.ABC):
                 )
                 return
             self._release_leftovers()
-            self._drop_model_refs()
-            pipeline, self._pipeline = self._pipeline, None
-            if pipeline is not None:
-                _close_pipeline(pipeline)
+            if self._model_loaded:
+                self._model_loaded = False
+                self._release_model()
             logger.info("%s closed", type(self).__name__)
 
     # * ---- shared machinery ---------------------------------------------------
 
-    def _verified_device(self, pipeline: LocalPipeline) -> str:
+    def _checked_device(self, active: str | None) -> str:
         """Return the model's device after checking it is the strict spec device.
 
         Raises:
             DeviceUnavailableError: When the model is on another device.
 
         """
-        active = _active_device(pipeline)
-        if active != self._spec.device:
+        if active is None or active != self._spec.device:
             msg = (
                 f"{self._spec.key.label}: the model loaded on {active!r} "
                 f"instead of the strict device {self._spec.device!r}"
             )
             raise DeviceUnavailableError(msg)
         return active
+
+    def _reject_unsupported(self, job: _Job) -> bool:
+        """Answer a claimed job the engine cannot run with an ``error`` result.
+
+        Returns:
+            ``True`` when the job was answered (the caller stops handling it).
+
+        """
+        problem = self._unsupported(job.item)
+        if problem is None:
+            return False
+        self._retire(job, self._outcome(job, error=ValueError(problem)))
+        return True
 
     @staticmethod
     def _thread_main(name: str, target: Callable[[], None]) -> None:
@@ -1061,19 +1215,6 @@ class _EngineBase(abc.ABC):
             target()
         except Exception:
             logger.exception("engine thread %s crashed", name)
-
-    def _require_pipeline(self) -> LocalPipeline:
-        """Return the loaded pipeline.
-
-        Raises:
-            RuntimeError: When the engine is not loaded (or already closed).
-
-        """
-        pipeline = self._pipeline
-        if pipeline is None:
-            msg = "engine is not loaded"
-            raise RuntimeError(msg)
-        return pipeline
 
     def _should_stop(self, job: _Job) -> bool:
         """Return whether *job* must stop (cancelled or the engine closes)."""
@@ -1137,12 +1278,35 @@ class _EngineBase(abc.ABC):
         _remove_tree(path)
 
     def _outcome(
-        self, job: _Job, *, text: str | None = None, error: Exception | None = None
+        self,
+        job: _Job,
+        *,
+        text: str | None = None,
+        data: Mapping[str, object] | None = None,
+        error: Exception | None = None,
     ) -> EngineResult:
-        """Build the result of *job*: ``cancelled`` wins, then the error, then text."""
+        """Build the result of *job*: ``cancelled`` wins, then the error, then success.
+
+        Args:
+            job: The finished job.
+            text: Transcript of a finished ``stt`` job.
+            data: Structured payload: the segments of an ``stt`` job that asked
+                for them (kept for ``ok`` and ``empty``), the turns of a
+                ``diarize`` job.
+            error: Failure that ended the job.
+
+        Returns:
+            ``cancelled`` when a cancel was requested; ``error`` for *error*
+            (and for a ``diarize`` job without turns); otherwise the
+            transcription result, or the ``ok`` diarization result.
+
+        """
         run_s = job.run_s()
         if job.cancel.is_set():
             return EngineResult.for_cancel(job.item, backend=self._backend, run_s=run_s)
+        diarize = job.item.kind == JOB_KIND_DIARIZE
+        if error is None and diarize and data is None:
+            error = RuntimeError("the speaker diarization finished without turns")
         if error is not None:
             logger.warning(
                 "job %s attempt %s failed: %s: %s",
@@ -1159,12 +1323,21 @@ class _EngineBase(abc.ABC):
                 run_s=run_s,
                 audio_s=job.audio_s(),
             )
+        if diarize and data is not None:
+            return EngineResult.for_diarization(
+                job.item,
+                data,
+                backend=self._backend,
+                run_s=run_s,
+                audio_s=job.audio_s(),
+            )
         return EngineResult.for_text(
             job.item,
             text or "",
             backend=self._backend,
             run_s=run_s,
             audio_s=job.audio_s(),
+            data=data,
         )
 
     def _retire(self, job: _Job, result: EngineResult) -> None:
@@ -1289,37 +1462,136 @@ class _EngineBase(abc.ABC):
             job.clip = None
             self._close_temp_dir(job)
 
+
+class _PipelineEngine(_EngineBase):
+    """STT engines over one strict-device :class:`~core.pipelines.LocalPipeline`.
+
+    The model hooks build the pipeline (:meth:`_build_pipeline`), load and
+    warm it up, verify its device, keep the engine's own references
+    (:meth:`_on_loaded`) and unload it on :meth:`close`
+    (:meth:`_drop_model_refs` first). Only ``stt`` items are served; GigaAM
+    rejects the Whisper-only decoding options.
+    """
+
+    def __init__(self, spec: WorkerSpec) -> None:
+        super().__init__(spec)
+        self._gigaam = provider_family(spec.key.provider) == "gigaam"
+        self._pipeline: LocalPipeline | None = None
+
+    # * ---- pipeline-specific hooks ------------------------------------------
+
+    @abc.abstractmethod
+    def _build_pipeline(self) -> LocalPipeline:
+        """Construct the engine's pipeline (not loaded yet)."""
+
+    def _on_loaded(self, pipeline: LocalPipeline) -> None:
+        """Keep references the engine needs after a successful load."""
+
+    def _drop_model_refs(self) -> None:
+        """Drop the engine's own model references before the pipeline unloads."""
+
+    # * ---- model hooks ------------------------------------------------------
+
+    def _load_model(self) -> str:
+        """Build, load and verify the pipeline; unload it again on any failure."""
+        pipeline = self._build_pipeline()
+        try:
+            pipeline.ensure_stt_loaded()
+            active = self._checked_device(_active_device(pipeline))
+            self._on_loaded(pipeline)
+        except BaseException:
+            _close_pipeline(pipeline)
+            raise
+        self._pipeline = pipeline
+        return active
+
+    def _release_model(self) -> None:
+        """Drop the engine's model references, then unload the pipeline."""
+        self._drop_model_refs()
+        pipeline, self._pipeline = self._pipeline, None
+        if pipeline is not None:
+            _close_pipeline(pipeline)
+
+    def _unsupported(self, item: WorkItem) -> str | None:
+        """Reject non-``stt`` items and Whisper-only options on GigaAM."""
+        if item.kind != JOB_KIND_STT:
+            return (
+                f"{self._spec.key.label} runs speech-to-text only; a {item.kind!r} "
+                "job cannot run on it"
+            )
+        conflict = job_kind_conflict(
+            item.kind,
+            language=item.language,
+            want_segments=item.want_segments,
+            decode=item.decode,
+            diarize=item.diarize,
+        )
+        if conflict is not None:
+            return conflict
+        if self._gigaam and not item.decode.is_default:
+            names = ", ".join(sorted(item.decode.to_wire()))
+            return (
+                f"The decoding options ({names}) apply to the Whisper STT provider "
+                f"only; the {self._spec.key.provider} provider does not support them"
+            )
+        return None
+
+    # * ---- jobs -------------------------------------------------------------
+
+    def _require_pipeline(self) -> LocalPipeline:
+        """Return the loaded pipeline.
+
+        Raises:
+            RuntimeError: When the engine is not loaded (or already closed).
+
+        """
+        pipeline = self._pipeline
+        if pipeline is None:
+            msg = "engine is not loaded"
+            raise RuntimeError(msg)
+        return pipeline
+
     def _run_pipeline_job(self, job: _Job) -> None:
         """Run one claimed job through ``pipeline.process`` and emit its result.
 
         The text is ``Document.get_full_text().strip()``, exactly like the
-        one-shot ``external-transcribe`` path.
+        one-shot ``external-transcribe`` path. The job's window and decoding
+        options reach ``pipeline.process`` only when they are not default; the
+        segments of a job that asked for them are returned in ``data`` (also
+        for an ``empty`` result) with media-relative times.
         """
+        if self._reject_unsupported(job):
+            return
         if self._should_stop(job):
             self._retire(job, self._outcome(job))
             return
+        item = job.item
         text: str | None = None
+        data: dict[str, object] | None = None
         error: Exception | None = None
         try:
             pipeline = self._require_pipeline()
             work_dir = self._open_temp_dir(job)
             document = pipeline.process(
-                job.item.input_path,
+                item.input_path,
                 work_dir,
                 should_cancel=lambda: self._should_stop(job),
-                language=job.item.language,
+                language=item.language,
+                **_process_options(item),
             )
             text = document.get_full_text().strip()
             if self._gigaam and document.segments:
                 # * GigaAM segments are the 20 s windows: the last one ends at
-                # * the exact audio duration.
+                # * the exact (window-relative) audio duration.
                 job.audio_end_s = float(document.segments[-1].end_time)
+            if item.want_segments:
+                data = {"segments": _document_segments(document, item)}
         except Exception as exc:  # noqa: BLE001 - a failed job becomes an error result
             error = exc
-        self._retire(job, self._outcome(job, text=text, error=error))
+        self._retire(job, self._outcome(job, text=text, data=data, error=error))
 
 
-class CpuPipelineEngine(_EngineBase):
+class CpuPipelineEngine(_PipelineEngine):
     """Any provider on CPU: ``capacity`` slot threads over one shared pipeline.
 
     Whisper uses ``cpu_threads=threads_per_slot`` and ``num_workers=capacity``
@@ -1327,8 +1599,9 @@ class CpuPipelineEngine(_EngineBase):
     ``torch_threads=threads_per_slot`` and the lock-free thread-safe path
     (warmed up single-threaded in :meth:`load`). Each slot takes the next held
     item in admission order and runs ``pipeline.process`` with the item's own
-    language and temp directory; a cancel stops it at the next
-    segment/window boundary (or during the ffmpeg preparation).
+    language, media window, decoding options and temp directory; a cancel
+    stops it at the next segment/window boundary (or during the ffmpeg
+    preparation).
     """
 
     def _build_pipeline(self) -> LocalPipeline:
@@ -1362,12 +1635,13 @@ class CpuPipelineEngine(_EngineBase):
             self._guarded(job, self._run_pipeline_job)
 
 
-class GigaamGpuBatchEngine(_EngineBase):
+class GigaamGpuBatchEngine(_PipelineEngine):
     """``gigaam-e2e-ctc`` on CUDA with cross-job window batches.
 
     Threads: up to :data:`MAX_PREP_THREADS` prep threads run ``prepare_audio``
-    (ffmpeg, no torch) into each job's temp directory; ONE batch-loop thread
-    owns every prepared job, streams its 20 s windows lazily
+    (ffmpeg, no torch; with the job's media window when it has one) into each
+    job's temp directory; ONE batch-loop thread owns every prepared job,
+    streams its 20 s windows lazily
     (:func:`~core.gigaam_ctc_wrapper.iter_wav_windows`), deals up to ``lanes``
     windows per batch with :func:`rotate_lanes` and runs
     ``transcribe_window_batch``. The lane rotation carries over from batch to
@@ -1377,9 +1651,11 @@ class GigaamGpuBatchEngine(_EngineBase):
 
     A job's text is its window texts joined with newlines and stripped (one
     segment per window, empty windows kept), the structure of
-    ``Document.get_full_text()`` on the default path. A failed batch fails
-    only the jobs that had windows in it; a cancel drops the job's remaining
-    windows at the next batch boundary.
+    ``Document.get_full_text()`` on the default path. A job that asks for
+    segments gets one ``{start, end, text}`` segment per 20 s window (empty
+    windows kept, media-relative times), like the wrapper's default path. A
+    failed batch fails only the jobs that had windows in it; a cancel drops
+    the job's remaining windows at the next batch boundary.
     """
 
     def __init__(self, spec: WorkerSpec) -> None:
@@ -1425,16 +1701,28 @@ class GigaamGpuBatchEngine(_EngineBase):
             self._guarded(job, self._prepare)
 
     def _prepare(self, job: _Job) -> None:
-        """Convert the job's media to a 16 kHz mono WAV in its temp directory."""
+        """Convert the job's media window to a 16 kHz mono WAV in its temp directory."""
         from core.audio_io import prepare_audio  # noqa: PLC0415 - worker only
 
+        if self._reject_unsupported(job):
+            return
+        window = job.item.window
         try:
             work_dir = self._open_temp_dir(job)
-            job.wav_path = prepare_audio(
-                job.item.input_path,
-                work_dir,
-                should_cancel=lambda: self._should_stop(job),
-            )
+            if window.is_default:
+                job.wav_path = prepare_audio(
+                    job.item.input_path,
+                    work_dir,
+                    should_cancel=lambda: self._should_stop(job),
+                )
+            else:
+                job.wav_path = prepare_audio(
+                    job.item.input_path,
+                    work_dir,
+                    should_cancel=lambda: self._should_stop(job),
+                    start_s=window.start_s,
+                    duration_s=window.duration_s,
+                )
         except Exception as exc:  # noqa: BLE001 - a failed prep fails only its job
             self._retire(job, self._outcome(job, error=exc))
             return
@@ -1478,12 +1766,13 @@ class GigaamGpuBatchEngine(_EngineBase):
         from core.gigaam_ctc_wrapper import iter_wav_windows  # noqa: PLC0415 - lazy
 
         try:
-            if job.windows is None:
+            windows = job.windows
+            if windows is None:
                 if job.wav_path is None:
                     msg = "prepared WAV is missing"
                     raise RuntimeError(msg)  # noqa: TRY301 - reported as this job's error
-                job.windows = iter_wav_windows(job.wav_path)
-            job.lookahead = next(job.windows)
+                windows = job.windows = iter_wav_windows(job.wav_path)
+            job.lookahead = next(windows)
         except StopIteration:
             job.exhausted = True
             _close_windows(job)
@@ -1512,7 +1801,10 @@ class GigaamGpuBatchEngine(_EngineBase):
         if job.read_error is not None:
             self._retire(job, self._outcome(job, error=job.read_error))
             return
-        self._retire(job, self._outcome(job, text="\n".join(job.texts)))
+        data: dict[str, object] | None = None
+        if job.item.want_segments:
+            data = {"segments": _window_segments(job)}
+        self._retire(job, self._outcome(job, text="\n".join(job.texts), data=data))
 
     def _batch_step(self, active: Sequence[_Job]) -> None:
         """Deal one batch over the active jobs, run it, then settle every job."""
@@ -1573,16 +1865,19 @@ class GigaamGpuBatchEngine(_EngineBase):
             return
         for (job, window), text in zip(batch, texts, strict=True):
             job.texts.append(text)
+            job.spans.append((window.start_s, window.end_s))
             job.audio_end_s = window.end_s
 
 
-class WhisperGpuEngine(_EngineBase):
+class WhisperGpuEngine(_PipelineEngine):
     """Whisper on CUDA: cross-file clip batches plus the sequential path.
 
     Threads: up to :data:`MAX_PREP_THREADS` prep threads route each item: an
-    item with an explicit language whose duration (``duration_s``, else
-    ffprobe) and decoded length are at most ``whisper_batch_max_clip_s`` is
-    decoded (:func:`~core.whisper_batch.load_audio_16k`), checked by the
+    item with segments requested, decoding options or a media window takes
+    the sequential path at once (the clip batch honors none of them); a
+    default item with an explicit language whose duration (``duration_s``,
+    else ffprobe) and decoded length are at most ``whisper_batch_max_clip_s``
+    is decoded (:func:`~core.whisper_batch.load_audio_16k`), checked by the
     Silero VAD (no speech -> ``empty`` without inference) and trimmed to its
     speech span; every other item takes the sequential path. ONE inference
     thread takes the first prepared item in admission order: a batch item
@@ -1637,6 +1932,8 @@ class WhisperGpuEngine(_EngineBase):
 
     def _prepare(self, job: _Job) -> None:
         """Route one claimed item, then answer it (``empty``) or hand it on."""
+        if self._reject_unsupported(job):
+            return
         try:
             route = self._route(job)
         except Exception as exc:  # noqa: BLE001 - the sequential path reports its own error
@@ -1658,9 +1955,14 @@ class WhisperGpuEngine(_EngineBase):
         self._release_ready(job)
 
     def _route(self, job: _Job) -> WhisperRoute:
-        """Choose the job's path; batch candidates get their trimmed clip."""
+        """Choose the job's path; batch candidates get their trimmed clip.
+
+        An item with per-job options is decided before any probe, decode or
+        VAD check, so neither the clip batch nor its VAD ``empty`` shortcut
+        ever sees it.
+        """
         language = job.item.language
-        if language is None:
+        if language is None or _has_job_options(job.item):
             return "sequential"
         duration = job.item.duration_s
         if duration is None:
@@ -1751,6 +2053,130 @@ class WhisperGpuEngine(_EngineBase):
             self._retire(job, self._outcome(job, text=text))
 
 
+class DiarizeCpuEngine(_EngineBase):
+    """Speaker diarization on CPU: ``capacity`` slot threads over one model set.
+
+    :meth:`load` provisions the pinned sherpa-onnx models (downloaded and
+    hash-verified on first use) and validates the configuration once, with
+    ``threads_per_slot`` CPU threads for each network. Each slot takes the
+    next held ``diarize`` item in admission order and runs
+    :meth:`~core.sherpa_diarization.SherpaDiarizer.diarize_media` in the job's
+    temp directory with the item's settings and media window; the result is
+    ``ok`` with ``data={"turns": [...]}`` (media-relative times; an empty list
+    when no speech was found). A cancel stops the job during decoding or at
+    the next embedding chunk (the segmentation stage cannot be interrupted).
+
+    sherpa-onnx keeps the GIL during a native run, so the supervisor runs one
+    slot per diarization process and scales with more processes.
+    """
+
+    def __init__(self, spec: WorkerSpec) -> None:
+        super().__init__(spec)
+        self._diarizer: SherpaDiarizer | None = None
+
+    def _load_model(self) -> str:
+        """Provision and verify the models; nothing is kept when it fails."""
+        # ! The diarizer imports numpy and sherpa-onnx on load.
+        from core.sherpa_diarization import (  # noqa: PLC0415 - ML backend inside the worker only
+            SherpaDiarizer,
+        )
+
+        threads = self._spec.threads_per_slot
+        requested = self._spec.options.get("threads_per_slot")
+        if requested is not None and requested != threads:
+            logger.warning(
+                "spec option threads_per_slot=%r differs from the spec's "
+                "threads_per_slot %d; the spec value is used",
+                requested,
+                threads,
+            )
+        diarizer = SherpaDiarizer(threads=threads)
+        diarizer.load()
+        # * sherpa-onnx runs on the CPU provider only.
+        active = self._checked_device("cpu")
+        self._diarizer = diarizer
+        return active
+
+    def _release_model(self) -> None:
+        """Drop the diarizer (every native engine is owned by a finished call)."""
+        self._diarizer = None
+
+    def _unsupported(self, item: WorkItem) -> str | None:
+        """Reject every item that is not a ``diarize`` job with diarize options."""
+        if item.kind != JOB_KIND_DIARIZE:
+            return (
+                f"{self._spec.key.label} runs speaker diarization only; a "
+                f"{item.kind!r} job cannot run on it"
+            )
+        return job_kind_conflict(
+            item.kind,
+            language=item.language,
+            want_segments=item.want_segments,
+            decode=item.decode,
+            diarize=item.diarize,
+        )
+
+    def _details(self) -> dict[str, object]:
+        return {"slots": self._spec.capacity}
+
+    def _thread_targets(self) -> list[tuple[str, Callable[[], None]]]:
+        return [
+            (f"stt-slot-{index}", self._slot_loop)
+            for index in range(self._spec.capacity)
+        ]
+
+    def _slot_loop(self) -> None:
+        """Run held items one at a time until the engine closes."""
+        while (job := self._take_queued()) is not None:
+            self._guarded(job, self._run_diarize_job)
+
+    def _require_diarizer(self) -> SherpaDiarizer:
+        """Return the loaded diarizer.
+
+        Raises:
+            RuntimeError: When the engine is not loaded (or already closed).
+
+        """
+        diarizer = self._diarizer
+        if diarizer is None:
+            msg = "engine is not loaded"
+            raise RuntimeError(msg)
+        return diarizer
+
+    def _run_diarize_job(self, job: _Job) -> None:
+        """Diarize one claimed job and emit its result.
+
+        Every failure (undecodable media, an empty window, a model or backend
+        error) is an ``error`` result with its message; a requested cancel
+        wins over the outcome.
+        """
+        if self._reject_unsupported(job):
+            return
+        if self._should_stop(job):
+            self._retire(job, self._outcome(job))
+            return
+        item = job.item
+        data: dict[str, object] | None = None
+        error: Exception | None = None
+        try:
+            diarizer = self._require_diarizer()
+            work_dir = self._open_temp_dir(job)
+            turns = diarizer.diarize_media(
+                item.input_path,
+                item.diarize_options,
+                window=item.window,
+                work_dir=work_dir,
+                should_cancel=lambda: self._should_stop(job),
+            )
+            data = {"turns": turns}
+        except Exception as exc:  # noqa: BLE001 - a failed job becomes an error result
+            error = exc
+        if error is None and item.duration_s is None and not self._should_stop(job):
+            # * The processed length teaches the supervisor's estimates.
+            job.audio_end_s = _processed_seconds(item)
+        self._retire(job, self._outcome(job, data=data, error=error))
+
+
 def create_engine(spec: WorkerSpec) -> PoolEngine:
     """Build the engine for a worker spec (nothing is loaded here).
 
@@ -1758,7 +2184,8 @@ def create_engine(spec: WorkerSpec) -> PoolEngine:
         spec: Validated worker specification.
 
     Returns:
-        :class:`CpuPipelineEngine` for the CPU backend,
+        :class:`DiarizeCpuEngine` for the speaker diarization key,
+        :class:`CpuPipelineEngine` for STT on the CPU backend,
         :class:`GigaamGpuBatchEngine` for ``gigaam-e2e-ctc`` on the GPU, or
         :class:`WhisperGpuEngine` for Whisper on the GPU.
 
@@ -1775,6 +2202,11 @@ def create_engine(spec: WorkerSpec) -> PoolEngine:
             f"{key.label} (expected {expected_device!r})"
         )
         raise ValueError(msg)
+    if worker_kind(key.provider) == "diarize":
+        if key.backend != "cpu":
+            msg = f"speaker diarization runs on the CPU only, not on {key.label}"
+            raise ValueError(msg)
+        return DiarizeCpuEngine(spec)
     if key.backend == "cpu":
         return CpuPipelineEngine(spec)
     if provider_family(key.provider) == "gigaam":

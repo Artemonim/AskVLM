@@ -152,7 +152,7 @@ if ($EnsureCUDA) { $doEnsureCUDA = $true }
 if ($doEnsureML) {
     try {
         # * whisperx PyPI package is optional (alignment); WhisperXWrapper uses faster-whisper.
-        $needMl = (-not (Test-Module numpy)) -or (-not (Test-Module torch)) -or (-not (Test-Module whisper)) -or (-not (Test-Module faster_whisper)) -or (-not (Test-Module pyannote.audio)) -or (-not (Test-Module transformers)) -or (-not (Test-Module sentencepiece)) -or (-not (Test-Module hydra)) -or (-not (Test-Module omegaconf))
+        $needMl = (-not (Test-Module numpy)) -or (-not (Test-Module torch)) -or (-not (Test-Module whisper)) -or (-not (Test-Module faster_whisper)) -or (-not (Test-Module pyannote.audio)) -or (-not (Test-Module transformers)) -or (-not (Test-Module sentencepiece)) -or (-not (Test-Module hydra)) -or (-not (Test-Module omegaconf)) -or (-not (Test-Module sherpa_onnx))
         if ($needMl) {
             Write-Host "Installing ML dependencies (extras: ml)..." -ForegroundColor Yellow
             try { python -m pip install -q -U pip wheel setuptools } catch {}

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -12,12 +13,18 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pytest
 
+from core.diarization_models import DiarizationModelError
+from core.sherpa_diarization import DiarizationError
 from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
+from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import engines
 from core.stt_pool.engines import AdmissionTicket, admission_order, deal_lanes
+from core.stt_pool.keys import DIARIZE_PROVIDER
 from tests.stt_pool_engine_support import (
     RATE,
+    EngineHandle,
     EngineRuntime,
+    OptionsPipeline,
     item,
     spec,
     wav,
@@ -29,9 +36,8 @@ from tests.stt_pool_engine_support import (
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    from core.stt_pool.engine_api import WorkItem
+    from core.stt_pool.engine_api import WorkerSpec, WorkItem
     from core.stt_pool.keys import Backend
-    from tests.stt_pool_engine_support import EngineHandle
 
 
 @pytest.fixture
@@ -644,3 +650,358 @@ def test_whisper_higher_class_keeps_admission_before_lower_language_match(
         ("en", [3000]),
         ("ru", [4000]),
     ]
+
+
+def _diarize_spec() -> WorkerSpec:
+    """Reserve one CPU slot, matching the native diarizer concurrency contract."""
+    return replace(spec(DIARIZE_PROVIDER), capacity=1, threads_per_slot=3)
+
+
+def _diarize_item(path: Path, *, seq: int = 1) -> WorkItem:
+    """Build a real diarization item with no transcription-only settings."""
+    return replace(
+        item(path, seq=seq, language=None),
+        kind="diarize",
+        diarize=DiarizeOptions(num_speakers=2),
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("provider", ["whisper", "gigaam-e2e-ctc", DIARIZE_PROVIDER])
+def test_failed_model_load_cannot_start_and_can_be_retried_without_leaking(
+    runtime: EngineRuntime, tmp_path: Path, provider: str
+) -> None:
+    """Catch partial loads starting slots, leaking weights or poisoning a later load."""
+    configuration = _diarize_spec() if provider == DIARIZE_PROVIDER else spec(provider)
+    handle = EngineHandle(engines.create_engine(configuration))
+    runtime.handles.append(handle)
+    with pytest.raises(RuntimeError):
+        handle.engine.start(handle.results.put)
+    runtime.load_error = DiarizationModelError("fixture model provisioning failed")
+    with pytest.raises(DiarizationModelError):
+        handle.engine.load()
+    with pytest.raises(RuntimeError):
+        handle.engine.start(handle.results.put)
+    assert runtime.unload_count == (0 if provider == DIARIZE_PROVIDER else 1)
+    runtime.load_error = None
+    handle.engine.load()
+    handle.engine.load()
+    assert runtime.load_count == 2
+    handle.engine.start(handle.results.put)
+    job = (
+        _diarize_item(tmp_path / "recovered.wav")
+        if provider == DIARIZE_PROVIDER
+        else item(tmp_path / "recovered.wav")
+    )
+    handle.engine.submit(job)
+    assert handle.result().status == "ok"
+    handle.engine.close()
+    handle.engine.close()
+    handle.engine.start(handle.results.put)
+    handle.engine.submit(replace(job, job_id="f" * 32))
+    assert handle.results.empty()
+    assert runtime.load_count == 2
+    assert runtime.unload_count == (0 if provider == DIARIZE_PROVIDER else 2)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+@pytest.mark.parametrize("text", ["recognized", " \n\t"])
+def test_pipeline_segments_survive_ok_and_empty_with_media_relative_words(
+    runtime: EngineRuntime, tmp_path: Path, backend: Backend, text: str
+) -> None:
+    """Catch lost empty payloads, omitted options or double offsets on words and segments."""
+    runtime.pipeline_type = OptionsPipeline
+    path = tmp_path / "window.wav"
+    runtime.pipeline_texts[path.name] = text
+    runtime.pipeline_segments[path.name] = [
+        {
+            "start": 0.125,
+            "end": 1.875,
+            "text": " recognized ",
+            "no_speech_prob": 0.12349,
+            "avg_logprob": -0.45651,
+            "words": [
+                {
+                    "word": " recognized ",
+                    "start": 0.25,
+                    "end": 1.5,
+                    "probability": 0.99949,
+                }
+            ],
+        }
+    ]
+    job = replace(
+        item(path, duration_s=None),
+        want_segments=True,
+        window=MediaWindow(12.5, 2.0),
+        decode=WhisperDecodeOptions(
+            beam_size=3, vad_filter=False, word_timestamps=True
+        ),
+    )
+    handle = runtime.open(spec("whisper", backend))
+    handle.engine.submit(job)
+    result = handle.result()
+    assert result.status == ("ok" if text.strip() else "empty")
+    assert result.text == text.strip()
+    assert result.data == {
+        "segments": [
+            {
+                "start": 12.625,
+                "end": 14.375,
+                "text": "recognized",
+                "no_speech_prob": 0.123,
+                "avg_logprob": -0.457,
+                "words": [
+                    {
+                        "word": "recognized",
+                        "start": 12.75,
+                        "end": 14.0,
+                        "probability": 0.999,
+                    }
+                ],
+            }
+        ]
+    }
+    call = runtime.options_calls.get(timeout=WAIT_S)
+    assert call.path == path
+    assert call.window == job.window
+    assert call.decode == job.decode
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("raw", [None, []])
+def test_requested_segments_distinguish_missing_payload_from_no_speech(
+    runtime: EngineRuntime, tmp_path: Path, raw: list[dict[str, object]] | None
+) -> None:
+    """Catch unavailable transcript metadata silently replaced with a valid empty list."""
+    path = tmp_path / "segments.wav"
+    runtime.pipeline_texts[path.name] = ""
+    runtime.pipeline_segments[path.name] = raw
+    handle = runtime.open(spec())
+    handle.engine.submit(replace(item(path), want_segments=True))
+    result = handle.result()
+    assert result.status == ("error" if raw is None else "empty")
+    if raw is None:
+        assert result.error_kind == "transcribe_failed"
+        assert "segments" in (result.error_detail or "")
+        assert result.data is None
+    else:
+        assert result.data == {"segments": []}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"want_segments": True},
+        {"decode": WhisperDecodeOptions(vad_filter=False)},
+        {"decode": WhisperDecodeOptions(beam_size=10)},
+        {"window": MediaWindow(1.0, 2.0)},
+    ],
+)
+def test_whisper_gpu_options_bypass_clip_decoding_and_silence_shortcut(
+    runtime: EngineRuntime,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    options: dict[str, object],
+) -> None:
+    """Catch per-job options entering batching or being discarded by its VAD-empty shortcut."""
+    probes = []
+
+    def probe(
+        argv: list[str], **_options: object
+    ) -> subprocess.CompletedProcess[bytes]:
+        probes.append(argv)
+        return subprocess.CompletedProcess(argv, 0, b'{"format":{"duration":"1"}}', b"")
+
+    monkeypatch.setattr(subprocess, "run", probe)
+    runtime.pipeline_type = OptionsPipeline
+    path = tmp_path / "no-clip-decoding.wav"
+    runtime.pipeline_segments[path.name] = []
+    job = replace(item(path, duration_s=None), **options)
+    handle = runtime.open(spec("whisper", "gpu"))
+    handle.engine.submit(job)
+    result = handle.result()
+    assert result.status == "ok"
+    assert result.text == "ru:no-clip-decoding.wav"
+    assert runtime.process_calls.get(timeout=WAIT_S).path == path
+    assert runtime.batch_calls.empty()
+    assert not probes
+    assert not runtime.decode_calls
+    assert not runtime.vad_calls
+    assert runtime.options_calls.get(timeout=WAIT_S).window == (
+        job.window if not job.window.is_default else None
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("silent", [False, True])
+def test_gigaam_batch_window_preserves_order_empty_windows_and_media_times(
+    runtime: EngineRuntime, tmp_path: Path, *, silent: bool
+) -> None:
+    """Catch unapplied cuts, dropped empty GigaAM windows or window-relative JSON times."""
+    runtime.gigaam_texts = {
+        1000: "" if silent else " first ",
+        2000: "",
+        3000: "" if silent else "last ",
+    }
+    path = wav(tmp_path / "gigaam-window.wav", [1000, 2000, 3000])
+    job = replace(
+        item(path, duration_s=None), want_segments=True, window=MediaWindow(5.0, 52.0)
+    )
+    handle = runtime.open(spec("gigaam-e2e-ctc", "gpu", batch_lanes=2))
+    handle.engine.submit(job)
+    result = handle.result()
+    assert result.status == ("empty" if silent else "ok")
+    assert result.text == ("" if silent else "first \n\nlast")
+    assert result.audio_s == 52.0
+    assert result.data == {
+        "segments": [
+            {"start": 5.0, "end": 25.0, "text": "" if silent else "first"},
+            {"start": 25.0, "end": 45.0, "text": ""},
+            {"start": 45.0, "end": 57.0, "text": "" if silent else "last"},
+        ]
+    }
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("provider", "backend"),
+    [("gigaam-ctc", "cpu"), ("gigaam-e2e-ctc", "cpu"), ("gigaam-e2e-ctc", "gpu")],
+)
+def test_gigaam_engines_reject_explicit_whisper_decode_options(
+    runtime: EngineRuntime, tmp_path: Path, provider: str, backend: Backend
+) -> None:
+    """Catch direct worker jobs silently ignoring Whisper-only options on GigaAM."""
+    handle = runtime.open(spec(provider, backend))
+    handle.engine.submit(
+        replace(
+            item(tmp_path / "unused.wav"), decode=WhisperDecodeOptions(beam_size=10)
+        )
+    )
+    result = handle.result()
+    assert result.status == "error"
+    assert result.error_kind == "transcribe_failed"
+    assert "beam_size" in (result.error_detail or "")
+    assert provider in (result.error_detail or "")
+    assert runtime.process_calls.empty()
+    assert runtime.batch_calls.empty()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "configuration",
+    [spec(), spec("whisper", "gpu"), spec("gigaam-e2e-ctc", "gpu"), _diarize_spec()],
+)
+def test_engine_dispatch_and_runtime_kind_guard_reject_wrong_job_family(
+    runtime: EngineRuntime, tmp_path: Path, configuration: WorkerSpec
+) -> None:
+    """Catch diarize keys reaching STT construction or mismatched work running inference."""
+    diarize = configuration.key.provider == DIARIZE_PROVIDER
+    handle = runtime.open(configuration)
+    if diarize:
+        assert isinstance(handle.engine, engines.DiarizeCpuEngine)
+        assert not runtime.pipelines
+        job = item(tmp_path / "wrong-kind.wav")
+    else:
+        job = _diarize_item(tmp_path / "wrong-kind.wav")
+    handle.engine.submit(job)
+    result = handle.result()
+    assert result.status == "error"
+    assert (result.job_id, result.attempt_id) == (job.job_id, job.attempt_id)
+    assert runtime.process_calls.empty()
+    assert runtime.diarize_calls.empty()
+    assert runtime.batch_calls.empty()
+    handle.engine.close()
+    assert handle.results.empty()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("duration", [None, 1.25])
+def test_diarize_engine_returns_turns_and_clips_unknown_audio_length(
+    runtime: EngineRuntime, tmp_path: Path, duration: float | None
+) -> None:
+    """Catch zero turns becoming empty, lost options, wrong thread budget or ETA duration."""
+    path = wav(tmp_path / "diarize.wav", [1000], window_s=10.0)
+    job = replace(
+        _diarize_item(path), duration_s=duration, window=MediaWindow(7.0, 5.0)
+    )
+    handle = runtime.open(_diarize_spec())
+    assert runtime.diarizers[0].threads == 3
+    handle.engine.submit(job)
+    result = handle.result()
+    assert result.status == "ok"
+    assert result.text == ""
+    assert result.data == {"turns": []}
+    assert result.audio_s == (3.0 if duration is None else duration)
+    call = runtime.diarize_calls.get(timeout=WAIT_S)
+    assert call.path == path
+    assert call.window == job.window
+    assert call.options == job.diarize
+    assert call.thread_name.startswith("stt-slot-")
+    assert not call.work_dir.exists()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    "error_type", [DiarizationError, DiarizationModelError, ValueError]
+)
+def test_diarize_engine_errors_answer_once_and_leave_slot_usable(
+    runtime: EngineRuntime, tmp_path: Path, error_type: type[Exception]
+) -> None:
+    """Catch backend/media/model failures dropping an attempt or killing the diarize slot."""
+    broken = _diarize_item(tmp_path / "broken-diarize.wav")
+    runtime.diarize_results[broken.input_path.name] = error_type(str(broken.input_path))
+    handle = runtime.open(_diarize_spec())
+    handle.engine.submit(broken)
+    failed = handle.result()
+    assert failed.status == "error"
+    assert failed.error_kind == "transcribe_failed"
+    assert str(broken.input_path) in (failed.error_detail or "")
+    healthy = _diarize_item(tmp_path / "healthy-diarize.wav", seq=2)
+    runtime.diarize_results[healthy.input_path.name] = [
+        {"start": 0.1, "end": 0.9, "speaker": "speaker_00"}
+    ]
+    handle.engine.submit(healthy)
+    result = handle.result()
+    assert result.status == "ok"
+    assert result.data == {
+        "turns": [{"start": 0.1, "end": 0.9, "speaker": "speaker_00"}]
+    }
+    handle.engine.close()
+    assert handle.results.empty()
+
+
+@pytest.mark.integration
+def test_diarize_running_and_held_cancellation_win_and_emit_once(
+    runtime: EngineRuntime, tmp_path: Path
+) -> None:
+    """Catch cancelled diarization producing success/error, duplicate answers or a dead slot."""
+    first = _diarize_item(tmp_path / "blocked-diarize.wav")
+    second = _diarize_item(tmp_path / "held-diarize.wav", seq=2)
+    gate = runtime.process_gates[first.input_path.name] = threading.Event()
+    handle = runtime.open(_diarize_spec())
+    handle.engine.submit(first)
+    call = runtime.diarize_calls.get(timeout=WAIT_S)
+    assert (call.work_dir / engines.KEEPALIVE_FILE_NAME).exists()
+    handle.engine.submit(first)
+    handle.engine.submit(second)
+    for job in (first, second):
+        handle.engine.cancel(job.job_id, job.attempt_id)
+        handle.engine.cancel(job.job_id, job.attempt_id)
+    held = handle.result()
+    assert (held.job_id, held.status) == (second.job_id, "cancelled")
+    gate.set()
+    running = handle.result()
+    assert (running.job_id, running.status, running.error_kind) == (
+        first.job_id,
+        "cancelled",
+        "cancelled",
+    )
+    assert running.data is None
+    handle.engine.submit(_diarize_item(tmp_path / "after-cancel.wav", seq=3))
+    assert handle.result().status == "ok"
+    handle.engine.close()
+    assert handle.results.empty()
+    assert not call.work_dir.exists()

@@ -116,7 +116,16 @@ python cli.py external-transcribe PATH_TO_MEDIA
 - Несколько входов в одном вызове возвращают JSON Lines в порядке входов (`--output-dir`, `--max-parallel`); `--priority high|normal|low` упорядочивает очередь с чередованием вызовов.
 - Legacy `--no-daemon`: модель грузится в процессе самой команды и выгружается перед выходом; на Windows упавший GPU-процесс (OOM) повторяется на CPU в изолированном подпроцессе (Whisper и `gigaam-e2e-ctc`). `gigaam-ctc` в CUDA/fallback/Windows GPU-isolation не участвует.
 - Опциональный файловый вывод: `--output-file transcript.txt`.
-- Диаризация отключена по умолчанию (экономия VRAM).
+- `--format json`: документ на вход в формате `transcribe.py` навыка hardsub (сегменты со словами, `no_speech_prob`, `avg_logprob`); Whisper-опции `--beam-size`, `--vad/--no-vad`, `--condition-on-previous-text/...`, `--word-timestamps/...` (с GigaAM — ошибка) и окно `--start`/`--duration`.
+- `--diarization` (выключена по умолчанию): CPU-диаризация sherpa-onnx (pyannote segmentation 3.0 + WeSpeaker ResNet34-LM, без токена и GPU) через супервизор и в `--no-daemon`; метки `speaker_00`, `speaker_01`, …, при одном голосе текст без префиксов.
+
+### `external-diarize` — кто говорит когда
+
+```bash
+python cli.py external-diarize PATH_TO_MEDIA [--num-speakers N] [--threshold 0.5]
+```
+
+Печатает JSON `{"media", "turns": [{"start", "end", "speaker"}]}` в формате `diarize.py` навыка hardsub; несколько входов — JSON Lines. Только CPU; модели (~33 МБ) скачиваются при первом запуске с проверкой SHA-256 в `.cache/models/sherpa-diarization/`.
 
 Подробности — [doc/EXTERNAL_CLI_TRANSCRIBER.md](doc/EXTERNAL_CLI_TRANSCRIBER.md).
 

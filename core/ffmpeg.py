@@ -1,5 +1,6 @@
 # Placeholder for ffmpeg.py
 
+import contextlib
 import json
 import logging
 import math
@@ -7,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import wave
 from pathlib import Path
 from typing import cast
 
@@ -21,15 +23,111 @@ def extract_audio(
     output_file: str | Path,
     sample_rate: int = 16000,
     channels: int = 1,
+    *,
+    start_s: float | None = None,
+    duration_s: float | None = None,
 ) -> None:
-    """Extract audio from input file and save as WAV with specified sample rate and channels."""
-    ffmpeg.input(str(input_file)).output(
+    """Extract audio from input file and save as WAV with specified sample rate and channels.
+
+    Args:
+        input_file: Media file to read.
+        output_file: WAV file to write.
+        sample_rate: Output sample rate in Hz.
+        channels: Output channel count.
+        start_s: Window start in seconds; applied as an input seek (``-ss``
+            before ``-i``) only when positive.
+        duration_s: Window length in seconds (``-t``); ``None`` reads to the end.
+
+    Raises:
+        ValueError: A window was requested and the decoded WAV has no audio
+            frames (for example the window starts after the end of the media).
+
+    """
+    input_kwargs, output_kwargs = window_ffmpeg_kwargs(start_s, duration_s)
+    ffmpeg.input(str(input_file), **input_kwargs).output(
         str(output_file),
         format="wav",
         acodec="pcm_s16le",
         ac=channels,
         ar=sample_rate,
+        **output_kwargs,
     ).overwrite_output().run(quiet=True)
+    ensure_window_has_audio(
+        output_file, input_file, start_s=start_s, duration_s=duration_s
+    )
+
+
+def window_ffmpeg_kwargs(
+    start_s: float | None, duration_s: float | None
+) -> tuple[dict[str, str], dict[str, str]]:
+    """Return the ffmpeg-python option kwargs of a media window.
+
+    Times are passed as fixed-point strings (``"1.500"``), never as the float
+    ``repr`` (``1e-05``, ``1e+16``) that the ffmpeg time parser may reject.
+
+    Args:
+        start_s: Window start in seconds; seeks only when positive.
+        duration_s: Window length in seconds; limits the output when set.
+
+    Returns:
+        ``(input_kwargs, output_kwargs)``: ``ss`` is an input option (the seek
+        happens before ``-i``) and ``t`` an output option (``-t`` after
+        ``-i``); both dicts are empty when no window is requested.
+
+    """
+    input_kwargs: dict[str, str] = {}
+    if start_s is not None and start_s > 0:
+        input_kwargs["ss"] = f"{start_s:.3f}"
+    output_kwargs: dict[str, str] = {}
+    if duration_s is not None:
+        output_kwargs["t"] = f"{duration_s:.3f}"
+    return input_kwargs, output_kwargs
+
+
+def ensure_window_has_audio(
+    wav_path: str | Path,
+    input_file: str | Path,
+    *,
+    start_s: float | None,
+    duration_s: float | None,
+) -> None:
+    """Fail when a requested media window produced a WAV without audio frames.
+
+    Does nothing when no window was requested (no positive ``start_s`` and no
+    ``duration_s``).
+
+    Args:
+        wav_path: WAV file written by ffmpeg for the window.
+        input_file: Media file the window was cut from (for the message).
+        start_s: Requested window start in seconds.
+        duration_s: Requested window length in seconds.
+
+    Raises:
+        ValueError: The WAV has zero frames (or is empty) or cannot be parsed;
+            an empty file is removed on a best-effort basis.
+
+    """
+    if not any(window_ffmpeg_kwargs(start_s, duration_s)):
+        return
+    length = "to the end" if duration_s is None else f"{duration_s:g} s long"
+    window = f"the window starting at {start_s or 0.0:g} s ({length})"
+    try:
+        with wave.open(str(wav_path), "rb") as handle:
+            frames = handle.getnframes()
+    except EOFError:
+        frames = 0
+    except wave.Error as exc:
+        msg = f"cannot read the WAV decoded from {Path(input_file)} for {window}: {exc}"
+        raise ValueError(msg) from exc
+    if frames > 0:
+        return
+    with contextlib.suppress(OSError):
+        Path(wav_path).unlink()
+    msg = (
+        f"no audio decoded from {Path(input_file)} for {window}; "
+        "the window may lie beyond the end of the media"
+    )
+    raise ValueError(msg)
 
 
 logger = logging.getLogger(__name__)
