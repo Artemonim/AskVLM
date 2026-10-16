@@ -2,15 +2,84 @@
 
 import contextlib
 import logging
+import sys
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Self
 
 import ffmpeg
 
 from .ffmpeg import ensure_window_has_audio, extract_audio, window_ffmpeg_kwargs
 
 logger = logging.getLogger(__name__)
+
+# * ffmpeg exit codes that mean "out of memory", as Windows reports them
+# * (unsigned 32-bit): the loader could not commit memory for the process
+# * (STATUS_COMMITMENT_LIMIT, for example under a Job Object cap), an
+# * allocation failed with STATUS_NO_MEMORY, or ffmpeg itself returned
+# * AVERROR(ENOMEM) = -12.
+_FFMPEG_MEMORY_EXIT_CODES: dict[int, str] = {
+    0xC000012D: "STATUS_COMMITMENT_LIMIT",
+    0xC0000017: "STATUS_NO_MEMORY",
+    0xFFFFFFF4: "ENOMEM",
+}
+
+
+class FfmpegOutOfMemoryError(MemoryError, RuntimeError):
+    """ffmpeg exited with an exit code that means it ran out of memory.
+
+    It is a :class:`MemoryError`, so the STT pool reports the job as
+    ``memory_limit`` (retried on a fresh worker with a larger reservation),
+    and a :class:`RuntimeError`, like every other ffmpeg failure of
+    :func:`prepare_audio`, so existing handlers keep catching it.
+
+    Attributes:
+        exit_code: ffmpeg's exit code as the process reported it.
+        status: Name of the memory status the exit code stands for.
+
+    """
+
+    def __init__(self, exit_code: int, status: str) -> None:
+        """Describe the failed ffmpeg run.
+
+        Args:
+            exit_code: ffmpeg's exit code as the process reported it.
+            status: Name of the memory status the exit code stands for.
+
+        """
+        self.exit_code = exit_code
+        self.status = status
+        super().__init__(
+            f"ffmpeg exited with code {exit_code} (0x{exit_code & 0xFFFFFFFF:08X}, "
+            f"{status}): out of memory"
+        )
+
+    def __reduce__(self) -> tuple[type[Self], tuple[int, str]]:
+        """Pickle with the constructor arguments rather than the message."""
+        return (type(self), (self.exit_code, self.status))
+
+
+def _ffmpeg_exit_error(code: int) -> RuntimeError:
+    """Return the exception for ffmpeg's non-zero exit *code*.
+
+    Windows reports exit codes as unsigned 32-bit values, so a code is
+    compared in that form there; elsewhere a negative code is a signal
+    number and never means "out of memory".
+
+    Args:
+        code: Non-zero exit code of the ffmpeg process.
+
+    Returns:
+        :class:`FfmpegOutOfMemoryError` for a memory-exhaustion code, else a
+        plain :class:`RuntimeError`.
+
+    """
+    lookup = code & 0xFFFFFFFF if sys.platform == "win32" else code
+    status = _FFMPEG_MEMORY_EXIT_CODES.get(lookup)
+    if status is not None:
+        return FfmpegOutOfMemoryError(code, status)
+    return RuntimeError(f"ffmpeg exited with code {code}")
 
 
 def _extract_blocking(
@@ -75,6 +144,9 @@ def prepare_audio(
         start.
 
     Raises:
+        FfmpegOutOfMemoryError: On the cancellable path, ffmpeg exited with an
+            exit code that means it ran out of memory (also a
+            :class:`RuntimeError`).
         RuntimeError: Cancellation was requested or ffmpeg failed.
         ValueError: A window was requested and no audio frames were decoded.
 
@@ -132,8 +204,7 @@ def prepare_audio(
             ret = proc_local.poll()
             if ret is not None:
                 if ret != 0:
-                    msg = f"ffmpeg exited with code {ret}"
-                    raise RuntimeError(msg)
+                    raise _ffmpeg_exit_error(ret)
                 break
             time.sleep(0.1)
         # * A window that decodes to zero frames is an error, not an empty transcript.

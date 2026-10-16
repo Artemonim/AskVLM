@@ -13,8 +13,12 @@ its own Job Object owned by the supervisor:
 
 Jobs nest on Windows 8 and newer: when the supervisor itself runs inside a job,
 a worker's job becomes a child of that job and both limits apply. Off Windows
-the job is inactive and :attr:`WorkerJob.error` says why. The module uses
-``ctypes`` only and imports no ML packages.
+the job is inactive and :attr:`WorkerJob.error` says why.
+
+:func:`suppress_error_dialogs` turns off the modal Windows error dialogs of a
+headless process and of the children it starts afterwards: a child that fails
+to start or crashes then exits with its status instead of waiting for a click.
+The module uses ``ctypes`` only and imports no ML packages.
 """
 
 from __future__ import annotations
@@ -47,6 +51,15 @@ _JOB_OBJECT_MSG_JOB_MEMORY_LIMIT = 10
 _PROCESS_TERMINATE = 0x0001
 _PROCESS_SET_QUOTA = 0x0100
 _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+# * ``SetErrorMode`` flags: no critical-error box (a loader failure such as
+# * 0xC000012D STATUS_COMMITMENT_LIMIT included), no Windows Error Reporting box
+# * after a crash, no box when ``OpenFile`` misses a file.
+_SEM_FAILCRITICALERRORS = 0x0001
+_SEM_NOGPFAULTERRORBOX = 0x0002
+_SEM_NOOPENFILEERRORBOX = 0x8000
+_SUPPRESSED_ERROR_DIALOGS = (
+    _SEM_FAILCRITICALERRORS | _SEM_NOGPFAULTERRORBOX | _SEM_NOOPENFILEERRORBOX
+)
 # * Completion keys of the job's notification port.
 _JOB_KEY = 1
 _STOP_KEY = 2
@@ -175,6 +188,10 @@ def _kernel32() -> ctypes.CDLL:
         ctypes.POINTER(ctypes.c_int),
     )
     lib.IsProcessInJob.restype = ctypes.c_int
+    lib.GetErrorMode.argtypes = ()
+    lib.GetErrorMode.restype = ctypes.c_uint
+    lib.SetErrorMode.argtypes = (ctypes.c_uint,)
+    lib.SetErrorMode.restype = ctypes.c_uint
     return lib
 
 
@@ -483,6 +500,34 @@ def is_current_process_in_job() -> bool | None:
     ):
         return None
     return bool(result.value)
+
+
+def suppress_error_dialogs() -> int | None:
+    """Turn off the modal Windows error dialogs of this process and its children.
+
+    Adds ``SEM_FAILCRITICALERRORS``, ``SEM_NOGPFAULTERRORBOX`` and
+    ``SEM_NOOPENFILEERRORBOX`` to the process error mode, keeping the flags
+    already set. Processes started afterwards inherit the mode unless they are
+    created with ``CREATE_DEFAULT_ERROR_MODE``, which ``subprocess`` and
+    ffmpeg-python never pass. A child that fails to load (for example
+    ``0xC000012D`` STATUS_COMMITMENT_LIMIT under the worker's Job Object cap)
+    or crashes then exits with its status instead of blocking on an
+    "Application Error" box until someone clicks it. A crash is no longer
+    reported to Windows Error Reporting either.
+
+    Returns:
+        The error mode in effect afterwards, or ``None`` off Windows or when
+        ``kernel32`` is unavailable (nothing is changed then).
+
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        kernel32 = _kernel32()
+    except OSError:
+        return None
+    kernel32.SetErrorMode(int(kernel32.GetErrorMode()) | _SUPPRESSED_ERROR_DIALOGS)
+    return int(kernel32.GetErrorMode())
 
 
 def detached_creationflags(*, breakaway: bool) -> int:

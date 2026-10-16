@@ -37,6 +37,11 @@ DEFAULT_MIN_THREAD_BUDGET = 2
 DEFAULT_COMMIT_BUDGET_GIB = 12.0
 DEFAULT_FREE_COMMIT_GUARD_GIB = 8.0
 DEFAULT_CRITICAL_FREE_COMMIT_GIB = 4.0
+# * Commit a worker's Job Object allows above the worker's reservation for its
+# * child processes: ffmpeg audio decodes (up to two at once in a GPU worker's
+# * prep threads, one per slot in a CPU worker) usually commit tens to a few
+# * hundred MiB each, so 1 GiB leaves a wide margin for large video inputs.
+DEFAULT_CHILD_HEADROOM_GIB = 1.0
 DEFAULT_VRAM_BUDGET_GIB = 4.0
 DEFAULT_VRAM_FREE_GUARD_GIB = 0.5
 DEFAULT_WORKER_IDLE_TTL_S = 600.0
@@ -83,7 +88,12 @@ _GPU_KEYS = frozenset(
 )
 _THREADS_KEYS = frozenset({"budget"})
 _MEMORY_KEYS = frozenset(
-    {"commit_budget_gib", "free_commit_guard_gib", "critical_free_commit_gib"}
+    {
+        "commit_budget_gib",
+        "free_commit_guard_gib",
+        "critical_free_commit_gib",
+        "child_headroom_gib",
+    }
 )
 _VRAM_KEYS = frozenset({"budget_gib", "free_guard_gib"})
 _LIFECYCLE_KEYS = frozenset(
@@ -193,12 +203,18 @@ class MemoryConfig:
             worker spawn.
         critical_free_commit_bytes: Free system commit below which idle
             workers are stopped and no worker is spawned.
+        child_headroom_bytes: Commit a worker's Job Object allows above the
+            worker's commit reservation, for child processes such as ffmpeg
+            that share the job's cap. It is not reserved: the commit budget
+            and the scheduler count only the reservation. ``0`` caps the job
+            at the reservation.
 
     """
 
     commit_budget_bytes: int
     free_commit_guard_bytes: int
     critical_free_commit_bytes: int
+    child_headroom_bytes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -624,6 +640,11 @@ def _parse_memory(payload: Mapping[str, object]) -> MemoryConfig:
         critical_free_commit_bytes=_as_gib_bytes(
             section.get("critical_free_commit_gib", DEFAULT_CRITICAL_FREE_COMMIT_GIB),
             "memory.critical_free_commit_gib",
+            allow_zero=True,
+        ),
+        child_headroom_bytes=_as_gib_bytes(
+            section.get("child_headroom_gib", DEFAULT_CHILD_HEADROOM_GIB),
+            "memory.child_headroom_gib",
             allow_zero=True,
         ),
     )
@@ -1122,6 +1143,7 @@ def config_summary(config: PoolConfig) -> dict[str, object]:
             "commit_budget_bytes": config.memory.commit_budget_bytes,
             "free_commit_guard_bytes": config.memory.free_commit_guard_bytes,
             "critical_free_commit_bytes": config.memory.critical_free_commit_bytes,
+            "child_headroom_bytes": config.memory.child_headroom_bytes,
         },
         "vram": {
             "budget_bytes": config.vram.budget_bytes,

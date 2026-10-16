@@ -6,12 +6,15 @@ import wave
 from array import array
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
 
 from core import audio_io
+from core.stt_pool.engine_api import WorkItem
 from tests.bounded_scenario_support import run_bounded_scenario
+from tests.stt_pool_engine_support import EngineRuntime, spec
 from utils import env as env_utils
 
 
@@ -224,57 +227,103 @@ def test_load_env_file_sets_variables(
     assert os.environ.get("C") == "3"
 
 
-def test_prepare_audio_cancellable_path_success(  # noqa: C901
+class _AsyncFfmpeg:
+    """Substitute only ffmpeg-python's external process chain and its exit."""
+
+    def __init__(self, exit_code: int) -> None:
+        self.exit_code = exit_code
+        self.stderr = io.StringIO("progress=1\n")
+        self.output_path: Path | None = None
+
+    def input(self, *_args: object, **_kwargs: object) -> "_AsyncFfmpeg":
+        """Accept the media path without decoding a real input."""
+        return self
+
+    def output(self, path: str, **_kwargs: object) -> "_AsyncFfmpeg":
+        """Remember where the real caller requests its intermediate WAV."""
+        self.output_path = Path(path)
+        return self
+
+    def overwrite_output(self) -> "_AsyncFfmpeg":
+        """Keep the external builder chain intact."""
+        return self
+
+    def global_args(self, *_args: object) -> "_AsyncFfmpeg":
+        """Accept the external progress arguments."""
+        return self
+
+    def run_async(self, **_kwargs: object) -> "_AsyncFfmpeg":
+        """Leave a partial file like a failed external decoder."""
+        if self.output_path is not None:
+            self.output_path.write_bytes(b"partial WAV")
+        return self
+
+    def poll(self) -> int:
+        """Return the OS status without timer-dependent progress."""
+        return self.exit_code
+
+    def terminate(self) -> None:
+        """Satisfy the cancellable process boundary."""
+
+    def kill(self) -> None:
+        """Satisfy the cancellable process boundary."""
+
+
+def test_prepare_audio_cancellable_path_success(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """prepare_audio with should_cancel uses async ffmpeg path and succeeds."""
-
-    # Fake ffmpeg chain
-    class FakeStream:
-        def __init__(self) -> None:
-            self.stderr = io.StringIO("progress=1\n")
-
-        def output(self, *_args: object, **_kwargs: object) -> "FakeStream":
-            return self
-
-        def overwrite_output(self) -> "FakeStream":
-            return self
-
-        def global_args(self, *_args: object) -> "FakeStream":
-            return self
-
-        def run_async(
-            self,
-            *,
-            pipe_stdin: bool = True,
-            pipe_stdout: bool = False,
-            pipe_stderr: bool = True,
-        ) -> object:
-            class Proc:
-                def __init__(self, stderr: io.StringIO) -> None:
-                    self.stderr = stderr
-
-                def poll(self) -> int:
-                    return 0
-
-                def terminate(self) -> None:
-                    return None
-
-                def kill(self) -> None:
-                    return None
-
-            # Touch keyword-only flags to avoid unused-argument warnings
-            _ = (pipe_stdin, pipe_stdout, pipe_stderr)
-            return Proc(self.stderr)
-
-    class FakeFFMPEG:
-        def input(self, *_args: object, **_kwargs: object) -> FakeStream:
-            return FakeStream()
-
-    # Patch module-level ffmpeg in audio_io
-    monkeypatch.setattr(audio_io, "ffmpeg", FakeFFMPEG())
+    monkeypatch.setattr(audio_io, "ffmpeg", _AsyncFfmpeg(0))
 
     inp = tmp_path / "in.wav"
     # No need to exist; pipeline does not read input when poll()=0 immediately
     out = audio_io.prepare_audio(inp, tmp_path, should_cancel=lambda: False)
     assert out.exists() is False or out.suffix == ".wav"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("platform", "exit_code", "status"),
+    [
+        ("win32", 0xC000012D, "STATUS_COMMITMENT_LIMIT"),
+        ("win32", 0xC0000017, "STATUS_NO_MEMORY"),
+        ("win32", 0xFFFFFFF4, "ENOMEM"),
+        ("win32", -1073741523, "STATUS_COMMITMENT_LIMIT"),
+        ("win32", -1073741801, "STATUS_NO_MEMORY"),
+        ("win32", -12, "ENOMEM"),
+        ("win32", 1, None),
+        ("linux", -12, None),
+        ("linux", -9, None),
+        ("linux", 137, None),
+    ],
+)
+def test_ffmpeg_failure_reaches_pool_classification_and_removes_partial_audio(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    platform: str,
+    exit_code: int,
+    status: str | None,
+) -> None:
+    """Catch generic failure for loader OOM or OOM classification for a signal."""
+    monkeypatch.setattr(audio_io, "sys", SimpleNamespace(platform=platform))
+    ffmpeg = _AsyncFfmpeg(exit_code)
+    monkeypatch.setattr(audio_io, "ffmpeg", ffmpeg)
+    source = tmp_path / "incident.wav"
+    item = WorkItem("job", "job:1", source, "ru", 1.0, None)
+    runtime = EngineRuntime()
+    runtime.install(monkeypatch, tmp_path)
+    try:
+        handle = runtime.open(spec("gigaam-e2e-ctc", "gpu"))
+        handle.engine.submit(item)
+        result = handle.result()
+        assert result.status == "error"
+        assert result.attempt_id == item.attempt_id
+        assert result.error_kind == ("memory_limit" if status else "transcribe_failed")
+        assert str(exit_code) in (result.error_detail or "")
+        if status is not None:
+            assert status in (result.error_detail or "")
+        assert ffmpeg.output_path is not None
+        assert not ffmpeg.output_path.exists()
+    finally:
+        runtime.release_and_close()
+    assert not list(tmp_path.glob("askvlm-pool-*"))

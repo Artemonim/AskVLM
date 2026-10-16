@@ -18,6 +18,7 @@ from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
 from core.stt_pool import ipc
 from core.stt_pool.engine_api import EngineResult, LoadInfo
 from core.stt_pool.sysprobe import child_interpreter
+from tests.stt_pool_windows_support import signal, wait_for_signal
 
 if TYPE_CHECKING:
     from core.stt_pool.engine_api import EmitFn, PoolEngine, WorkerSpec, WorkItem
@@ -48,6 +49,18 @@ class ScenarioEngine:
         if error:
             msg = "fake load failed"
             raise RuntimeError(msg)
+        if options.get("mode") in {"error_mode", "loader_failure"}:
+            from tests.stt_pool_windows_support import (  # noqa: PLC0415 - Windows-only test boundary
+                error_mode_details,
+                loader_failure_details,
+            )
+
+            probe = (
+                loader_failure_details
+                if options["mode"] == "loader_failure"
+                else error_mode_details
+            )
+            return LoadInfo(self._spec.device, 0.0, probe())
         return LoadInfo(str(options.get("loaded_device", self._spec.device)), 0.0, {})
 
     def start(self, emit: EmitFn) -> None:
@@ -145,6 +158,7 @@ class SupervisorEngine:
         self._emit: EmitFn | None = None
         self._threads: list[threading.Thread] = []
         self._cancels: dict[tuple[str, str], tuple[threading.Event, bool]] = {}
+        self._cancel_signals: dict[tuple[str, str], str] = {}
         self._child: subprocess.Popen[bytes] | None = None
         self._close_gate = False
         self._record(
@@ -178,6 +192,8 @@ class SupervisorEngine:
         self._close_gate = bool(plan.get("close_gate"))
         mode = plan.get("load_modes", {}).get(self._spec.key.model)
         self._record("loading", mode=mode)
+        if mode == "cap_report":
+            self._cap_gate(plan)
         if mode == "hang":
             threading.Event().wait()
         if mode == "gate":
@@ -222,6 +238,9 @@ class SupervisorEngine:
             cancel,
             bool(instructions.get("ignore_cancel")),
         )
+        cancel_signal = instructions.get("cancel_signal")
+        if isinstance(cancel_signal, str):
+            self._cancel_signals[item.job_id, item.attempt_id] = cancel_signal
         self._record(
             "submitted",
             job_id=item.job_id,
@@ -248,11 +267,8 @@ class SupervisorEngine:
         self, item: WorkItem, instructions: dict[str, object], cancel: threading.Event
     ) -> None:
         """Recognize at the fake external model boundary."""
-        mode = instructions.get("mode", "ok")
+        mode = self._attempt_mode(item, instructions)
         self._chatter(instructions)
-        attempt = int(item.attempt_id.rsplit(":", 1)[1])
-        if attempt > int(instructions.get("fail_attempts", 1000000)):
-            mode = "ok"
         if mode == "hold" or instructions.get("wait"):
             release = self._root / "release" / item.job_id
             while not release.exists() and not cancel.is_set():
@@ -279,6 +295,25 @@ class SupervisorEngine:
             emit(result)
             if mode == "duplicate":
                 emit(result)
+
+    @staticmethod
+    def _attempt_mode(item: WorkItem, instructions: dict[str, object]) -> object:
+        """Fail only the configured attempts and gate real cap reports by events."""
+        attempt = int(item.attempt_id.rsplit(":", 1)[1])
+        if attempt > int(instructions.get("fail_attempts", 1000000)):
+            return "ok"
+        mode = instructions.get("mode", "ok")
+        if mode == "cap_report":
+            SupervisorEngine._cap_gate(instructions)
+            return instructions.get("after_cap", "error")
+        return mode
+
+    @staticmethod
+    def _cap_gate(instructions: dict[str, object]) -> None:
+        """Report a real denied allocation before an event releases the outcome."""
+        SupervisorEngine._capped_allocation_error()
+        signal(instructions.get("cap_signal"))
+        wait_for_signal(instructions.get("result_gate"))
 
     @staticmethod
     def _chatter(instructions: dict[str, object]) -> None:
@@ -311,25 +346,16 @@ class SupervisorEngine:
             result = EngineResult.for_cancel(
                 item, backend=self._spec.key.backend, run_s=0.0
             )
-        elif mode in {"cuda_oom", "memory_limit", "allocation_error", "error"}:
-            error: Exception
-            if mode == "cuda_oom":
-                error = CudaOutOfMemoryError("CUDA out of memory in fake recognition")
-            elif mode == "memory_limit":
-                error = MemoryError("fake capped allocation failed")
-            elif mode == "allocation_error":
-                error = self._capped_allocation_error()
-            else:
-                error = RuntimeError(
-                    str(
-                        instructions.get(
-                            "error_text", "Too long wav file: transcribe_longform"
-                        )
-                    )
-                )
-            result = EngineResult.for_error(
-                item, error, backend=self._spec.key.backend, run_s=0.0
-            )
+        elif mode in {
+            "cuda_oom",
+            "memory_limit",
+            "allocation_error",
+            "error",
+            "device_unavailable",
+            "protocol_error",
+            "result_too_large",
+        }:
+            result = self._error_result(item, instructions, mode)
         else:
             data = instructions.get("data")
             if data is not None and not isinstance(data, dict):
@@ -360,6 +386,34 @@ class SupervisorEngine:
                 result = replace(result, status="ok", text=" \n\t ")
         return result
 
+    def _error_result(
+        self, item: WorkItem, instructions: dict[str, object], mode: object
+    ) -> EngineResult:
+        """Expose typed external failures without supervisor logic in the fake."""
+        error: Exception
+        if mode == "cuda_oom":
+            error = CudaOutOfMemoryError("CUDA out of memory in fake recognition")
+        elif mode == "memory_limit":
+            error = MemoryError("fake capped allocation failed")
+        elif mode == "allocation_error":
+            error = self._capped_allocation_error()
+        elif mode == "device_unavailable":
+            error = DeviceUnavailableError("fake device is unavailable")
+        else:
+            error = RuntimeError(
+                str(
+                    instructions.get(
+                        "error_text", "Too long wav file: transcribe_longform"
+                    )
+                )
+            )
+        result = EngineResult.for_error(
+            item, error, backend=self._spec.key.backend, run_s=0.0
+        )
+        if mode in {"protocol_error", "result_too_large"}:
+            result = replace(result, error_kind=str(mode))
+        return result
+
     @staticmethod
     def _capped_allocation_error() -> MemoryError:
         """Return a real small Job-cap allocation failure without killing the worker."""
@@ -374,6 +428,7 @@ class SupervisorEngine:
     def cancel(self, job_id: str, attempt_id: str) -> None:
         """Deliver cancellation or keep a deliberately uncooperative job running."""
         self._record("cancel", job_id=job_id, attempt_id=attempt_id)
+        signal(self._cancel_signals.get((job_id, attempt_id)))
         entry = self._cancels.get((job_id, attempt_id))
         if entry is not None and not entry[1]:
             entry[0].set()

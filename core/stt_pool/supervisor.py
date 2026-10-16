@@ -44,6 +44,7 @@ from core.stt_pool.engine_api import (
     ERROR_KIND_CUDA_OOM,
     ERROR_KIND_MEMORY_LIMIT,
     ERROR_KIND_RESULT_TOO_LARGE,
+    ERROR_KIND_TRANSCRIBE_FAILED,
     EngineResult,
     LoadInfo,
     WorkerSpec,
@@ -594,8 +595,9 @@ class _Worker:
 
     Lifecycle: ``spawning`` (process started) -> ``loading`` (``hello``) ->
     ``ready`` (``loaded``) -> optionally ``retiring`` (after a CUDA OOM or a
-    commit-cap failure of a job) -> ``stopping`` (``shutdown`` sent or the
-    process killed) -> removed once its exit is confirmed and the handle is
+    commit-cap failure of a job, or when its Job Object reported the commit
+    cap while it was ready) -> ``stopping`` (``shutdown`` sent or the process
+    killed) -> removed once its exit is confirmed and the handle is
     closed. ``stop_reason`` marks a stop the supervisor asked for and
     ``kill_reason`` why it killed the process; both decide how the exit is
     classified (:func:`_exit_kind`). ``load_failure_recorded`` marks a worker
@@ -788,6 +790,41 @@ def _with_requested_payload(
     )
 
 
+def _cap_failure(
+    worker: _Worker, result: EngineResult, limit_bytes: int
+) -> EngineResult:
+    """Return a ``transcribe_failed`` *result* of a capped worker as ``memory_limit``.
+
+    The worker's Job Object reported its commit cap, so an unclassified
+    engine failure is taken for a memory failure: a child process such as
+    ffmpeg that could not commit memory reaches the engine as an ordinary
+    error. The engine's detail stays at the head, because clients classify
+    on it, and the cap is noted after it.
+
+    Args:
+        worker: Worker whose Job Object reported its commit cap.
+        result: ``transcribe_failed`` result of the job's current attempt.
+        limit_bytes: The worker's Job Object commit cap.
+
+    Returns:
+        *result* with ``error_kind`` ``memory_limit`` and the noted detail.
+
+    """
+    limit_gib = limit_bytes / _GIB
+    note = f"the worker's Job Object reached its memory limit of {limit_gib:.2f} GiB"
+    detail = f"{result.error_detail}; {note}" if result.error_detail else note
+    logger.warning(
+        "error of a capped worker taken as %s: job_id=%s worker_id=%s key=%s "
+        "error_kind=%s",
+        ERROR_KIND_MEMORY_LIMIT,
+        result.job_id,
+        worker.worker_id,
+        worker.key.label,
+        result.error_kind,
+    )
+    return replace(result, error_kind=ERROR_KIND_MEMORY_LIMIT, error_detail=detail)
+
+
 # * The supervisor.
 # *
 # * One loop iteration: wait up to ``tick_s`` for worker events and handle all
@@ -796,11 +833,15 @@ def _with_requested_payload(
 # * admit new job files and apply cancel markers and deadlines; enforce load,
 # * stop and cancel timeouts; build a SchedulerState and execute the plan in
 # * order (Reject, Stop, Assign, Spawn); save estimates when due; beat the
-# * heart. Job fate after a worker exit (``_settle_jobs``): a pending cancel
-# * wins; victims of a supervisor stop or of a kill caused by another job get
-# * their attempt back; a crash costs the attempt (retry while attempts last);
-# * a crash that hit the commit cap pins the re-queued jobs to the worker's
-# * backend (victims are never pinned).
+# * heart. A commit-cap report of a worker's Job Object grows its key's commit
+# * estimate and retires the worker when it is ready; a ``transcribe_failed``
+# * attempt of that worker (unless its cancel is pending) retries like a
+# * ``memory_limit`` error, while its successes and other error kinds keep
+# * their handling. Job fate after a worker exit (``_settle_jobs``): a
+# * pending cancel wins; victims of a supervisor stop or of a kill caused by
+# * another job get their attempt back; a crash costs the attempt (retry while
+# * attempts last); a crash that hit the commit cap pins the re-queued jobs to
+# * the worker's backend (victims are never pinned).
 
 
 class _Supervisor:
@@ -1024,14 +1065,7 @@ class _Supervisor:
             logger.debug("event of a released worker ignored: %s", event.worker_id)
             return
         if isinstance(event, _MemoryLimitEvent):
-            worker.memory_limit_reported = True
-            logger.warning(
-                "worker reached its commit cap: worker_id=%s key=%s pid=%d limit_bytes=%d",
-                worker.worker_id,
-                worker.key.label,
-                event.pid,
-                worker.reservation.commit_bytes,
-            )
+            self._on_memory_limit_event(worker, event.pid)
             return
         message = event.message
         if message is None:
@@ -1050,6 +1084,34 @@ class _Supervisor:
         elif kind == ipc.MSG_BYE:
             worker.bye = True
             logger.info("worker said bye: worker_id=%s", worker.worker_id)
+
+    def _on_memory_limit_event(self, worker: _Worker, pid: int) -> None:
+        """Handle the commit-cap report of a worker's Job Object.
+
+        The report names the process whose allocation failed: the worker or a
+        child such as ffmpeg, which shares the job's cap. Either way the
+        worker's reservation proved too small, so the key's commit estimate
+        grows x1.25 at once (at most once per worker) and the next worker
+        reserves more. A ready worker retires: it takes no new jobs and stops
+        once idle. A worker still loading keeps loading and serves once
+        loaded, so a key whose estimate cannot grow any further still makes
+        progress instead of respawning in a loop. Its ``transcribe_failed``
+        results are retried as ``memory_limit`` by :meth:`_on_result`.
+        """
+        worker.memory_limit_reported = True
+        logger.warning(
+            "worker reached its commit cap: worker_id=%s key=%s pid=%d limit_bytes=%d "
+            "commit_bytes=%d state=%s",
+            worker.worker_id,
+            worker.key.label,
+            pid,
+            self._job_limit_bytes(worker.reservation),
+            worker.reservation.commit_bytes,
+            worker.state,
+        )
+        if worker.state == "ready":
+            worker.state = "retiring"
+        self._bump_memory_once(worker, vram=False, reason="job object commit cap")
 
     def _on_hello(self, worker: _Worker, message: Mapping[str, object]) -> None:
         """Record the handshake; the cold load is in progress from here on."""
@@ -1171,6 +1233,18 @@ class _Supervisor:
             ERROR_KIND_MEMORY_LIMIT,
         }:
             self._on_resource_error(job, worker, result, now)
+        elif (
+            result.status == "error"
+            and result.error_kind == ERROR_KIND_TRANSCRIBE_FAILED
+            and job.cancel_reason is None
+            and self._cap_reported(worker)
+        ):
+            # * The failing allocation may have been in a child (ffmpeg) whose
+            # * failure reached the engine as an unclassified error; every other
+            # * error kind keeps its own classification.
+            limit = self._job_limit_bytes(worker.reservation)
+            failure = _cap_failure(worker, result, limit)
+            self._on_resource_error(job, worker, failure, now)
         else:
             result = _with_requested_payload(job.record, worker, result)
             succeeded = result.status in {"ok", "empty"}
@@ -2034,16 +2108,33 @@ class _Supervisor:
             self._last_gpu_change_ts = now
         logger.info(
             "worker spawned: worker_id=%s key=%s pid=%s capacity=%d commit_bytes=%d "
-            "vram_bytes=%d host_threads=%d reason_job_id=%s",
+            "job_limit_bytes=%d vram_bytes=%d host_threads=%d reason_job_id=%s",
             worker_id,
             key.label,
             proc.pid,
             action.capacity,
             action.reservation.commit_bytes,
+            self._job_limit_bytes(action.reservation),
             action.reservation.vram_bytes,
             action.reservation.host_threads,
             action.reason_job_id,
         )
+
+    def _job_limit_bytes(self, reservation: Reservation) -> int:
+        """Return the Job Object commit cap of a worker with *reservation*.
+
+        The cap is the commit reservation plus ``memory.child_headroom_gib``,
+        because child processes such as ffmpeg share the job's cap. The
+        headroom is not reserved: the scheduler and the commit budget count
+        only the reservation.
+
+        Returns:
+            The cap in bytes, or ``0`` (no cap) for a zero reservation.
+
+        """
+        if reservation.commit_bytes <= 0:
+            return 0
+        return reservation.commit_bytes + self._config.memory.child_headroom_bytes
 
     def _start_process(
         self, spec: WorkerSpec, reservation: Reservation
@@ -2056,7 +2147,7 @@ class _Supervisor:
 
         """
         key = spec.key
-        limit = reservation.commit_bytes
+        limit = self._job_limit_bytes(reservation)
         try:
             proc = WorkerProcess(
                 spec.worker_id,
@@ -2201,7 +2292,8 @@ class _Supervisor:
             self._record_crash(worker.key, now)
         # * The peak still raises the learned commit floor; the x1.25 growth of
         # * a cap hit applies only when this worker has not grown the commit
-        # * estimate already (a job's ``memory_limit`` error, a CUDA OOM).
+        # * estimate already (the cap report itself, a job's ``memory_limit``
+        # * error, a CUDA OOM).
         self._estimates.observe_worker_exit(
             worker.key,
             capacity=worker.capacity,
@@ -2227,11 +2319,21 @@ class _Supervisor:
             limit_hit,
         )
 
+    @staticmethod
+    def _cap_reported(worker: _Worker) -> bool:
+        """Return whether the worker's Job Object reported its commit cap.
+
+        The handle's flag is set on the monitor thread before the event is
+        queued, so it also covers a report whose event is still waiting behind
+        the worker's result.
+        """
+        return worker.memory_limit_reported or worker.proc.memory_limit_hit
+
     def _memory_limit_hit(self, worker: _Worker, peak: int | None) -> bool:
         """Return whether the worker reached its Job Object commit cap."""
-        if worker.memory_limit_reported or worker.proc.memory_limit_hit:
+        if self._cap_reported(worker):
             return True
-        limit = worker.reservation.commit_bytes
+        limit = self._job_limit_bytes(worker.reservation)
         return (
             peak is not None and limit > 0 and peak >= MEMORY_LIMIT_PEAK_RATIO * limit
         )
@@ -2327,7 +2429,7 @@ class _Supervisor:
                 f"{_clip(fatal.detail or '', FATAL_DETAIL_CHARS)}"
             )
         if limit_hit:
-            limit_gib = worker.reservation.commit_bytes / _GIB
+            limit_gib = self._job_limit_bytes(worker.reservation) / _GIB
             summary += f"; it reached its memory limit of {limit_gib:.2f} GiB"
         if worker.kill_reason == "broken":
             summary += "; its protocol pipe was broken"

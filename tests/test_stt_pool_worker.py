@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import gc
 import queue
+import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import psutil  # type: ignore[import-untyped]
 import pytest
@@ -17,7 +19,9 @@ from core.stt_pool.keys import make_key
 from core.stt_pool.procs import WorkerProcess, default_worker_launch
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Iterator, Sequence
+
+    from core.stt_pool.procs import WorkerLaunch
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group(name="pool_processes")]
 _ROOT = Path(__file__).resolve().parents[1]
@@ -28,13 +32,19 @@ _MEMORY_CAP = 128 * 1024**2
 class WorkerPeer:
     """Drive production worker.py through production process ownership and IPC."""
 
-    def __init__(self, tmp_path: Path, memory_cap: int = _MEMORY_CAP) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        memory_cap: int = _MEMORY_CAP,
+        *,
+        launch: WorkerLaunch | None = None,
+    ) -> None:
         self.events: queue.Queue[dict[str, object] | None] = queue.Queue()
         self.log_path = tmp_path / "worker.log"
         self.close_marker = tmp_path / "engine-closed"
         self.worker = WorkerProcess(
             "production-entry-test",
-            default_worker_launch(project_root=_ROOT),
+            default_worker_launch(project_root=_ROOT) if launch is None else launch,
             log_path=self.log_path,
             memory_limit_bytes=memory_cap,
             on_event=lambda _worker_id, message: self.events.put(message),
@@ -72,7 +82,7 @@ class WorkerPeer:
         """Take the next protocol record and fail on a missing or unexpected event."""
         message = self.events.get(timeout=_TIMEOUT_S)
         assert message is not None
-        assert message["type"] == kind
+        assert message["type"] == kind, (message, self.worker.log_tail(6000))
         return message
 
     def finish(self, code: int) -> None:
@@ -111,6 +121,47 @@ def _item(tmp_path: Path, seq: int = 1) -> WorkItem:
     """Create one Unicode input with an explicit, unique attempt identity."""
     job_id = f"{seq:032x}"
     return WorkItem(job_id, f"{job_id}:2", tmp_path / "русский.wav", "ru", 1.0, None)
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32", reason="Real Windows error-mode inheritance"
+)
+@pytest.mark.parametrize("probe", ["error_mode", "loader_failure"])
+def test_worker_from_zero_mode_protects_children_from_modal_loader_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, probe: str
+) -> None:
+    """Catch shell flags masking a worker defect or a modal loader hang."""
+    native_popen = subprocess.Popen
+
+    def popen(
+        argv: Sequence[str],
+        **kwargs: Any,  # noqa: ANN401 - external subprocess keyword options
+    ) -> subprocess.Popen[bytes]:
+        flags = kwargs.get("creationflags", 0)
+        assert isinstance(flags, int)
+        kwargs["creationflags"] = flags | subprocess.CREATE_DEFAULT_ERROR_MODE
+        return native_popen(argv, **kwargs)
+
+    monkeypatch.setattr(procs.subprocess, "Popen", popen)
+    launch = default_worker_launch(
+        project_root=_ROOT, module="tests.stt_pool_windows_support"
+    )
+    launch = replace(launch, argv=(*launch.argv, "--mode", "worker"))
+    peer = WorkerPeer(tmp_path, launch=launch)
+    try:
+        peer.worker.start(peer.specification(mode=probe))
+        peer.hello()
+        details = peer.next_message("loaded")["details"]
+        assert isinstance(details, dict)
+        assert details["initial_mode"] == 0
+        assert details["worker_mode"] & 0x8003 == 0x8003
+        assert details["child_mode"] & 0x8003 == 0x8003
+        if probe == "loader_failure":
+            assert details["loader_exit"] == 0xC000012D
+            assert details["loader_stdout"] == ""
+        peer.shutdown()
+    finally:
+        peer.worker.close(timeout_s=_TIMEOUT_S)
 
 
 @pytest.mark.parametrize("payload_char", ["x", "汉"])

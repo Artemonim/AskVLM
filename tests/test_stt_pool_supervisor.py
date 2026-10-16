@@ -16,6 +16,8 @@ import pytest
 
 from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import fsio, winjob
+from core.stt_pool.estimates import EstimateStore
+from core.stt_pool.keys import make_key
 from core.stt_pool.queue import (
     JobOptions,
     ResultRecord,
@@ -27,7 +29,9 @@ from core.stt_pool.queue import (
     write_result,
 )
 from core.stt_pool.supervisor import run_supervisor
+from core.stt_pool.sysprobe import hardware_fingerprint
 from tests.stt_pool_supervisor_support import GIB, SupervisorHarness, configuration
+from tests.stt_pool_windows_support import WinEvent
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -369,16 +373,14 @@ def test_invalid_provider_request_is_rejected_before_spawning(
     pool.finish()
 
 
-@pytest.mark.skipif(
-    sys.platform != "win32", reason="Real Windows Job Object cap and notification"
-)
-@pytest.mark.parametrize("mode", ["crash", "retry_crash", "handled"])
-def test_real_job_memory_limit_notification_classifies_worker_exit(
-    pool: SupervisorHarness, monkeypatch: pytest.MonkeyPatch, mode: str
-) -> None:
-    """Catch a capped worker crash being classified as an ordinary crash."""
+@pytest.fixture
+def tiny_job_caps(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    """Enforce small real job caps; record the supervisor's requested limits."""
+    if sys.platform != "win32":
+        pytest.skip("requires real Windows Job Object caps and notifications")
     kernel = winjob._kernel32()  # noqa: SLF001 - substitute only the external Win32 API boundary
     cap_bytes = 96 * 1024**2
+    limits: list[int] = []
 
     class CappedKernel:
         """Delegate Win32 calls while making only this test's worker cap small."""
@@ -396,10 +398,19 @@ def test_real_job_memory_limit_notification_classifies_worker_exit(
                     pointer,
                     ctypes.POINTER(winjob._JobExtendedLimitInformation),  # noqa: SLF001 - real external ABI structure
                 ).contents
+                limits.append(int(info.JobMemoryLimit))
                 info.JobMemoryLimit = cap_bytes
             return kernel.SetInformationJobObject(handle, info_class, pointer, size)
 
     monkeypatch.setattr(winjob, "_kernel32", CappedKernel)
+    return limits
+
+
+@pytest.mark.parametrize("mode", ["crash", "retry_crash", "handled"])
+def test_real_job_memory_limit_notification_classifies_worker_exit(
+    pool: SupervisorHarness, tiny_job_caps: list[int], mode: str
+) -> None:
+    """Catch a capped worker crash being classified as an ordinary crash."""
     retry = mode == "retry_crash"
     pool.config = configuration(
         gpu={"max_workers": 1}, scheduling={"max_attempts": 2 if retry else 1}
@@ -440,6 +451,139 @@ def test_real_job_memory_limit_notification_classifies_worker_exit(
         for event in pool.events("constructed")
         if event["worker_id"] == started["worker_id"]
     )
+
+
+@pytest.mark.parametrize(
+    ("mode", "attempt_budget", "status", "kind", "attempts"),
+    [
+        ("error", 2, "ok", None, 2),
+        ("error", 1, "error", "memory_limit", 1),
+        ("ok", 2, "ok", None, 1),
+        ("empty", 2, "empty", None, 1),
+        ("device_unavailable", 2, "error", "device_unavailable", 1),
+        ("protocol_error", 2, "error", "protocol_error", 1),
+        ("result_too_large", 2, "error", "result_too_large", 1),
+        ("cancel", 2, "cancelled", "cancelled", 1),
+        ("cancel_error", 2, "error", "transcribe_failed", 1),
+    ],
+)
+@pytest.mark.parametrize("backend", ["cpu", "gpu"])
+def test_cap_report_retires_before_result_and_preserves_attempt_outcomes(
+    pool: SupervisorHarness,
+    tiny_job_caps: list[int],
+    backend: str,
+    mode: str,
+    attempt_budget: int,
+    status: str,
+    kind: str | None,
+    attempts: int,
+) -> None:
+    """Catch lost retries, capped-worker reuse, or resurrected cancellations."""
+    pool.config = configuration(
+        cpu={"max_slots": 2},
+        gpu={"max_workers": 2},
+        scheduling={"max_attempts": attempt_budget},
+    )
+    pool.hardware.gpu_available = True
+    device = "cpu" if backend == "cpu" else "cuda"
+    with WinEvent() as capped, WinEvent() as release, WinEvent() as cancelled:
+        job = pool.job(
+            device=device,
+            mode="cap_report",
+            after_cap="error" if mode in {"cancel", "cancel_error"} else mode,
+            cap_signal=capped.name,
+            result_gate=release.name,
+            cancel_signal=cancelled.name,
+            ignore_cancel=mode == "cancel_error",
+            error_text="decode input=incident.wav exit=3221225773",
+            fail_attempts=1,
+        )
+        pool.start()
+        first = pool.submitted(job)
+        capped.wait()
+        pool.heartbeat(
+            lambda value: any(
+                worker["worker_id"] == first["worker_id"]
+                and worker["state"] == "retiring"
+                for worker in value["workers"]
+            )
+        )
+        canary = pool.job(device=device, call=2)
+        healthy = pool.result(canary)
+        assert healthy.status == "ok"
+        assert healthy.worker_id != first["worker_id"]
+        if mode in {"cancel", "cancel_error"}:
+            request_cancel(pool.paths, job.job_id)
+            cancelled.wait()
+        release.set()
+        result = pool.result(job)
+        assert result.status == status
+        assert result.error_kind == kind
+        assert result.attempts == attempts
+        assert result.backend == backend
+        starts = pool.events("submitted", job)
+        assert len(starts) == attempts
+        if attempts == 2:
+            assert result.worker_id != first["worker_id"]
+            assert starts[1]["backend"] == backend
+        if mode == "error" and attempt_budget == 1:
+            assert "incident.wav" in (result.error_detail or "")
+            assert "3221225773" in (result.error_detail or "")
+        assert not pool.paths.incoming_file(job.job_id).exists()
+        pool.finish()
+    learned = fsio.read_json(pool.paths.estimates_file)
+    assert learned is not None
+    entry = next(iter(learned["keys"].values()))
+    assert entry["commit_factor"] == 1.25
+    assert entry["vram_factor"] == 1.0
+
+
+@pytest.mark.parametrize("at_ceiling", [False, True])
+def test_load_time_cap_report_still_serves_without_a_respawn_loop(
+    pool: SupervisorHarness, tiny_job_caps: list[int], *, at_ceiling: bool
+) -> None:
+    """Catch a load-end cap report causing a respawn loop at the ceiling."""
+    key = make_key("whisper", "small", "auto", "cpu")
+    before = pool.clock.peek()
+    if at_ceiling:
+        store = EstimateStore(
+            pool.paths.estimates_file,
+            fingerprint=hardware_fingerprint(None),
+            clock=pool.clock,
+        )
+        store.bump_memory(key, factor=4.0)
+        assert store.save_if_due(force=True)
+    with WinEvent() as capped, WinEvent() as release:
+        pool.plan(
+            load_modes={"small": "cap_report"},
+            cap_signal=capped.name,
+            result_gate=release.name,
+        )
+        job = pool.job()
+        pool.start()
+        capped.wait()
+        pool.until(
+            lambda: fsio.read_json(pool.paths.estimates_file),
+            lambda saved: saved is not None
+            and saved["keys"].get(key.label, {}).get("updated_at", 0) > before,
+        )
+        pool.heartbeat(
+            lambda value: len(value["workers"]) == 1
+            and value["workers"][0]["state"] == "loading"
+        )
+        release.set()
+        result = pool.result(job)
+        assert result.status == "ok"
+        assert result.attempts == 1
+        following = pool.job(call=2)
+        second = pool.result(following)
+        assert second.status == "ok"
+        assert second.worker_id == result.worker_id
+        assert len(pool.events("constructed")) == 1
+        pool.finish()
+    learned = fsio.read_json(pool.paths.estimates_file)
+    assert learned is not None
+    assert learned["keys"][key.label]["commit_factor"] == (4.0 if at_ceiling else 1.25)
 
 
 def test_evicts_idle_other_configuration_before_ttl(pool: SupervisorHarness) -> None:
@@ -1087,6 +1231,35 @@ def job_caps(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
 
 @pytest.mark.parametrize(
+    ("headroom_gib", "extra_bytes"), [(None, GIB), (0, 0), (0.5, GIB // 2)]
+)
+def test_child_headroom_changes_only_the_job_cap_and_not_admission(
+    pool: SupervisorHarness,
+    job_caps: list[int],
+    headroom_gib: float | None,
+    extra_bytes: int,
+) -> None:
+    """Catch missing child allowance or counting it in the admission budget."""
+    pool.config = configuration(memory={"child_headroom_gib": 0})
+    baseline = pool.job()
+    pool.start()
+    assert pool.result(baseline).status == "ok"
+    pool.finish()
+    assert len(job_caps) == 1
+    reservation = job_caps[0]
+    memory: dict[str, object] = {"commit_budget_gib": reservation / GIB}
+    if headroom_gib is not None:
+        memory["child_headroom_gib"] = headroom_gib
+    pool.config = configuration(memory=memory)
+    assert pool.config.memory.child_headroom_bytes == extra_bytes
+    following = pool.job(call=2)
+    pool.start()
+    assert pool.result(following).status == "ok"
+    pool.finish()
+    assert job_caps == [reservation, reservation + extra_bytes]
+
+
+@pytest.mark.parametrize(
     ("backend", "error"), [("cpu", "memory_limit"), ("gpu", "cuda_oom")]
 )
 def test_retry_reserves_grown_memory_before_retiring_worker_exits(
@@ -1113,7 +1286,10 @@ def test_retry_reserves_grown_memory_before_retiring_worker_exits(
     assert result.attempts == 2
     assert first["worker_id"] != second["worker_id"]
     assert len(job_caps) == 2
-    assert job_caps[1] == pytest.approx(job_caps[0] * 1.25, abs=2)
+    headroom = pool.config.memory.child_headroom_bytes
+    assert job_caps[1] - headroom == pytest.approx(
+        (job_caps[0] - headroom) * 1.25, abs=2
+    )
     first_pid = next(
         event["pid"]
         for event in pool.events("constructed")

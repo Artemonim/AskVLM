@@ -27,7 +27,8 @@
   "memory": {
     "commit_budget_gib": 24,
     "free_commit_guard_gib": 8,
-    "critical_free_commit_gib": 4
+    "critical_free_commit_gib": 4,
+    "child_headroom_gib": 1
   },
   "vram": {
     "budget_gib": 7,

@@ -5,8 +5,9 @@ stderr appended to the worker's log, assigns it to its Job Object, and only
 then sends the ``spec`` line. The process:
 
 1. moves the protocol off file descriptor 1 (:meth:`WorkerChannel.install`)
-   before anything else can write, ignores console interrupts and logs to
-   stderr;
+   before anything else can write, ignores console interrupts, logs to
+   stderr and turns off the modal Windows error dialogs for itself and its
+   future children (:func:`~core.stt_pool.winjob.suppress_error_dialogs`);
 2. reads the ``spec`` (a missing or malformed one is answered with ``fatal``
    stage ``spec``) and answers ``hello``;
 3. builds the engine through the factory the spec names, loads it and starts
@@ -38,7 +39,7 @@ import time
 from typing import IO, TYPE_CHECKING, Literal, NoReturn, TypeGuard
 
 from core.stt_errors import DeviceUnavailableError
-from core.stt_pool import ipc
+from core.stt_pool import ipc, winjob
 from core.stt_pool.engine_api import (
     ERROR_KIND_RESULT_TOO_LARGE,
     ERROR_KIND_TRANSCRIBE_FAILED,
@@ -646,8 +647,15 @@ def main() -> NoReturn:
         _terminate(ipc.EXIT_FATAL)
     _ignore_console_interrupts()
     handler = _configure_logging()
+    # * Before any engine or ffmpeg child exists: a child that cannot commit
+    # * memory under the Job Object cap must exit with its status, not block on
+    # * a modal "Application Error" box that nobody sees.
+    error_mode = winjob.suppress_error_dialogs()
     logger.info(
-        "worker process started: pid=%d python=%s", os.getpid(), sys.version.split()[0]
+        "worker process started: pid=%d python=%s error_mode=%s",
+        os.getpid(),
+        sys.version.split()[0],
+        "-" if error_mode is None else f"0x{error_mode:04X}",
     )
     worker = _Worker(channel, handler)
     try:
