@@ -19,6 +19,13 @@ Strict policy (``strict=True``, used by the STT worker pool):
 * ``cuda`` without a usable CUDA runtime raises
   :class:`~core.stt_errors.DeviceUnavailableError` instead of degrading to CPU;
 * no free-VRAM threshold is applied.
+
+The module also holds the torch-free helpers of the pool's CUDA memory
+hygiene: the cuFFT plan cache bound (:func:`limit_cufft_plan_cache`), the
+release of cached CUDA blocks (:func:`release_cuda_cache`) and the per-job
+memory telemetry (:func:`cuda_memory_stats`), none of which initializes CUDA,
+and the caching-allocator cap of a GPU worker (:func:`limit_cuda_allocator`),
+which does, because it runs before the model loads on CUDA.
 """
 
 from __future__ import annotations
@@ -26,9 +33,12 @@ from __future__ import annotations
 import contextlib
 import gc
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from core.stt_errors import DeviceUnavailableError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +237,145 @@ def release_cuda_cache(torch_mod: object) -> None:
         return
     with contextlib.suppress(Exception):
         cuda.empty_cache()
+
+
+def limit_cufft_plan_cache(torch_mod: object, max_size: int) -> int | None:
+    """Bound the cuFFT plan cache of the current CUDA device (best effort).
+
+    ``torch.stft`` keeps one cuFFT plan per distinct input shape in a per-device
+    LRU cache (4096 plans by default), so variable-length audio grows it with
+    every new length. A smaller bound evicts the least recently used plans.
+
+    Args:
+        torch_mod: Loaded ``torch`` module whose CUDA context is initialized.
+        max_size: Most cached plans; must be positive (``0`` would disable the
+            cache, which callers express by not calling this function).
+
+    Returns:
+        The bound now in effect, or ``None`` when it could not be applied (the
+        failure is logged; the library default stays in effect).
+
+    Raises:
+        ValueError: When *max_size* is not a positive integer.
+
+    """
+    if isinstance(max_size, bool) or not isinstance(max_size, int) or max_size < 1:
+        msg = f"max_size must be a positive integer (got {max_size!r})"
+        raise ValueError(msg)
+    try:
+        module: Any = torch_mod
+        index = module.cuda.current_device()
+        cache = module.backends.cuda.cufft_plan_cache[index]
+        cache.max_size = max_size
+        return int(cache.max_size)
+    except Exception:  # noqa: BLE001 - an unbounded cache must not fail the model load
+        logger.warning("cannot bound the cuFFT plan cache", exc_info=True)
+        return None
+
+
+def limit_cuda_allocator(torch_mod: object, cap_bytes: int) -> int | None:
+    """Cap the CUDA caching allocator of this process on the current device.
+
+    ``torch.cuda.set_per_process_memory_fraction`` limits what the caching
+    allocator may hold (cached blocks included) to ``fraction * total device
+    memory``; an allocation beyond it first frees cached blocks and then
+    fails with ``torch.OutOfMemoryError``. The CUDA context and loaded
+    kernels are outside the allocator and outside the cap. Called before the
+    model's first CUDA allocation, so the weights count against the cap too.
+    Best effort: a failure is logged and leaves the allocator uncapped.
+
+    Args:
+        torch_mod: Loaded ``torch`` module; the call initializes its CUDA
+            context.
+        cap_bytes: Most bytes the allocator may hold (a positive integer);
+            a cap at or above the device memory leaves the fraction at 1.
+
+    Returns:
+        The cap now in effect in bytes (the fraction times the device
+        memory), or ``None`` when CUDA is unavailable or the cap could not be
+        set.
+
+    Raises:
+        ValueError: When *cap_bytes* is not a positive integer.
+
+    """
+    if isinstance(cap_bytes, bool) or not isinstance(cap_bytes, int) or cap_bytes < 1:
+        msg = f"cap_bytes must be a positive integer (got {cap_bytes!r})"
+        raise ValueError(msg)
+    if not _cuda_is_available(torch_mod):
+        return None
+    try:
+        cuda: Any = getattr(torch_mod, "cuda", None)
+        index = int(cuda.current_device())
+        total = int(cuda.get_device_properties(index).total_memory)
+        fraction = min(1.0, cap_bytes / total)
+        cuda.set_per_process_memory_fraction(fraction, index)
+    except Exception:  # noqa: BLE001 - an uncapped allocator must not fail the model load
+        logger.warning("cannot cap the CUDA caching allocator", exc_info=True)
+        return None
+    return int(fraction * total)
+
+
+# * Keys of :func:`cuda_memory_stats`, in log order.
+CUDA_MEMORY_STAT_KEYS: tuple[str, ...] = (
+    "cuda_reserved_bytes",
+    "cuda_allocated_bytes",
+    "cuda_max_reserved_bytes",
+    "cufft_plan_cache_size",
+)
+
+
+def cuda_memory_stats(torch_mod: object) -> dict[str, int | None]:
+    """Return the CUDA caching-allocator and cuFFT plan cache figures of this process.
+
+    Nothing is read (every value is ``None``) when *torch_mod* is ``None`` or
+    its CUDA context is not initialized, so a CPU process never creates a
+    CUDA context for telemetry. Each figure is read independently; one that
+    fails stays ``None``.
+
+    Args:
+        torch_mod: The already imported ``torch`` module (for example
+            ``sys.modules.get("torch")``), or ``None``.
+
+    Returns:
+        A mapping with every key of :data:`CUDA_MEMORY_STAT_KEYS`:
+        ``torch.cuda.memory_reserved()``, ``memory_allocated()`` and
+        ``max_memory_reserved()`` of the current device in bytes, and the
+        number of cached cuFFT plans of that device.
+
+    """
+    stats: dict[str, int | None] = dict.fromkeys(CUDA_MEMORY_STAT_KEYS)
+    cuda: Any = getattr(torch_mod, "cuda", None)
+    if cuda is None:
+        return stats
+    try:
+        if not cuda.is_initialized():
+            return stats
+        index = int(cuda.current_device())
+    except Exception:  # noqa: BLE001 - telemetry never fails its caller
+        logger.debug("CUDA state query failed", exc_info=True)
+        return stats
+    readers: dict[str, Callable[[], object]] = {
+        "cuda_reserved_bytes": lambda: cuda.memory_reserved(index),
+        "cuda_allocated_bytes": lambda: cuda.memory_allocated(index),
+        "cuda_max_reserved_bytes": lambda: cuda.max_memory_reserved(index),
+        "cufft_plan_cache_size": lambda: _cufft_plan_cache_size(torch_mod, index),
+    }
+    for key, read in readers.items():
+        try:
+            value = read()
+        except Exception:  # noqa: BLE001 - telemetry never fails its caller
+            logger.debug("CUDA memory figure %s unavailable", key, exc_info=True)
+            continue
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            stats[key] = value
+    return stats
+
+
+def _cufft_plan_cache_size(torch_mod: object, index: int) -> object:
+    """Return the number of cached cuFFT plans of CUDA device *index*."""
+    module: Any = torch_mod
+    return module.backends.cuda.cufft_plan_cache[index].size
 
 
 def module_device_types(model: object) -> set[str] | None:

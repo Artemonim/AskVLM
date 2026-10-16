@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
+import types
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,10 +20,65 @@ from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
 from core.stt_pool import ipc
 from core.stt_pool.engine_api import EngineResult, LoadInfo
 from core.stt_pool.sysprobe import child_interpreter
-from tests.stt_pool_windows_support import signal, wait_for_signal
+from tests.stt_pool_windows_support import allocation_child, signal, wait_for_signal
 
 if TYPE_CHECKING:
     from core.stt_pool.engine_api import EmitFn, PoolEngine, WorkerSpec, WorkItem
+
+
+def install_memory_probe(mode: object, marker: object) -> None:
+    """Install a tiny torch boundary that records forbidden CUDA initialization."""
+    if mode is None:
+        return
+    if mode == "unimported":
+        guard = importlib.import_module("tests.stt_pool_fake_worker").MLImportGuard
+        sys.meta_path.insert(0, guard())
+        return
+
+    def cuda_access(*_args: object) -> int:
+        if mode != "initialized":
+            Path(str(marker)).write_text("CUDA accessed", encoding="utf-8")
+            msg = "telemetry touches an uninitialized CUDA runtime"
+            raise AssertionError(msg)
+        return 1
+
+    def figure(device: int, value: int) -> int:
+        if device != cuda_access():
+            msg = "telemetry reads a different CUDA device"
+            raise AssertionError(msg)
+        return value
+
+    module = types.ModuleType("torch")
+    module.cuda = types.SimpleNamespace(
+        is_initialized=lambda: mode == "initialized",
+        init=cuda_access,
+        _lazy_init=cuda_access,
+        is_available=cuda_access,
+        current_device=cuda_access,
+        memory_reserved=lambda device: figure(device, 8192),
+        memory_allocated=lambda device: figure(device, 1024),
+        max_memory_reserved=lambda device: figure(device, 16384),
+    )
+    module.backends = types.SimpleNamespace(
+        cuda=types.SimpleNamespace(cufft_plan_cache={1: types.SimpleNamespace(size=7)})
+    )
+    sys.modules["torch"] = module
+
+
+class _MemoryPacket:
+    """Emit deliberately malformed telemetry at the trusted worker protocol boundary."""
+
+    def __init__(self, result: EngineResult, memory: object) -> None:
+        self._result = result
+        self._memory = memory
+        self.job_id = result.job_id
+        self.attempt_id = result.attempt_id
+
+    def to_message(self) -> dict[str, object]:
+        """Keep the outcome valid while corrupting only its optional memory field."""
+        message = self._result.to_message()
+        message["memory"] = self._memory
+        return message
 
 
 class ScenarioEngine:
@@ -36,6 +93,7 @@ class ScenarioEngine:
     def load(self) -> LoadInfo:
         """Report the configured device or a typed load failure."""
         options = self._spec.options
+        install_memory_probe(options.get("memory_probe"), options.get("cuda_marker"))
         error = options.get("load_error")
         if error == "cuda_oom":
             msg = "CUDA out of memory while loading fake weights"
@@ -169,6 +227,9 @@ class SupervisorEngine:
             key=spec.key.to_dict(),
             threads_per_slot=spec.threads_per_slot,
             options=dict(spec.options),
+            cudnn_v8_lru_cache_limit=os.environ.get(
+                "TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT"
+            ),
             thread_env={
                 name: os.environ.get(name)
                 for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS")
@@ -189,6 +250,7 @@ class SupervisorEngine:
     def load(self) -> LoadInfo:
         """Expose load failure, timeout or malformed metadata."""
         plan = json.loads((self._root / "plan.json").read_text(encoding="utf-8"))
+        install_memory_probe(plan.get("memory_probe"), plan.get("cuda_marker"))
         self._close_gate = bool(plan.get("close_gate"))
         mode = plan.get("load_modes", {}).get(self._spec.key.model)
         self._record("loading", mode=mode)
@@ -292,17 +354,35 @@ class SupervisorEngine:
                 status=result.status,
                 error_detail=result.error_detail,
             )
-            emit(result)
+            if "wire_memory" in instructions:
+                emit(_MemoryPacket(result, instructions["wire_memory"]))  # type: ignore[arg-type]
+            else:
+                emit(result)
             if mode == "duplicate":
                 emit(result)
 
-    @staticmethod
-    def _attempt_mode(item: WorkItem, instructions: dict[str, object]) -> object:
+    def _attempt_mode(self, item: WorkItem, instructions: dict[str, object]) -> object:
         """Fail only the configured attempts and gate real cap reports by events."""
         attempt = int(item.attempt_id.rsplit(":", 1)[1])
         if attempt > int(instructions.get("fail_attempts", 1000000)):
             return "ok"
         mode = instructions.get("mode", "ok")
+        if mode == "child_cap_report":
+            wait_for_signal(instructions.get("before_cap_gate"))
+            with allocation_child() as child:
+                self._record(
+                    "child",
+                    pid=child.process.pid,
+                    created_at=psutil.Process(child.process.pid).create_time(),
+                )
+                denied = child.allocate(256 * 1024**2)
+                self._record("child_allocation", **denied)
+                if not denied["denied"]:
+                    msg = "test Job Object did not reject the child's allocation"
+                    raise AssertionError(msg)
+                signal(instructions.get("cap_signal"))
+                wait_for_signal(instructions.get("result_gate"))
+            return instructions.get("after_cap", "error")
         if mode == "cap_report":
             SupervisorEngine._cap_gate(instructions)
             return instructions.get("after_cap", "error")
@@ -384,6 +464,8 @@ class SupervisorEngine:
                 )
             if mode == "blank_ok":
                 result = replace(result, status="ok", text=" \n\t ")
+        if "memory" in instructions:
+            result = replace(result, memory=instructions["memory"])  # type: ignore[arg-type]
         return result
 
     def _error_result(

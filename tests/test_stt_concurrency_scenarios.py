@@ -11,11 +11,15 @@ death of the parent, and failures recorded rather than reported as success.
 
 from __future__ import annotations
 
+import contextlib
+import csv
 import json
 import os
+import re
 import subprocess
 import sys
 import time
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import psutil
@@ -27,9 +31,11 @@ from tests.stt_concurrency_support import (
     FAKE_WORKER,
     PARENT_DRIVER,
     PROJECT_ROOT,
+    GrowthBench,
     JobApiFault,
     make_clips,
 )
+from tests.stt_pool_windows_support import _hidden_desktop
 
 # isort: split
 
@@ -46,8 +52,7 @@ from stt_concurrency.sysmetrics import CommitInfo
 from stt_concurrency.workload import AudioItem
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
-    from pathlib import Path
+    from collections.abc import Iterator, Sequence
 
 # * The scenarios spawn processes and measure time: keep them on one xdist worker.
 pytestmark = [
@@ -178,18 +183,52 @@ class Bench:
         """Return the pids recorded by the fake workers under *prefix*."""
         return [int(p.read_text()) for p in sorted(self.fake.glob(f"{prefix}-*.pid"))]
 
+    def processes(self, prefix: str) -> list[psutil.Process]:
+        """Return the running processes the fake workers recorded under *prefix*.
+
+        A pid file outlives its process, and by then the pid may belong to a
+        stranger. A process counts as the sandbox's only while its creation time
+        equals the one the worker recorded about itself; a missing or unreadable
+        record proves nothing and excludes the process.
+        """
+        confirmed: list[psutil.Process] = []
+        for marker in sorted(self.fake.glob(f"{prefix}-*.pid")):
+            try:
+                recorded = float(marker.with_suffix(".created").read_text())
+                process = psutil.Process(int(marker.read_text()))
+                if process.create_time() == recorded:
+                    confirmed.append(process)
+            except (OSError, ValueError, psutil.Error):
+                continue
+        return confirmed
+
+    def reap(self) -> None:
+        """Kill the sandbox processes that are still running, and nothing else.
+
+        The kill re-checks the identity: a pid taken over after the confirmation
+        raises ``NoSuchProcess`` instead of terminating the newcomer.
+        """
+        for process in [*self.processes("worker"), *self.processes("grandchild")]:
+            with contextlib.suppress(psutil.Error):
+                process.kill()
+
+
+@contextlib.contextmanager
+def sandboxed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Bench]:
+    """Provide a sandbox and kill any worker it left behind."""
+    sandbox = Bench(tmp_path, monkeypatch)
+    try:
+        yield sandbox
+    finally:
+        # * Safety net: never leave a sandbox process behind, even if a test failed.
+        sandbox.reap()
+
 
 @pytest.fixture
 def bench(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Bench]:
     """Provide a sandbox and kill any worker it left behind."""
-    sandbox = Bench(tmp_path, monkeypatch)
-    yield sandbox
-    # * Safety net: never leave a sandbox process behind, even if a test failed.
-    for pid in [*sandbox.pids("worker"), *sandbox.pids("grandchild")]:
-        try:
-            psutil.Process(pid).kill()
-        except psutil.Error:
-            continue
+    with sandboxed(tmp_path, monkeypatch) as sandbox:
+        yield sandbox
 
 
 def _gone(processes: list[psutil.Process], timeout_s: float) -> list[psutil.Process]:
@@ -200,6 +239,435 @@ def _gone(processes: list[psutil.Process], timeout_s: float) -> list[psutil.Proc
         time.sleep(0.2)
         alive = [p for p in alive if p.is_running()]
     return alive
+
+
+@pytest.fixture
+def growth_bench(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[GrowthBench]:
+    """Keep growth runs in a temporary root with every native child contained."""
+    desktop = _hidden_desktop() if sys.platform == "win32" else contextlib.nullcontext()
+    with desktop as name:
+        sandbox = GrowthBench(tmp_path, monkeypatch, desktop=name)
+        try:
+            yield sandbox
+        finally:
+            sandbox.close()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ("--jobs", "0"),
+        ("--durations", "unknown"),
+        ("--duration-min-s", "3", "--duration-max-s", "1", "--durations", "varied"),
+        ("--gpu-memory-bounds", "unknown"),
+        ("--idle-gap-s", "-1"),
+        ("--pool-set", "gpu.cache_typo=1"),
+        ("--pool-set", "gpu.vram_cap=1"),
+        ("--pool-set", "gpu.cufft_plan_cache_max_size=-1"),
+        ("--pool-set", "gpu.batch_lanes.gigaam=0"),
+        # * Non-finite floats must fail before resource probes or run creation,
+        # * including duration options inactive in the selected fixed mode.
+        *[
+            (f"{option}={value}",)
+            for option in (
+                "--duration-min-s",
+                "--duration-max-s",
+                "--fixed-duration-s",
+                "--reservation-commit-gib",
+                "--reservation-vram-gib",
+                "--min-free-commit-gib",
+                "--min-free-vram-gib",
+                "--commit-reserve-gib",
+                "--plateau-tolerance-mib",
+                "--idle-gap-s",
+                "--job-timeout-s",
+                "--load-timeout-s",
+            )
+            for value in ("nan", "inf", "-inf")
+        ],
+        ("--reservation-commit-gib", "1e308"),
+        ("--reservation-vram-gib", "1e308"),
+        ("--idle-gap-s", "1e12"),
+        ("--job-timeout-s", "1e12"),
+        ("--load-timeout-s", "1e12"),
+    ],
+)
+def test_growth_cli_rejects_invalid_workloads_and_pool_overrides_before_side_effects(
+    growth_bench: GrowthBench, options: tuple[str, ...]
+) -> None:
+    """Catch invalid plans, NaN/Inf or huge floats creating a run or crashing."""
+    growth_bench.tools.probe_allowed = growth_bench.worker_allowed = False
+
+    result = growth_bench.invoke(*options)
+
+    assert result.exit_code == 2, (result.output, result.exception)
+    assert not growth_bench.out.exists()
+    assert growth_bench.tools.calls == []
+
+
+@pytest.mark.parametrize("reason", ["commit", "vram", "missing_vram", "job_cap"])
+def test_growth_preflight_records_refusal_before_audio_probe_or_worker_launch(
+    growth_bench: GrowthBench, reason: str
+) -> None:
+    """Catch preflight running torch or allowing the Job cap to spend the reserve."""
+    growth_bench.tools.probe_allowed = growth_bench.worker_allowed = False
+    options: tuple[str, ...] = ()
+    if reason == "commit":
+        growth_bench.free_commit = 19 * 1024**3
+    elif reason == "vram":
+        growth_bench.tools.gpu_csv = "7168, 8192, 0\n"
+    elif reason == "missing_vram":
+        growth_bench.tools.gpu_csv = ""
+    else:
+        growth_bench.free_commit = 24 * 1024**3
+        options = ("--reservation-commit-gib", "12")
+
+    result = growth_bench.invoke(*options)
+
+    assert result.exit_code == 3, (result.output, result.exception)
+    plan = growth_bench.document("run.json")
+    assert plan["stack"] is None
+    assert plan["guard"]["refusals"]
+    assert plan["guard"]["free_commit_bytes"] == growth_bench.free_commit
+    if reason == "job_cap":
+        assert plan["guard"]["job_limit_bytes"] == 13 * 1024**3
+    assert {path.name for path in growth_bench.run_dir().iterdir()} == {"run.json"}
+    assert all(args[0] == "nvidia-smi" for args in growth_bench.tools.calls)
+
+
+@pytest.mark.parametrize("summary_blocked", [False, True])
+def test_growth_input_failure_keeps_diagnostics_and_its_exit_code_when_report_fails(
+    growth_bench: GrowthBench, monkeypatch: pytest.MonkeyPatch, *, summary_blocked: bool
+) -> None:
+    """Catch lost inputs_failed diagnostics, leaked inputs or a masked input error."""
+    growth_bench.worker_allowed = False
+    growth_bench.tools.fail_cut = True
+    if summary_blocked:
+
+        def block_report(
+            argv: Sequence[str],
+            **kwargs: Any,  # noqa: ANN401 - external command boundary
+        ) -> subprocess.CompletedProcess[Any]:
+            if argv[0] == "ffmpeg" and "-t" in argv:
+                (growth_bench.run_dir() / "summary.json").mkdir(exist_ok=True)
+            return native_run(argv, **kwargs)
+
+        native_run = subprocess.run
+        monkeypatch.setattr(subprocess, "run", block_report)
+
+    result = growth_bench.invoke()
+
+    assert result.exit_code == 2, (result.output, result.exception)
+    assert growth_bench.document("run.json")["stack"]["torch"] == "fake-probe"
+    assert growth_bench.records() == []
+    if not summary_blocked:
+        summary = growth_bench.document("summary.json")
+        assert summary["status"] == "inputs_failed"
+        assert summary["stats"]["throughput"]["jobs"] == 0
+    assert not (growth_bench.run_dir() / "tmp").exists()
+    assert not (growth_bench.run_dir() / "inputs").exists()
+
+
+def test_growth_spawn_guard_rechecks_commit_after_input_preparation_and_cleans_up(
+    growth_bench: GrowthBench,
+) -> None:
+    """Catch a stale preflight allowing a worker after input generation spent commit."""
+    growth_bench.worker_allowed = False
+
+    def spend_commit(_path: Path) -> None:
+        growth_bench.free_commit = 12 * 1024**3
+
+    growth_bench.tools.after_cut = spend_commit
+
+    result = growth_bench.invoke()
+
+    assert result.exit_code == 3, (result.output, result.exception)
+    plan = growth_bench.document("run.json")
+    assert not plan["guard"]["refusals"]
+    assert plan["spawn_guard"]["refusals"]
+    assert plan["spawn_guard"]["free_commit_bytes"] == 12 * 1024**3
+    summary = growth_bench.document("summary.json")
+    assert summary["status"] == "guard_refused"
+    assert summary["stats"]["throughput"]["jobs"] == 0
+    assert growth_bench.records() == []
+    assert not (growth_bench.run_dir() / "tmp").exists()
+    assert not (growth_bench.run_dir() / "inputs").exists()
+
+
+def test_growth_commit_stop_persists_partial_results_and_reaps_the_worker(
+    growth_bench: GrowthBench,
+) -> None:
+    """Catch continuing below the reserve or losing completed jobs on an early stop."""
+
+    def commit() -> int:
+        files = list(growth_bench.out.glob("*/results.jsonl"))
+        done = len(files[0].read_text("utf-8").splitlines()) if files else 0
+        return (11 if done >= 2 else 64) * 1024**3
+
+    growth_bench.commit_reading = commit
+
+    result = growth_bench.invoke()
+
+    assert result.exit_code == 1, (result.output, result.exception)
+    assert [record["index"] for record in growth_bench.records()] == [1, 2]
+    summary = growth_bench.document("summary.json")
+    assert summary["status"] == "system_commit_low"
+    assert summary["stats"]["throughput"]["ok"] == 2
+    assert len(growth_bench.workers) == 1
+    assert growth_bench.workers[0].poll() == 0
+    assert not (growth_bench.run_dir() / "inputs").exists()
+
+
+def test_growth_completed_jobs_with_an_unwritable_summary_exit_four_and_clean_up(
+    growth_bench: GrowthBench,
+) -> None:
+    """Catch successful exit codes and leaked audio when final artifact writes fail."""
+
+    def block_summary(path: Path) -> None:
+        (path.parent.parent / "summary.json").mkdir(exist_ok=True)
+
+    growth_bench.tools.after_cut = block_summary
+
+    result = growth_bench.invoke()
+
+    assert result.exit_code == 4, (result.output, result.exception)
+    assert [record["index"] for record in growth_bench.records()] == [1, 2, 3, 4]
+    assert growth_bench.workers[0].poll() == 0
+    assert growth_bench.document("run.json")["spawn_guard"]["refusals"] == []
+    assert not (growth_bench.run_dir() / "tmp").exists()
+    assert not (growth_bench.run_dir() / "inputs").exists()
+    assert not list(growth_bench.run_dir().glob(".*.tmp"))
+
+
+@pytest.mark.parametrize("bounds", ["pool", "library"])
+def test_growth_cli_completes_real_worker_jobs_and_applies_the_requested_bounds(
+    growth_bench: GrowthBench, monkeypatch: pytest.MonkeyPatch, bounds: str
+) -> None:
+    """Catch broken IPC wiring, inherited library-run bounds or lost artifacts."""
+    cache_env = "TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT"
+    monkeypatch.setenv(cache_env, "77")
+    monkeypatch.setenv("ASKVLM_STT_POOL_CONFIG", str(growth_bench.root / "absent.json"))
+
+    result = growth_bench.invoke(
+        "--gpu-memory-bounds", bounds, "--pool-set", "gpu.host_threads.gigaam=2"
+    )
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    records = growth_bench.records()
+    assert [record["index"] for record in records] == [1, 2, 3, 4]
+    assert all(
+        record["status"] == "ok" and record["audio_s"] == 1.25 for record in records
+    )
+    summary = growth_bench.document("summary.json")
+    assert summary["status"] == "completed"
+    assert summary["stats"]["throughput"]["ok"] == 4
+    if sys.platform == "win32":
+        assert all(
+            record["private_bytes"] > 0 and record["job_peak_bytes"] > 0
+            for record in records
+        )
+    assert len(growth_bench.workers) == 1
+    assert summary["worker_pid"] == growth_bench.workers[0].pid
+    assert growth_bench.workers[0].poll() == 0
+    plan = growth_bench.document("run.json")
+    assert plan["spec"]["options"]["batch_lanes"] == plan["spec"]["capacity"]
+    env = growth_bench.worker_envs[0]
+    assert [
+        env[key]
+        for key in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")
+    ] == ["2", "2", "2"]
+    assert env["TEMP"] == env["TMP"] == str(growth_bench.run_dir() / "tmp")
+    if bounds == "library":
+        assert cache_env not in env
+        assert plan["spec"]["options"]["vram_cap_bytes"] is None
+        assert plan["spec"]["options"]["cufft_plan_cache_max_size"] == 0
+    else:
+        assert env[cache_env] == "256"
+        assert plan["spec"]["options"]["vram_cap_bytes"] > 0
+    with (growth_bench.run_dir() / "results.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        assert [int(row["index"]) for row in csv.DictReader(handle)] == [1, 2, 3, 4]
+    assert (growth_bench.run_dir() / "summary.md").is_file()
+    assert not (growth_bench.run_dir() / "tmp").exists()
+    assert not (growth_bench.run_dir() / "inputs").exists()
+
+
+def test_growth_dry_run_prints_the_requested_plan_without_writing_or_spawning(
+    growth_bench: GrowthBench,
+) -> None:
+    """Catch dry-run side effects or omitted user-selected spec values."""
+    growth_bench.worker_allowed = growth_bench.tools.probe_allowed = False
+
+    result = growth_bench.invoke(
+        "--dry-run",
+        "--pool-set",
+        "gpu.cufft_plan_cache_max_size=11",
+        "--pool-set",
+        "gpu.idle_cache_release_s=0.25",
+    )
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    assert "gigaam-e2e-ctc/ai-sage/GigaAM-v3@e2e_ctc/fp32/gpu" in result.output
+    assert re.search(r"cuFFT\D+11\b", result.output)
+    assert "0.25" in result.output
+    assert not growth_bench.out.exists()
+    assert all(args[0] == "nvidia-smi" for args in growth_bench.tools.calls)
+
+
+def test_growth_metadata_replace_failure_preserves_the_previous_complete_plan(
+    growth_bench: GrowthBench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch truncated metadata or input leaks after a failed atomic rewrite."""
+    growth_bench.worker_allowed = False
+    native_replace = os.replace
+    previous: list[bytes] = []
+
+    def replace_at_filesystem(source: object, destination: object) -> None:
+        target = Path(destination)
+        if target.name == "run.json" and target.exists():
+            previous.append(target.read_bytes())
+            msg = "test filesystem refuses a metadata replacement"
+            raise PermissionError(msg)
+        native_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", replace_at_filesystem)
+
+    result = growth_bench.invoke("--no-probe-stack")
+
+    assert result.exit_code == 1
+    assert isinstance(result.exception, PermissionError)
+    assert len(previous) == 1
+    assert (growth_bench.run_dir() / "run.json").read_bytes() == previous[0]
+    assert growth_bench.document("summary.json")["status"] == "error"
+    assert not (growth_bench.run_dir() / "inputs").exists()
+    assert not (growth_bench.run_dir() / "tmp").exists()
+    assert not list(growth_bench.run_dir().glob(".*.tmp"))
+
+
+def test_growth_broken_console_does_not_turn_a_written_summary_into_exit_four(
+    growth_bench: GrowthBench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch console errors conflated with artifact write failures."""
+    native_echo = cli.typer.echo
+
+    def echo_at_console(*args: Any, **kwargs: Any) -> None:  # noqa: ANN401 - external console boundary
+        if list(growth_bench.out.glob("*/summary.md")):
+            msg = "test console pipe is closed"
+            raise BrokenPipeError(msg)
+        native_echo(*args, **kwargs)
+
+    monkeypatch.setattr(cli.typer, "echo", echo_at_console)
+
+    result = growth_bench.invoke()
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    summary = growth_bench.document("summary.json")
+    assert summary["status"] == "completed"
+    assert summary["stats"]["throughput"]["ok"] == 4
+    assert growth_bench.workers[0].poll() == 0
+
+
+@pytest.mark.parametrize("jobs", [0, 4])
+def test_summarize_rebuilds_growth_artifacts_even_before_the_first_job(
+    tmp_path: Path, jobs: int
+) -> None:
+    """Catch overwritten zero-job growth reports or CSV crashes on old keys."""
+    (tmp_path / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": "growth-example",
+                "label": "example",
+                "key": "gpu-test",
+                "recycle_threshold_bytes": 200,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "summary.json").write_text(
+        json.dumps({"status": "system_commit_low", "stats": {}}), encoding="utf-8"
+    )
+    if jobs:
+        (tmp_path / "results.jsonl").write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "index": index,
+                        "elapsed_s": index * 30,
+                        "private_bytes": 100 + index * 2,
+                        "status": "ok",
+                        "wall_s": 1,
+                        "audio_s": 3,
+                        "legacy_extra_key": "kept",
+                    }
+                )
+                for index in range(1, jobs + 1)
+            )
+            + '\n{"index":',
+            encoding="utf-8",
+        )
+
+    result = CliRunner().invoke(cli.app, ["summarize", "--out-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    summary = json.loads((tmp_path / "summary.json").read_text("utf-8"))
+    assert summary["schema"] == "askvlm.stt_memory_growth.summary"
+    assert summary["status"] == "system_commit_low"
+    assert summary["stats"]["throughput"]["jobs"] == jobs
+    if jobs:
+        assert summary["stats"]["metrics"]["private_bytes"]["slope_per_job"] == 2
+    with (tmp_path / "results.csv").open(newline="", encoding="utf-8") as handle:
+        assert len(list(csv.DictReader(handle))) == jobs
+    assert (tmp_path / "summary.md").is_file()
+
+
+def test_summarize_excludes_two_warmup_jobs_from_a_ten_job_growth_projection(
+    tmp_path: Path,
+) -> None:
+    """Catch an 80% window rounded down to include warm-up and lose projection."""
+    mib = 1024**2
+    (tmp_path / "run.json").write_text(
+        json.dumps({"run_id": "ten-jobs", "recycle_threshold_bytes": 200 * mib}),
+        encoding="utf-8",
+    )
+    # * Jobs 3-10 add 2 MiB per 30 s and end at 120 MiB. The 200 MiB
+    # * threshold is 80 MiB away, hence 40 more jobs at 240 MiB/hour.
+    values = [180, 180, 106, 108, 110, 112, 114, 116, 118, 120]
+    (tmp_path / "results.jsonl").write_text(
+        "".join(
+            json.dumps(
+                {"index": index, "elapsed_s": 30 * index, "private_bytes": value * mib}
+            )
+            + "\n"
+            for index, value in enumerate(values, start=1)
+        ),
+        encoding="utf-8",
+    )
+
+    result = CliRunner().invoke(cli.app, ["summarize", "--out-dir", str(tmp_path)])
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    stats = json.loads((tmp_path / "summary.json").read_text("utf-8"))["stats"]
+    private = stats["metrics"]["private_bytes"]
+    assert private["slope_per_job"] == pytest.approx(2 * mib)
+    assert private["slope_per_hour"] == pytest.approx(240 * mib)
+    assert stats["recycle"]["projected_jobs_to_threshold"] == pytest.approx(40)
+    assert stats["recycle"]["first_job_at_threshold"] is None
+
+
+def test_summarize_keeps_the_ordinary_benchmark_result_schema(bench: Bench) -> None:
+    """Catch memory-growth routing taking over ordinary benchmark output folders."""
+    bench.run("whisper-cpu-P1x1")
+    (bench.out / "summary.json").write_text("[]", encoding="utf-8")
+
+    result = CliRunner().invoke(cli.app, ["summarize", "--out-dir", str(bench.out)])
+
+    assert result.exit_code == 0, (result.output, result.exception)
+    rows = json.loads((bench.out / "summary.json").read_text("utf-8"))
+    assert isinstance(rows, list)
+    assert [row["name"] for row in rows] == ["whisper-cpu-P1x1"]
 
 
 def test_p2_clock_starts_after_all_workers_loaded_and_workload_is_complete(
@@ -332,6 +800,129 @@ def _proc(pid: int) -> psutil.Process | None:
         return psutil.Process(pid)
     except psutil.Error:
         return None
+
+
+@contextlib.contextmanager
+def _own_process() -> Iterator[subprocess.Popen[str]]:
+    """Run a process of the test's own that exits with 0 only when told to."""
+    script = (
+        "import sys; print('ready', flush=True); "
+        "sys.exit(sys.stdin.readline().strip() != 'exit')"
+    )
+    child = subprocess.Popen(  # noqa: S603 - fixed one-line script, no shell
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout is not None
+        assert child.stdout.readline().strip() == "ready"
+        yield child
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=30)
+        for stream in (child.stdin, child.stdout):
+            if stream is not None:
+                with contextlib.suppress(OSError):
+                    stream.close()
+
+
+@pytest.mark.parametrize("prefix", ["worker", "grandchild"])
+@pytest.mark.parametrize(
+    ("record", "killed"),
+    [
+        ("own", True),
+        ("earlier_owner", False),
+        ("none", False),
+        ("invalid", False),
+        ("unreadable", False),
+    ],
+)
+class TestBenchTeardown:
+    """Catch the actual fixture killing strangers or leaving identified workers.
+
+    The pid files outlive the fake workers. Once a worker is gone, its pid may
+    belong to an unrelated process, and a bare ``psutil.Process(pid).kill()`` made
+    at teardown terminates that process (a stranger's console died with exit code
+    15). A pid file whose recorded creation time is another process's, or that has
+    none, must be left alone, while a sandbox process still running with its
+    recorded identity must still die (the net must not become a no-op).
+    """
+
+    @pytest.fixture(autouse=True)
+    def observed_process(self, *, killed: bool) -> Iterator[subprocess.Popen[str]]:
+        """Keep the child alive through pytest's actual ``bench`` finalizer.
+
+        Autouse fixtures start before ordinary fixtures in the same scope and
+        finish after them, so the exit-code assertion observes ``bench`` teardown.
+        """
+        with _own_process() as child:
+            yield child
+            assert child.stdin is not None
+            with contextlib.suppress(OSError):
+                child.stdin.write("exit\n")
+                child.stdin.flush()
+            returncode = child.wait(timeout=30)
+            assert (returncode == 0) is not killed, (
+                f"process ended with {returncode}; expected killed={killed}"
+            )
+
+    def test_bench_teardown_kills_only_a_process_it_can_identify(
+        self,
+        bench: Bench,
+        observed_process: subprocess.Popen[str],
+        prefix: str,
+        record: str,
+    ) -> None:
+        """Plant owned child identities for the real fixture finalizer to inspect."""
+        child = observed_process
+        created = psutil.Process(child.pid).create_time()
+        (bench.fake / f"{prefix}-0.pid").write_text(str(child.pid))
+        identity = bench.fake / f"{prefix}-0.created"
+        if record == "unreadable":
+            identity.mkdir()
+        elif record == "invalid":
+            identity.write_text("incomplete-identity")
+        elif record != "none":
+            # * The earlier owner of the pid was created before this process.
+            recorded = created if record == "own" else created - 1.0
+            identity.write_text(repr(recorded))
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32" or sys.prefix == sys.base_prefix,
+    reason="Windows venv redirector launcher",
+)
+def test_bench_reap_ends_the_python_behind_a_recorded_venv_launcher(
+    bench: Bench,
+) -> None:
+    """Catch killing only the recorded launcher and leaking its real interpreter."""
+    with _own_process() as child:
+        launcher = psutil.Process(child.pid)
+        # * The child's ready pipe proves the interpreter behind the launcher exists.
+        descendants = launcher.children(recursive=True)
+        assert descendants, "the venv launcher did not expose its real interpreter"
+        try:
+            (bench.fake / "grandchild-0.created").write_text(
+                repr(launcher.create_time())
+            )
+            (bench.fake / "grandchild-0.pid").write_text(str(launcher.pid))
+
+            bench.reap()
+
+            _terminated, survivors = psutil.wait_procs(
+                [launcher, *descendants], timeout=30
+            )
+            assert survivors == [], [process.pid for process in survivors]
+        finally:
+            # * Retain live identities; fallback cleanup touches only this child.
+            for process in descendants:
+                with contextlib.suppress(psutil.Error):
+                    process.kill()
+            _terminated, remaining = psutil.wait_procs(descendants, timeout=30)
+            assert remaining == []
 
 
 def test_resume_skips_finished_configs_and_retry_failed_reruns_the_rest(
@@ -560,6 +1151,27 @@ def test_child_serves_work_and_stops_gracefully(bench: Bench) -> None:
         assert result["error"] is None
         assert done["cpu_s"] >= 0.0
         assert proc.wait(timeout=30) == 0
+    finally:
+        _close_child(proc)
+
+
+def test_bench_teardown_kills_the_live_worker_and_helper_it_recorded(
+    bench: Bench,
+) -> None:
+    """Catches: worker records the teardown cannot confirm, so the net kills nothing."""
+    bench.env(FAKE_GRANDCHILD="1")
+    proc = _start_child(bench)
+    try:
+        _read_until(proc, "ready")
+        recorded = [*bench.pids("worker"), *bench.pids("grandchild")]
+        live = [*bench.processes("worker"), *bench.processes("grandchild")]
+        assert [p.pid for p in live] == recorded
+        assert len(live) == 2
+
+        bench.reap()
+
+        _terminated, survivors = psutil.wait_procs(live, timeout=30)
+        assert survivors == []
     finally:
         _close_child(proc)
 

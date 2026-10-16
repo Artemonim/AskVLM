@@ -13,6 +13,13 @@ of third-party libraries never corrupt the protocol stream.
 
 Worker stdin EOF without ``shutdown`` means the supervisor is gone: the worker
 exits with :data:`EXIT_PARENT_GONE`. The module imports no ML packages.
+
+Every ``result`` of a worker carries an optional ``memory`` object, a memory
+snapshot of the worker process taken when the result is sent (keys in
+:data:`core.stt_pool.engine_api.MEMORY_SNAPSHOT_KEYS`; an unknown figure is
+``null``). It is telemetry only: a reader ignores a missing or malformed
+snapshot, so the field changes neither :data:`PROTOCOL_VERSION` nor the
+handling of the result.
 """
 
 from __future__ import annotations

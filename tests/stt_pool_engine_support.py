@@ -5,6 +5,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 import types
 import wave
 from dataclasses import dataclass
@@ -106,6 +107,66 @@ class FakeGigaam:
         return [
             self._runtime.gigaam_texts.get(marker, str(marker)) for marker in markers
         ]
+
+    def release_cached_cuda_memory(self) -> bool:
+        """Expose driver-cache releases without a real CUDA context."""
+        self._runtime.cache_releases.append(threading.get_ident())
+        return self.active_device == "cuda"
+
+
+class EngineClock:
+    """Drive idle deadlines explicitly and observe when the batch loop parks."""
+
+    def __init__(self) -> None:
+        self.value = 1000.0
+        self.waits: queue.Queue[float] = queue.Queue()
+        self.condition = _ClockCondition(self)
+
+    def __call__(self) -> float:
+        """Read monotonic model time without advancing real time."""
+        return self.value
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Replace only the engine module's clock, preserving host timeout clocks."""
+        monkeypatch.setattr(
+            engines,
+            "time",
+            types.SimpleNamespace(
+                monotonic=self, perf_counter=time.perf_counter, sleep=time.sleep
+            ),
+        )
+
+    def advance(self, seconds: float) -> None:
+        """Wake engine threads after an explicit logical-time change."""
+        with self.condition:
+            while not self.waits.empty():
+                self.waits.get_nowait()
+            self.value += seconds
+            self.condition.notify_all()
+
+    def parked(self) -> None:
+        """Await a batch-loop time check and its condition-lock release."""
+        while self.waits.get(timeout=GATE_TIMEOUT_S) < self.value:
+            pass
+        with self.condition:
+            pass
+
+
+class _ClockCondition(threading.Condition):
+    """Use notifications for virtual deadlines; a real timeout only detects hangs."""
+
+    def __init__(self, clock: EngineClock) -> None:
+        super().__init__()
+        self._clock = clock
+
+    def wait(self, timeout: float | None = None) -> bool:  # noqa: ARG002 - logical time supplies all deadline wakes
+        """Expose a synchronization barrier before the batch loop parks."""
+        if threading.current_thread().name == "stt-batch-loop":
+            self._clock.waits.put(self._clock.value)
+        if not super().wait(GATE_TIMEOUT_S):
+            msg = "test did not notify a controlled engine condition"
+            raise TimeoutError(msg)
+        return True
 
 
 class FakeWhisper:
@@ -253,6 +314,7 @@ class EngineRuntime:
         self.options_calls: queue.Queue[OptionsCall] = queue.Queue()
         self.diarize_calls: queue.Queue[DiarizeCall] = queue.Queue()
         self.batch_calls: queue.Queue[BatchCall] = queue.Queue()
+        self.cache_releases: list[int] = []
         self.inferences: list[tuple[str, int]] = []
         self.process_gates: dict[str, threading.Event] = {}
         self.batch_gate: threading.Event | None = None

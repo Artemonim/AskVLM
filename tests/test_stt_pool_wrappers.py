@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib
+import importlib.abc
 import json
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import sys
 import types
 import wave
 from concurrent.futures import ThreadPoolExecutor
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Self
 
@@ -22,12 +24,15 @@ from core.gigaam_ctc_wrapper import GigaAMCtcWrapper, iter_wav_windows
 from core.gigaam_e2e_ctc_wrapper import GigaAME2ECtcWrapper
 from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
 from core.stt_options import MediaWindow, WhisperDecodeOptions
+from core.stt_pool.engines import create_engine
 from core.stt_pool.procs import default_worker_launch
 from core.whisper_batch import speech_span, transcribe_clips_batched
 from tests.bounded_scenario_support import run_bounded_scenario
+from tests.stt_pool_engine_support import spec
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from importlib.machinery import ModuleSpec
 
 _ROOT = Path(__file__).resolve().parents[1]
 _RATE = 16000
@@ -65,8 +70,17 @@ class Runtime:
         self.prepared_frames: list[int] = []
         self.batches: list[tuple[np.ndarray[Any, Any], np.ndarray[Any, Any]]] = []
         self.module = types.ModuleType("torch")
+        self.plan_caches = {
+            0: types.SimpleNamespace(max_size=4096, size=0),
+            1: types.SimpleNamespace(max_size=4096, size=0),
+        }
+        self.module.backends = types.SimpleNamespace(
+            cuda=types.SimpleNamespace(cufft_plan_cache=self.plan_caches)
+        )
         self.module.cuda = types.SimpleNamespace(
             is_available=lambda: self.available,
+            is_initialized=lambda: "cuda" in self.moves,
+            current_device=lambda: 1,
             mem_get_info=lambda: (16 * 1024**3, 16 * 1024**3),
             empty_cache=lambda: None,
         )
@@ -172,7 +186,9 @@ def _discard_fake_imports(cached: set[str]) -> None:
 
 
 @contextlib.contextmanager
-def _runtime_boundary(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
+def _runtime_boundary(
+    monkeypatch: pytest.MonkeyPatch, *, whisper: bool = True
+) -> Iterator[Runtime]:
     """Install only external ML modules before importing any heavy wrapper."""
     boundary = Runtime()
     cached = set(sys.modules)
@@ -242,16 +258,30 @@ def _runtime_boundary(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
     modules["transformers.modeling_utils"].PreTrainedModel = PreTrainedModel
     modules["hydra.utils"].instantiate = lambda *_args, **_kwargs: None
     modules["hydra"].utils = modules["hydra.utils"]
-    for name, module in {"torch": boundary.module, **modules}.items():
-        monkeypatch.setitem(sys.modules, name, module)
-    wrapper = importlib.import_module("core.whisperx_wrapper")
-    monkeypatch.setattr(wrapper, "torch_mod", boundary.module)
-    monkeypatch.setattr(wrapper, "fw_whisper_cls", WhisperModel)
-    monkeypatch.setattr(wrapper, "whisperx_mod", None)
+    _install_ml_modules(monkeypatch, boundary, modules, whisper=whisper)
     try:
         yield boundary
     finally:
         _discard_fake_imports(cached)
+
+
+def _install_ml_modules(
+    patch: pytest.MonkeyPatch,
+    boundary: Runtime,
+    modules: dict[str, types.ModuleType],
+    *,
+    whisper: bool,
+) -> None:
+    """Install external ML boundaries, optionally keeping Whisper entirely absent."""
+    for name, module in {"torch": boundary.module, **modules}.items():
+        if not whisper and name in {"faster_whisper", "whisperx"}:
+            continue
+        patch.setitem(sys.modules, name, module)
+    if whisper:
+        wrapper = importlib.import_module("core.whisperx_wrapper")
+        patch.setattr(wrapper, "torch_mod", boundary.module)
+        patch.setattr(wrapper, "fw_whisper_cls", modules["faster_whisper"].WhisperModel)
+        patch.setattr(wrapper, "whisperx_mod", None)
 
 
 @pytest.fixture
@@ -259,6 +289,122 @@ def runtime(monkeypatch: pytest.MonkeyPatch) -> Iterator[Runtime]:
     """Keep external ML substitutes scoped to one test's real components."""
     with _runtime_boundary(monkeypatch) as boundary:
         yield boundary
+
+
+class _WhisperImportGuard(importlib.abc.MetaPathFinder):
+    """Reject the second STT runtime before any native library can be loaded."""
+
+    def find_spec(
+        self, fullname: str, _path: object = None, _target: object = None
+    ) -> ModuleSpec | None:
+        """Fail an unexpected Whisper import in an isolated GigaAM build."""
+        if (
+            fullname.split(".", 1)[0] in {"faster_whisper", "ctranslate2", "whisperx"}
+            or fullname == "core.whisperx_wrapper"
+        ):
+            msg = f"GigaAM engine imports another STT runtime: {fullname}"
+            raise AssertionError(msg)
+        return None
+
+
+def _pipeline_cache_boundary(patch: pytest.MonkeyPatch, root: Path) -> types.ModuleType:
+    """Keep real pipeline construction and all model-cache paths in the test root."""
+    module = importlib.import_module("core.pipelines")
+    patch.setattr(module, "load_env_file", lambda: None)
+    patch.setattr(module, "get_project_cache_dir", lambda: root)
+    patch.setattr(module, "configure_ml_caches", lambda _root: root)
+    return module
+
+
+def _gigaam_import_and_cache_scenario(
+    root: Path, *, provider: str, backend: str, limit: int
+) -> None:
+    """Load a real engine and wrapper over external ML substitutes."""
+    forbidden = {"faster_whisper", "ctranslate2", "whisperx", "core.whisperx_wrapper"}
+    assert not forbidden.intersection(sys.modules)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(sys, "meta_path", [_WhisperImportGuard(), *sys.meta_path])
+        with _runtime_boundary(patch, whisper=False) as boundary:
+            _pipeline_cache_boundary(patch, root)
+            engine = create_engine(
+                spec(provider, backend, cufft_plan_cache_max_size=limit)
+            )
+            try:
+                loaded = engine.load()
+                assert loaded.device == ("cuda" if backend == "gpu" else "cpu")
+                assert not forbidden.intersection(sys.modules)
+                assert boundary.plan_caches[0].max_size == 4096
+                assert boundary.plan_caches[1].max_size == (
+                    limit if backend == "gpu" and limit else 4096
+                )
+            finally:
+                engine.close()
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("provider", "backend", "limit"),
+    [
+        ("gigaam-ctc", "cpu", 7),
+        ("gigaam-e2e-ctc", "cpu", 7),
+        ("gigaam-e2e-ctc", "gpu", 7),
+        ("gigaam-e2e-ctc", "gpu", 0),
+    ],
+)
+def test_gigaam_engine_build_is_lean_and_bounds_the_resident_devices_cufft_cache(
+    tmp_path: Path, provider: str, backend: str, limit: int
+) -> None:
+    """Catch extra cuDNN imports or unapplied cuFFT bounds at engine load."""
+    run_bounded_scenario(
+        partial(
+            _gigaam_import_and_cache_scenario,
+            provider=provider,
+            backend=backend,
+            limit=limit,
+        ),
+        tmp_path,
+    )
+
+
+def _whisper_reload_scenario(root: Path) -> None:
+    """Exercise real imports, monkeypatch rollback and deliberate substitution."""
+    with pytest.MonkeyPatch.context() as patch, _runtime_boundary(patch):
+        module = _pipeline_cache_boundary(patch, root)
+        original = importlib.import_module("core.whisperx_wrapper").WhisperXWrapper
+        initial = module.LocalPipeline(model_root=root, device="cpu")
+        try:
+            assert type(initial.require_whisperx()) is original
+        finally:
+            initial.close()
+        replacement = types.SimpleNamespace(unload=lambda **_kwargs: None)
+        with pytest.MonkeyPatch.context() as override:
+            override.setattr(module, "WhisperXWrapper", lambda **_kwargs: replacement)
+            pipeline = module.LocalPipeline(model_root=root, device="cpu")
+            assert pipeline.require_whisperx() is replacement
+            pipeline.close()
+        # * Rollback restores the old class and leaves a stale package attribute.
+        sys.modules.pop("core.whisperx_wrapper")
+        current = importlib.import_module("core.whisperx_wrapper").WhisperXWrapper
+        assert current is not original
+        pipeline = module.LocalPipeline(model_root=root, device="cpu")
+        try:
+            assert type(pipeline.require_whisperx()) is current
+            pipeline.ensure_stt_loaded()
+        finally:
+            pipeline.close()
+        with pytest.MonkeyPatch.context() as override:
+            override.setattr(module, "WhisperXWrapper", lambda **_kwargs: replacement)
+            pipeline = module.LocalPipeline(model_root=root, device="cpu")
+            assert pipeline.require_whisperx() is replacement
+            pipeline.close()
+
+
+@pytest.mark.integration
+def test_whisper_pipeline_uses_current_real_wrapper_after_reload_and_honors_override(
+    tmp_path: Path,
+) -> None:
+    """Catch stale wrapper classes or ignored deliberate overrides after reload."""
+    run_bounded_scenario(_whisper_reload_scenario, tmp_path)
 
 
 def _wav(path: Path, *, frames: int = 800) -> Path:

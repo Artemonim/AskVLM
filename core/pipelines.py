@@ -1,5 +1,6 @@
 import contextlib
 import enum
+import importlib
 import os
 from collections.abc import Callable
 from pathlib import Path
@@ -23,10 +24,70 @@ from .stt_providers import (
     normalize_stt_provider,
     resolve_gigaam_requested_device,
 )
-from .whisperx_wrapper import WhisperXWrapper
 
 if TYPE_CHECKING:
     from .diarization import Segment
+    from .whisperx_wrapper import WhisperXWrapper
+
+
+# ! ``core.whisperx_wrapper`` imports faster-whisper (CTranslate2 with its own
+# ! cuDNN DLLs) at module import, so it is imported only when a Whisper pipeline
+# ! is built: a GigaAM pipeline (an STT pool GigaAM worker among others) never
+# ! loads faster-whisper, CTranslate2 or whisperx. ``WhisperXWrapper`` stays a
+# ! module attribute through ``__getattr__``; it is resolved from the module
+# ! currently in ``sys.modules`` on every access and never cached here.
+_WHISPERX_WRAPPER_MODULE = f"{__name__.rpartition('.')[0]}.whisperx_wrapper"
+_WHISPERX_WRAPPER_CLASS = "WhisperXWrapper"
+
+
+def _is_wrapper_module_class(value: object) -> bool:
+    """Return whether *value* is a ``WhisperXWrapper`` class of the wrapper module.
+
+    Any instance of the module counts, also one that has since been dropped
+    from ``sys.modules``: such a global is a leftover (for example the value
+    a test's ``monkeypatch`` restores), not a deliberate substitute.
+    """
+    return (
+        isinstance(value, type)
+        and value.__module__ == _WHISPERX_WRAPPER_MODULE
+        and value.__qualname__ == _WHISPERX_WRAPPER_CLASS
+    )
+
+
+def _whisperx_wrapper_class() -> type["WhisperXWrapper"]:
+    """Return the Whisper wrapper class, importing its module on first use.
+
+    A deliberate substitute set as ``WhisperXWrapper`` on this module (any
+    object other than the wrapper module's own class) wins; otherwise the
+    class comes from the module currently in ``sys.modules`` (imported when
+    absent), so a re-imported wrapper module is always the one used.
+
+    Returns:
+        The class used to build the Whisper backend of a pipeline.
+
+    """
+    replacement = globals().get(_WHISPERX_WRAPPER_CLASS)
+    if replacement is not None and not _is_wrapper_module_class(replacement):
+        return cast("type[WhisperXWrapper]", replacement)
+    # ! Imports faster-whisper; ``import_module`` reads ``sys.modules`` (a
+    # ! ``from . import`` could return a stale package attribute instead).
+    module = importlib.import_module(_WHISPERX_WRAPPER_MODULE)
+    return cast("type[WhisperXWrapper]", getattr(module, _WHISPERX_WRAPPER_CLASS))
+
+
+def __getattr__(name: str) -> object:
+    """Resolve ``WhisperXWrapper`` lazily (PEP 562); other names do not exist.
+
+    Runs only while no global of that name exists; the value is not stored.
+
+    Raises:
+        AttributeError: For any other missing attribute.
+
+    """
+    if name == _WHISPERX_WRAPPER_CLASS:
+        return _whisperx_wrapper_class()
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
 
 
 # * Cancellation sentinel used across pipeline layers
@@ -195,7 +256,7 @@ class LocalPipeline:
             self.device = device
             # STT engine (Faster-Whisper via WhisperX)
             w_device = device if device in {"auto", "cuda", "cpu"} else "auto"
-            self.whisperx = WhisperXWrapper(
+            self.whisperx = _whisperx_wrapper_class()(
                 model_name="large-v3" if whisper_model == "auto" else whisper_model,
                 model_root=self.model_root,
                 device=w_device,
@@ -214,7 +275,7 @@ class LocalPipeline:
         self._llm_model = llm_model
         self.formatter: LLMFormatter | None = None
 
-    def require_whisperx(self) -> WhisperXWrapper:
+    def require_whisperx(self) -> "WhisperXWrapper":
         """Return the Whisper backend or raise when this pipeline uses GigaAM.
 
         Returns:

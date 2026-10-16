@@ -21,6 +21,11 @@ then sends the ``spec`` line. The process:
    supervisor is gone: exit :data:`~core.stt_pool.ipc.EXIT_PARENT_GONE` at
    once, without waiting for running jobs).
 
+Every ``result`` carries a memory snapshot of the process taken when it is
+sent (:func:`memory_snapshot`): private bytes and, when the process has an
+initialized CUDA context, the CUDA caching-allocator figures and the cuFFT
+plan cache size.
+
 Every exit goes through :func:`os._exit` after stderr is flushed: engine
 threads may still run, and a regular interpreter shutdown could hang on them.
 Until the spec arrives the process imports no ML package and no engine module;
@@ -30,6 +35,7 @@ the engine module is imported only through the factory named by the spec.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import logging
 import os
 import signal
@@ -38,11 +44,13 @@ import threading
 import time
 from typing import IO, TYPE_CHECKING, Literal, NoReturn, TypeGuard
 
+from core.gigaam_device import cuda_memory_stats
 from core.stt_errors import DeviceUnavailableError
-from core.stt_pool import ipc, winjob
+from core.stt_pool import ipc, sysprobe, winjob
 from core.stt_pool.engine_api import (
     ERROR_KIND_RESULT_TOO_LARGE,
     ERROR_KIND_TRANSCRIBE_FAILED,
+    MEMORY_SNAPSHOT_KEYS,
     EngineResult,
     WorkerSpec,
     WorkItem,
@@ -271,6 +279,31 @@ def _thread_env() -> dict[str, str | None]:
     return {name: os.environ.get(name) for name in _THREAD_ENV_VARS}
 
 
+def memory_snapshot() -> dict[str, int | None] | None:
+    """Return the memory snapshot attached to every result of this process.
+
+    The private bytes come from one ``GetProcessMemoryInfo`` call; the CUDA
+    figures are read only from an already imported ``torch`` whose CUDA
+    context is initialized (:func:`~core.gigaam_device.cuda_memory_stats`), so
+    the snapshot never imports torch or creates a CUDA context.
+
+    Returns:
+        Every key of :data:`~core.stt_pool.engine_api.MEMORY_SNAPSHOT_KEYS`
+        (``None`` for an unknown figure), or ``None`` when taking the snapshot
+        failed (it never fails the result it would accompany).
+
+    """
+    try:
+        snapshot: dict[str, int | None] = dict.fromkeys(MEMORY_SNAPSHOT_KEYS)
+        snapshot["private_bytes"] = sysprobe.process_private_bytes()
+        stats = cuda_memory_stats(sys.modules.get("torch"))
+        snapshot.update({key: value for key, value in stats.items() if key in snapshot})
+    except Exception:  # noqa: BLE001 - telemetry never fails a result
+        logger.debug("memory snapshot failed", exc_info=True)
+        return None
+    return snapshot
+
+
 # * ---------------------------------------------------------------------------
 # * Result emission
 # * ---------------------------------------------------------------------------
@@ -284,7 +317,9 @@ class _ResultEmitter:
     replaced by a ``protocol_error`` result for the same attempt, and a result
     whose protocol line would exceed :data:`~core.stt_pool.ipc.MAX_LINE_BYTES`
     (the supervisor's reader would skip it) by a ``result_too_large`` result,
-    so the supervisor never waits for an answer that was lost.
+    so the supervisor never waits for an answer that was lost. Every message
+    sent, replacements included, carries the process memory snapshot taken
+    when the result arrived (:func:`memory_snapshot`).
     """
 
     def __init__(self, channel: ipc.WorkerChannel, backend: Backend) -> None:
@@ -294,12 +329,15 @@ class _ResultEmitter:
         self._sealed = False
 
     def emit(self, result: EngineResult) -> None:
-        """Send one engine result (called from engine threads).
+        """Send one engine result with the memory snapshot (called from engine threads).
 
         Args:
-            result: Engine result.
+            result: Engine result; its own ``memory``, when an engine set one,
+                is kept.
 
         """
+        # * Outside the lock: the snapshot never delays another thread's write.
+        snapshot = memory_snapshot()
         with self._lock:
             if self._sealed:
                 logger.warning(
@@ -309,6 +347,12 @@ class _ResultEmitter:
                 )
                 return
             try:
+                if (
+                    snapshot is not None
+                    and isinstance(result, EngineResult)
+                    and result.memory is None
+                ):
+                    result = dataclasses.replace(result, memory=snapshot)
                 message = result.to_message()
                 size = _line_bytes(message)
                 if size <= ipc.MAX_LINE_BYTES:
@@ -317,7 +361,7 @@ class _ResultEmitter:
                 # * The engine thread must survive and the attempt still needs
                 # * its one answer.
                 logger.exception("engine result cannot be encoded")
-                self._send_replacement(result, exc)
+                self._send_replacement(result, exc, snapshot)
                 return
             if size > ipc.MAX_LINE_BYTES:
                 self._send_oversized(result, size)
@@ -348,7 +392,11 @@ class _ResultEmitter:
             )
 
     def _protocol_error(
-        self, job_id: str, attempt_id: str, detail: str
+        self,
+        job_id: str,
+        attempt_id: str,
+        detail: str,
+        memory: dict[str, int | None] | None = None,
     ) -> EngineResult:
         """Build an ``error`` result of kind ``protocol_error``."""
         return EngineResult(
@@ -361,9 +409,15 @@ class _ResultEmitter:
             backend=self._backend,
             run_s=0.0,
             audio_s=None,
+            memory=memory,
         )
 
-    def _send_replacement(self, result: object, exc: Exception) -> None:
+    def _send_replacement(
+        self,
+        result: object,
+        exc: Exception,
+        snapshot: dict[str, int | None] | None,
+    ) -> None:
         """Answer the attempt of an unencodable *result* (the caller holds the lock)."""
         job_id = getattr(result, "job_id", None)
         attempt_id = getattr(result, "attempt_id", None)
@@ -371,7 +425,7 @@ class _ResultEmitter:
             logger.error("unencodable engine result has no usable job or attempt id")
             return
         detail = f"engine result cannot be encoded: {error_detail_for_exception(exc)}"
-        replacement = self._protocol_error(job_id, attempt_id, detail)
+        replacement = self._protocol_error(job_id, attempt_id, detail, snapshot)
         self._channel.send(replacement.to_message())
 
     def _send_oversized(self, result: EngineResult, size: int) -> None:
@@ -399,6 +453,7 @@ class _ResultEmitter:
             backend=self._backend,
             run_s=result.run_s,
             audio_s=result.audio_s,
+            memory=result.memory,
         )
         self._channel.send(replacement.to_message())
 

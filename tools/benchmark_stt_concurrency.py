@@ -20,11 +20,16 @@ Usage (PowerShell, repository root, venv active)::
         --out-dir <dir> --manifest refs.jsonl [--groups gigaam-cuda-*] [--dry-run]
     python tools/benchmark_stt_concurrency.py combo --clips-dir <dir> \
         --out-dir <dir> --manifest refs.jsonl (--pairs A+B | --auto-combos)
+    python tools/benchmark_stt_concurrency.py memory-growth [--jobs 300] \
+        [--durations varied|fixed] [--gpu-memory-bounds pool|library] \
+        [--pool-set gpu.cudnn_v8_lru_cache_limit=256] [--dry-run]
     python tools/benchmark_stt_concurrency.py summarize --out-dir <dir>
 
 Each measurement runs in fresh child processes (this script in the hidden
 ``_child`` mode). ``run`` writes ``<out-dir>/results`` and ``summary.md``;
-``sweep`` writes ``<out-dir>/sweep``; ``combo`` writes ``<out-dir>/combos``.
+``sweep`` writes ``<out-dir>/sweep``; ``combo`` writes ``<out-dir>/combos``;
+``memory-growth`` starts one real GigaAM GPU pool worker and writes
+``.cache/stt_memory_growth/<stamp>-<label>`` (``summarize`` rebuilds its summary).
 Re-running resumes: results with the same input fingerprint are reused
 (``--retry-failed`` re-runs non-ok ones; ``run --clear`` starts over); results
 with another fingerprint are moved to ``stale/`` and measured again.

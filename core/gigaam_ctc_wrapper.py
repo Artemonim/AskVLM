@@ -48,6 +48,7 @@ from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, NoReturn, cast
 from core.gigaam_device import (
     STRICT_DEVICE_REQUESTS,
     is_cuda_oom_error,
+    limit_cufft_plan_cache,
     module_device_types,
     release_cuda_cache,
     select_gigaam_device,
@@ -888,6 +889,47 @@ class GigaAMCtcWrapper:
     def close(self) -> None:
         """Unload resources held by this wrapper."""
         self.unload(safe=False)
+
+    def bound_cufft_plan_cache(self, max_size: int) -> int | None:
+        """Bound the cuFFT plan cache of the resident CUDA model's device.
+
+        The mel front-end runs ``torch.stft`` on CUDA, and every distinct
+        input length (batch rows times frames) adds one cached cuFFT plan;
+        the bound keeps a long-lived process from accumulating plans.
+
+        Args:
+            max_size: Most cached plans (a positive integer).
+
+        Returns:
+            The bound in effect, or ``None`` when the model is not resident on
+            CUDA or the bound could not be applied.
+
+        Raises:
+            ValueError: When *max_size* is not a positive integer.
+
+        """
+        if self._active_device != "cuda" or self._torch is None:
+            return None
+        return limit_cufft_plan_cache(self._torch, max_size)
+
+    def release_cached_cuda_memory(self) -> bool:
+        """Return the cached CUDA blocks of an idle resident model to the driver.
+
+        Runs ``gc.collect()`` and ``torch.cuda.empty_cache()`` while holding the
+        per-wrapper CUDA inference lock, so it never overlaps an inference
+        call of the lock-free path; the caller still calls it only while no
+        work is in flight.
+
+        Returns:
+            ``True`` when the release ran, ``False`` when the model never used
+            CUDA (nothing is cached on a device).
+
+        """
+        if not self._cuda_used or self._torch is None:
+            return False
+        with self._cuda_infer_lock:
+            release_cuda_cache(self._torch)
+        return True
 
     @staticmethod
     def _coerce_text(raw: object) -> str:

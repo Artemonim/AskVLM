@@ -568,6 +568,30 @@ def reservation_for(
     return Reservation(commit_bytes=commit, vram_bytes=vram, host_threads=max(0, host))
 
 
+def commit_growth_blockers(
+    state: SchedulerState, worker_id: str, commit_bytes: int
+) -> tuple[str, ...]:
+    """Return why a live worker's commit reservation cannot grow to *commit_bytes*.
+
+    The growth (``commit_bytes`` minus the worker's current reservation) is
+    checked like the reservation of a spawn: the commit budget counts every
+    worker's reservation plus the growth, the free system commit must keep
+    the free-commit guard after the growth, and nothing grows while free
+    commit is below the critical level. Pure, like :func:`plan`.
+
+    Args:
+        state: Snapshot of the pool; *worker_id* must be among its workers.
+        worker_id: Worker whose reservation would grow.
+        commit_bytes: The worker's commit reservation after the growth.
+
+    Returns:
+        The blocking reasons with the numbers behind them; empty when the
+        growth fits (or *commit_bytes* is not above the current reservation).
+
+    """
+    return _Planner(state).growth_blockers(worker_id, commit_bytes)
+
+
 def service_seconds(
     key: WorkerKey,
     estimate: KeyEstimate,
@@ -1994,15 +2018,21 @@ class _Planner:
             out.extend(self._gpu_resource_blockers(need, freed))
         return out
 
-    def _commit_blockers(self, commit: int, freed: _Freed) -> list[str]:
-        """Return commit-budget and free-commit shortfalls of a new reservation."""
+    def _commit_blockers(
+        self, commit: int, freed: _Freed, *, action: str = "spawn"
+    ) -> list[str]:
+        """Return commit-budget and free-commit shortfalls of a new reservation.
+
+        *commit* is the reservation added by *action* (named in the reasons):
+        a spawn's whole reservation, or the growth of a live worker's.
+        """
         limits = self._limits
         out: list[str] = []
         commit_after = self._commit_reserved() - freed.commit + commit
         if commit_after > limits.commit_budget_bytes:
             out.append(
-                f"commit budget: {_gib(commit_after)} GiB reserved after the spawn > "
-                f"{_gib(limits.commit_budget_bytes)} GiB"
+                f"commit budget: {_gib(commit_after)} GiB reserved after the "
+                f"{action} > {_gib(limits.commit_budget_bytes)} GiB"
             )
         free_commit = self._probes.free_commit_bytes
         guard = limits.free_commit_guard_bytes
@@ -2012,6 +2042,24 @@ class _Planner:
                 f"{_gib(commit)} GiB + {_gib(guard)} GiB guard"
             )
         return out
+
+    def growth_blockers(self, worker_id: str, commit_bytes: int) -> tuple[str, ...]:
+        """Return why a live worker's commit reservation cannot grow.
+
+        See :func:`commit_growth_blockers`.
+        """
+        sim = next((sim for sim in self._sims if sim.worker_id == worker_id), None)
+        if sim is None:
+            return (f"worker {worker_id} is not in the pool",)
+        growth = commit_bytes - sim.reservation.commit_bytes
+        if growth <= 0:
+            return ()
+        reasons: list[str] = []
+        free = self._probes.free_commit_bytes
+        if free is not None and free < self._limits.critical_free_commit_bytes:
+            reasons.append("free system commit is below the critical level")
+        reasons.extend(self._commit_blockers(growth, _NOTHING_FREED, action="growth"))
+        return tuple(reasons)
 
     def _gpu_resource_blockers(self, need: _Need, freed: _Freed) -> list[str]:
         """Return GPU worker-count and VRAM shortfalls of a GPU spawn."""

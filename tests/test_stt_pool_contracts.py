@@ -214,6 +214,61 @@ def test_unknown_priority_values_fail(raw: object) -> None:
         ("cpu.threads_per_slot", 0),
         ("gpu.max_workers", 1.5),
         ("gpu.batch_lanes.whisper", 65),
+        *[
+            (f"gpu.{key}", value)
+            for key in ("cufft_plan_cache_max_size", "cudnn_v8_lru_cache_limit")
+            for value in (True, -1, 1.5, None, "32", 2**31, float("inf"), 10**400)
+        ],
+        *[
+            ("gpu.idle_cache_release_s", value)
+            for value in (
+                True,
+                -0.01,
+                None,
+                "15",
+                float("nan"),
+                float("inf"),
+                86400.01,
+                10**400,
+            )
+        ],
+        *[
+            (path, value)
+            for path in ("gpu.vram_cap", "memory.live_cap_raise")
+            for value in (0, 1, 0.0, None, "true", [], {})
+        ],
+        *[
+            ("gpu.vram_cap_margin_gib", value)
+            for value in (True, -0.01, None, "1", float("nan"), float("inf"), 10**400)
+        ],
+        *[
+            ("memory.recycle_commit_fraction", value)
+            for value in (
+                True,
+                -0.01,
+                1.0001,
+                None,
+                "1",
+                float("nan"),
+                float("inf"),
+                10**400,
+            )
+        ],
+        *[
+            ("lifecycle.worker_max_uptime_h", value)
+            for value in (
+                True,
+                -1,
+                0.001,
+                0.9999,
+                8760.01,
+                None,
+                "12",
+                float("nan"),
+                float("inf"),
+                10**400,
+            )
+        ],
         ("memory.commit_budget_gib", float("nan")),
         ("memory.commit_budget_gib", 0),
         ("memory.free_commit_guard_gib", -1),
@@ -225,6 +280,9 @@ def test_unknown_priority_values_fail(raw: object) -> None:
         ("memory.child_headroom_gib", float("inf")),
         ("memory.child_headroom_gib", 10**400),
         ("memory.child_headroom_typo", 1),
+        ("memory.live_cap_raise_typo", True),
+        ("gpu.vram_cap_typo", True),
+        ("lifecycle.worker_max_uptime_typo", 12),
         ("vram.budget_gib", 10**400),
         ("threads.budget", 0),
         ("diarization.threads_per_slot", 0),
@@ -280,6 +338,37 @@ def test_configuration_resolution_and_overrides_use_real_files(
     assert conservative.gpu.max_workers <= 1
     with pytest.raises(PoolConfigError):
         load_pool_config(explicit.with_name("missing.json"), root=tmp_path)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("fraction", "enabled", "margin_gib", "hours"),
+    [(0, False, 0, 0), (0.5, True, 0.125, 1), (1, True, 1, 8760)],
+)
+def test_memory_policy_file_accepts_boundaries_and_converts_units(
+    tmp_path: Path, fraction: float, *, enabled: bool, margin_gib: float, hours: float
+) -> None:
+    """Catch rejected disable switches, missing policy keys or GiB/hour unit errors."""
+    path = tmp_path / "limits.json"
+    path.write_text(
+        json.dumps(
+            {
+                "memory": {
+                    "recycle_commit_fraction": fraction,
+                    "live_cap_raise": enabled,
+                },
+                "gpu": {"vram_cap": enabled, "vram_cap_margin_gib": margin_gib},
+                "lifecycle": {"worker_max_uptime_h": hours},
+            }
+        ),
+        encoding="utf-8",
+    )
+    loaded = load_pool_config(path, root=tmp_path, env={}, logical_cpus=8)
+    assert loaded.memory.recycle_commit_fraction == fraction
+    assert loaded.memory.live_cap_raise is enabled
+    assert loaded.gpu.vram_cap is enabled
+    assert loaded.gpu.vram_cap_margin_bytes == round(margin_gib * _GIB)
+    assert loaded.lifecycle.worker_max_uptime_s == hours * 3600
 
 
 def test_example_configuration_honors_architect_safety_budgets() -> None:
@@ -763,10 +852,28 @@ def test_job_kind_provider_and_explicit_options_cannot_conflict(
 
 
 @pytest.mark.parametrize("kind", ["stt", "diarize"])
+@pytest.mark.parametrize(
+    "memory",
+    [
+        None,
+        [],
+        "unavailable",
+        42,
+        False,
+        {
+            "private_bytes": -1,
+            "cuda_reserved_bytes": True,
+            "cuda_allocated_bytes": 0,
+            "cuda_max_reserved_bytes": "16384",
+            "cufft_plan_cache_size": 1.5,
+            "unknown": 99,
+        },
+    ],
+)
 def test_worker_packets_preserve_options_and_empty_structured_success(
-    tmp_path: Path, kind: str
+    tmp_path: Path, kind: str, memory: object
 ) -> None:
-    """Catch structured payloads disappearing across IPC or no-turn diarization being classified empty."""
+    """Catch broken telemetry invalidating empty successes or dropping their data."""
     message: dict[str, object] = {
         "type": "job",
         "job_id": _JOB_ID,
@@ -796,12 +903,25 @@ def test_worker_packets_preserve_options_and_empty_structured_success(
             received, {"turns": []}, backend="cpu", run_s=0, audio_s=2
         )
         expected_status = "ok"
-    result_wire = ipc.decode_message(ipc.encode_message(result.to_message()))
+    result_message = result.to_message()
+    if memory is not None:
+        result_message["memory"] = memory
+    result_wire = ipc.decode_message(ipc.encode_message(result_message))
     assert result_wire is not None
     decoded = EngineResult.from_message(result_wire)
     assert decoded.status == expected_status
     assert decoded.text == ""
     assert decoded.data == ({"segments": []} if kind == "stt" else {"turns": []})
+    if isinstance(memory, dict):
+        assert decoded.memory == {
+            "private_bytes": None,
+            "cuda_reserved_bytes": None,
+            "cuda_allocated_bytes": 0,
+            "cuda_max_reserved_bytes": None,
+            "cufft_plan_cache_size": None,
+        }
+    else:
+        assert decoded.memory is None
 
 
 @pytest.mark.parametrize("data", [[], "{}", False])

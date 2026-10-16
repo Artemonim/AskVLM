@@ -45,18 +45,14 @@ from core.stt_pool.engine_api import (
     ERROR_KIND_MEMORY_LIMIT,
     ERROR_KIND_RESULT_TOO_LARGE,
     ERROR_KIND_TRANSCRIBE_FAILED,
+    MEMORY_SNAPSHOT_KEYS,
     EngineResult,
     LoadInfo,
     WorkerSpec,
     job_message_fields,
 )
 from core.stt_pool.estimates import EstimateStore
-from core.stt_pool.keys import (
-    device_for_backend,
-    make_key,
-    provider_family,
-    worker_kind,
-)
+from core.stt_pool.keys import device_for_backend, make_key
 from core.stt_pool.procs import WorkerProcess, WorkerSpawnError, default_worker_launch
 from core.stt_pool.queue import (
     ERROR_KIND_INPUT_INVALID,
@@ -92,7 +88,9 @@ from core.stt_pool.scheduler import (
     SchedulerState,
     Stop,
     WorkerView,
+    commit_growth_blockers,
     plan,
+    reservation_for,
     service_seconds,
     threads_for,
 )
@@ -102,6 +100,7 @@ from core.stt_pool.sysprobe import (
     query_commit,
     query_gpu,
 )
+from core.stt_pool.worker_setup import worker_environment, worker_spec_options
 from core.temp_gc import purge_stale_askvlm_temp_dirs
 
 if TYPE_CHECKING:
@@ -166,10 +165,6 @@ LOAD_TAIL_CHARS = 500
 FATAL_DETAIL_CHARS = 1500
 KEEP_WORKER_LOGS = 50
 
-# * Worker spec option (spec 6.3).
-WHISPER_BATCH_MAX_CLIP_S = 30.0
-_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS")
-
 # * Bounded waits around worker exits.
 EXIT_WAIT_S = 3.0
 CLOSE_TIMEOUT_S = 10.0
@@ -196,7 +191,8 @@ class SupervisorOptions:
         engine_factory: ``"module:callable"`` named in every worker ``spec``;
             a test seam that is never read from queue files.
         worker_launch: Builds the launch of a worker from its key and the
-            thread-count environment; ``None`` uses
+            extra worker environment (thread caps; for a GPU worker also the
+            cuDNN v8 cache bound); ``None`` uses
             :func:`~core.stt_pool.procs.default_worker_launch`.
         commit_probe: Free system commit reader, sampled every tick.
         gpu_probe: GPU reader run on the probe thread; ``None`` uses
@@ -543,7 +539,9 @@ class _Fatal:
 class _Outcome:
     """Terminal outcome of a job before it becomes a result record.
 
-    ``data`` is the structured payload of an ``ok``/``empty`` outcome.
+    ``data`` is the structured payload of an ``ok``/``empty`` outcome;
+    ``memory`` is the worker's memory snapshot of the result (telemetry for
+    the log only, never written to the result file).
     """
 
     status: ResultStatus
@@ -552,6 +550,35 @@ class _Outcome:
     error_detail: str | None = None
     run_s: float = 0.0
     data: Mapping[str, object] | None = None
+    memory: Mapping[str, int | None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _Telemetry:
+    """Memory figures logged with a published result.
+
+    Attributes:
+        memory: The worker's memory snapshot of the result
+            (:data:`~core.stt_pool.engine_api.MEMORY_SNAPSHOT_KEYS`), or
+            ``None`` when the result carried none.
+        job_peak_bytes: ``PeakJobMemoryUsed`` of the worker's Job Object when
+            the result was published (the peak over the worker's life so far),
+            or ``None`` when unknown.
+
+    """
+
+    memory: Mapping[str, int | None] | None = None
+    job_peak_bytes: int | None = None
+
+    def log_fields(self) -> str:
+        """Return the figures as ``key=value`` pairs (``None`` when unknown)."""
+        memory = self.memory or {}
+        pairs = [f"{key}={memory.get(key)}" for key in MEMORY_SNAPSHOT_KEYS]
+        pairs.append(f"job_peak_bytes={self.job_peak_bytes}")
+        return " ".join(pairs)
+
+
+_NO_TELEMETRY = _Telemetry()
 
 
 @dataclass(slots=True, eq=False)
@@ -566,6 +593,7 @@ class _Unpublished:
     key_label: str | None
     give_up_at: float
     failures: int = 1
+    telemetry: _Telemetry = _NO_TELEMETRY
 
 
 @dataclass(slots=True, eq=False)
@@ -595,17 +623,28 @@ class _Worker:
 
     Lifecycle: ``spawning`` (process started) -> ``loading`` (``hello``) ->
     ``ready`` (``loaded``) -> optionally ``retiring`` (after a CUDA OOM or a
-    commit-cap failure of a job, or when its Job Object reported the commit
-    cap while it was ready) -> ``stopping`` (``shutdown`` sent or the process
-    killed) -> removed once its exit is confirmed and the handle is
-    closed. ``stop_reason`` marks a stop the supervisor asked for and
-    ``kill_reason`` why it killed the process; both decide how the exit is
-    classified (:func:`_exit_kind`). ``load_failure_recorded`` marks a worker
-    whose failed cold load already started its key's cooldown; no worker of
-    that key is spawned until its exit is confirmed. ``commit_bumped`` and
-    ``vram_bumped`` mark the x1.25 growth of the key's commit and VRAM
-    estimates this worker already caused (each at most once per worker, see
-    :meth:`_Supervisor._bump_memory_once`).
+    commit-cap failure of a job, when its Job Object reported the commit cap
+    while it was ready and the cap was not raised live, when its own commit
+    reached the recycle threshold, or when its uptime reached
+    ``lifecycle.worker_max_uptime_h``) -> ``stopping`` (``shutdown`` sent
+    or the process killed) -> removed once its exit is confirmed and the
+    handle is closed. ``stop_reason`` marks a stop the supervisor asked for
+    and ``kill_reason`` why it killed the process; both decide how the exit
+    is classified (:func:`_exit_kind`). ``load_failure_recorded`` marks a
+    worker whose failed cold load already started its key's cooldown; no
+    worker of that key is spawned until its exit is confirmed.
+    ``commit_bumped`` and ``vram_bumped`` mark the x1.25 growth of the key's
+    commit and VRAM estimates this worker already caused (each at most once
+    per worker, see :meth:`_Supervisor._bump_memory_once`).
+
+    Commit-cap reports: ``cap_events`` counts the report events handled and
+    ``cap_hits_seen`` the reports already acted on (the handle counts them
+    too, see :meth:`_Supervisor._cap_hits`). ``reservation`` is replaced
+    when the job cap is raised live (at most once: ``cap_raised_at`` is set);
+    ``cap_hits_at_raise`` is the report count at that moment,
+    ``pre_raise_attempts`` the attempts that ran then, whose failures still
+    count as commit-cap failures, and ``pre_raise_limit_bytes`` the job cap
+    they ran under.
     """
 
     worker_id: str
@@ -630,6 +669,12 @@ class _Worker:
     load_failure_recorded: bool = False
     commit_bumped: bool = False
     vram_bumped: bool = False
+    cap_events: int = 0
+    cap_hits_seen: int = 0
+    cap_raised_at: float | None = None
+    cap_hits_at_raise: int = 0
+    pre_raise_attempts: frozenset[str] = frozenset()
+    pre_raise_limit_bytes: int = 0
 
 
 @dataclass(slots=True)
@@ -834,14 +879,24 @@ def _cap_failure(
 # * stop and cancel timeouts; build a SchedulerState and execute the plan in
 # * order (Reject, Stop, Assign, Spawn); save estimates when due; beat the
 # * heart. A commit-cap report of a worker's Job Object grows its key's commit
-# * estimate and retires the worker when it is ready; a ``transcribe_failed``
-# * attempt of that worker (unless its cancel is pending) retries like a
+# * estimate; a ready worker's first report raises its live job cap once to
+# * the grown reservation when it names a child process (Windows notifies
+# * only a process's first denial, so a denied worker process could not report
+# * a second hit) and the commit budget and the free-commit guard allow it
+# * (the worker keeps serving), otherwise, and on any later report, the ready
+# * worker retires. A ``transcribe_failed`` attempt that ran under a
+# * reported cap (unless its cancel is pending) retries like a
 # * ``memory_limit`` error, while its successes and other error kinds keep
-# * their handling. Job fate after a worker exit (``_settle_jobs``): a
-# * pending cancel wins; victims of a supervisor stop or of a kill caused by
-# * another job get their attempt back; a crash costs the attempt (retry while
-# * attempts last); a crash that hit the commit cap pins the re-queued jobs to
-# * the worker's backend (victims are never pinned).
+# * their handling; the failure of an attempt the raise covered does not
+# * retire the worker. A ready worker whose own commit in a result snapshot
+# * reaches ``memory.recycle_commit_fraction`` of its commit reservation
+# * retires too, and so does a ready worker whose uptime since spawn reaches
+# * ``lifecycle.worker_max_uptime_h``. Job fate after a worker exit
+# * (``_settle_jobs``): a pending cancel wins; victims of a supervisor stop or
+# * of a kill caused by another job get their attempt back; a crash costs the
+# * attempt (retry while attempts last); a crash that hit the commit cap (after
+# * a live raise: the raised cap) pins the re-queued jobs to the worker's
+# * backend (victims are never pinned).
 
 
 class _Supervisor:
@@ -1065,7 +1120,8 @@ class _Supervisor:
             logger.debug("event of a released worker ignored: %s", event.worker_id)
             return
         if isinstance(event, _MemoryLimitEvent):
-            self._on_memory_limit_event(worker, event.pid)
+            worker.cap_events += 1
+            self._note_cap_hits(worker, self._clock(), pid=event.pid)
             return
         message = event.message
         if message is None:
@@ -1085,33 +1141,219 @@ class _Supervisor:
             worker.bye = True
             logger.info("worker said bye: worker_id=%s", worker.worker_id)
 
-    def _on_memory_limit_event(self, worker: _Worker, pid: int) -> None:
-        """Handle the commit-cap report of a worker's Job Object.
+    def _note_cap_hits(
+        self, worker: _Worker, now: float, *, pid: int | None = None
+    ) -> None:
+        """Act once on every commit-cap report of a worker's Job Object.
+
+        Runs for the report's event and before each result of the worker: the
+        handle counts a report on its monitor thread before the event is
+        queued, so a result that overtakes the event still sees the report,
+        and the report is acted on before the result is classified.
 
         The report names the process whose allocation failed: the worker or a
         child such as ffmpeg, which shares the job's cap. Either way the
         worker's reservation proved too small, so the key's commit estimate
         grows x1.25 at once (at most once per worker) and the next worker
-        reserves more. A ready worker retires: it takes no new jobs and stops
-        once idle. A worker still loading keeps loading and serves once
-        loaded, so a key whose estimate cannot grow any further still makes
-        progress instead of respawning in a loop. Its ``transcribe_failed``
-        results are retried as ``memory_limit`` by :meth:`_on_result`.
+        reserves more. A ready worker's first report, when it names a child
+        process, raises its live job cap to the grown reservation
+        (:meth:`_raise_job_cap`) and the worker keeps serving; when the raise
+        is disabled or blocked (the worker process itself was denied
+        included), and on any later report, a ready worker retires: it takes
+        no new jobs and stops once idle. A worker still loading keeps loading
+        and serves once loaded, so a key whose estimate cannot grow any
+        further still makes progress instead of respawning in a loop.
+        ``transcribe_failed`` results of capped attempts are retried as
+        ``memory_limit`` by :meth:`_on_result`.
+
+        Args:
+            worker: Worker whose Job Object may have reported its cap.
+            now: Current clock value.
+            pid: Process the report named, when an event carried it.
+
         """
+        hits = self._cap_hits(worker)
+        if hits <= worker.cap_hits_seen:
+            return
+        worker.cap_hits_seen = hits
         worker.memory_limit_reported = True
+        if pid is None:
+            pid = worker.proc.memory_limit_pid
         logger.warning(
-            "worker reached its commit cap: worker_id=%s key=%s pid=%d limit_bytes=%d "
-            "commit_bytes=%d state=%s",
+            "worker reached its commit cap: worker_id=%s key=%s pid=%s hits=%d "
+            "limit_bytes=%d commit_bytes=%d state=%s",
             worker.worker_id,
             worker.key.label,
             pid,
+            hits,
             self._job_limit_bytes(worker.reservation),
             worker.reservation.commit_bytes,
             worker.state,
         )
+        if (
+            worker.state == "ready"
+            and worker.cap_raised_at is None
+            and hits == 1
+            and self._raise_job_cap(worker, hits, pid, now)
+        ):
+            return
         if worker.state == "ready":
             worker.state = "retiring"
         self._bump_memory_once(worker, vram=False, reason="job object commit cap")
+
+    def _raise_job_cap(
+        self, worker: _Worker, hits: int, pid: int | None, now: float
+    ) -> bool:
+        """Raise a ready worker's live job cap once, to the grown reservation.
+
+        The key's commit estimate grows first (:meth:`_bump_memory_once`), and
+        the worker's new commit reservation is exactly what a fresh worker of
+        the same capacity would reserve now
+        (:func:`~core.stt_pool.scheduler.reservation_for`), so it never exceeds
+        the estimate ceiling. The raise needs the report to name a child
+        process (:meth:`_raise_blockers`) and the growth to fit the commit
+        budget, the free-commit guard and the critical free commit. Only then
+        does the Job Object get the new cap (reservation plus child headroom;
+        its other limits stay and the one-shot report is re-armed), and the
+        new reservation replaces the old one for every later accounting:
+        admission, exit classification, crash details and the heartbeat.
+
+        Args:
+            worker: Ready worker with its first commit-cap report.
+            hits: The worker's report count (``1``).
+            pid: Process the report named, or ``None`` when unknown.
+            now: Current clock value.
+
+        Returns:
+            ``True`` when the cap was raised; ``False`` when the raise is
+            disabled (``memory.live_cap_raise``), the worker has no cap, or
+            the raise was blocked (logged with the reasons).
+
+        """
+        old = worker.reservation
+        if not self._config.memory.live_cap_raise or old.commit_bytes <= 0:
+            return False
+        self._bump_memory_once(worker, vram=False, reason="job object commit cap")
+        estimate = self._estimates.estimate(worker.key)
+        commit = reservation_for(
+            worker.key, worker.capacity, estimate, self._limits
+        ).commit_bytes
+        grown = replace(old, commit_bytes=commit)
+        limit = self._job_limit_bytes(grown)
+        reasons = self._raise_blockers(worker, commit, pid, now)
+        if not reasons and not worker.proc.raise_memory_limit(limit):
+            reasons = ("the Job Object commit cap could not be changed",)
+        if reasons:
+            logger.warning(
+                "live commit cap raise blocked; worker retiring: worker_id=%s key=%s "
+                "commit_bytes=%d grown_commit_bytes=%d reasons=%s",
+                worker.worker_id,
+                worker.key.label,
+                old.commit_bytes,
+                commit,
+                "; ".join(reasons),
+            )
+            return False
+        worker.pre_raise_limit_bytes = self._job_limit_bytes(old)
+        worker.reservation = grown
+        worker.cap_raised_at = now
+        worker.cap_hits_at_raise = hits
+        worker.pre_raise_attempts = frozenset(
+            attempt_id
+            for job_id in worker.running
+            if (job := self._jobs.get(job_id)) is not None
+            and (attempt_id := job.attempt_id) is not None
+        )
+        logger.warning(
+            "worker commit cap raised live; worker keeps serving: worker_id=%s "
+            "key=%s old_commit_bytes=%d commit_bytes=%d job_limit_bytes=%d "
+            "running=%d",
+            worker.worker_id,
+            worker.key.label,
+            old.commit_bytes,
+            grown.commit_bytes,
+            limit,
+            len(worker.running),
+        )
+        return True
+
+    def _raise_blockers(
+        self, worker: _Worker, commit: int, pid: int | None, now: float
+    ) -> tuple[str, ...]:
+        """Return why a worker's job cap cannot be raised to *commit* plus headroom.
+
+        Windows notifies only the first denied allocation of each process of
+        a job (:class:`~core.stt_pool.winjob.WorkerJob`). When the worker
+        process itself was denied (or the report named no process), a hit of
+        the raised cap by the worker would never be reported, so the raise is
+        refused and the worker retires as before. A child (ffmpeg) denial
+        leaves the worker's own notification unused, and every later child is
+        a new process, so a second hit is still reported. The growth itself
+        must pass :func:`~core.stt_pool.scheduler.commit_growth_blockers` and
+        stay above the current reservation (the estimate is not at its
+        ceiling).
+
+        Args:
+            worker: Ready worker with its first commit-cap report.
+            commit: Commit reservation the raise would set.
+            pid: Process the report named, or ``None`` when unknown.
+            now: Current clock value.
+
+        Returns:
+            The blocking reasons; empty when the raise may proceed.
+
+        """
+        if pid is None or pid <= 0 or pid == worker.proc.pid:
+            return (
+                "the worker process itself reached the cap, and Windows reports "
+                "only the first denial of a process",
+            )
+        if commit <= worker.reservation.commit_bytes:
+            return ("the commit estimate of the key cannot grow (at its ceiling)",)
+        return commit_growth_blockers(
+            self._scheduler_state(now), worker.worker_id, commit
+        )
+
+    def _check_recycle(
+        self, worker: _Worker, memory: Mapping[str, int | None] | None
+    ) -> None:
+        """Retire a ready worker whose own commit reached its recycle threshold.
+
+        The threshold is ``memory.recycle_commit_fraction`` of the worker's
+        commit reservation (the raised one after a live raise); the measure
+        is ``private_bytes`` of the worker process in a result snapshot, so
+        its children are not counted. A retiring worker takes no new jobs, so
+        under continuous load it finishes its running jobs, becomes idle and
+        stops; the waiting jobs get a fresh worker. A snapshot without private
+        bytes, a worker without a commit reservation and a worker that is not
+        ready change nothing.
+
+        Args:
+            worker: Worker that sent a result.
+            memory: The result's memory snapshot, or ``None``.
+
+        """
+        fraction = self._config.memory.recycle_commit_fraction
+        reserved = worker.reservation.commit_bytes
+        if fraction <= 0 or memory is None or worker.state != "ready" or reserved <= 0:
+            return
+        private = memory.get("private_bytes")
+        threshold = int(fraction * reserved)
+        if private is None or private < threshold:
+            return
+        worker.state = "retiring"
+        logger.warning(
+            "worker retiring: its own commit reached the recycle threshold: "
+            "worker_id=%s key=%s private_bytes=%d threshold_bytes=%d "
+            "commit_bytes=%d job_limit_bytes=%d running=%d",
+            worker.worker_id,
+            worker.key.label,
+            private,
+            threshold,
+            reserved,
+            self._job_limit_bytes(worker.reservation),
+            len(worker.running),
+        )
 
     def _on_hello(self, worker: _Worker, message: Mapping[str, object]) -> None:
         """Record the handshake; the cold load is in progress from here on."""
@@ -1209,10 +1451,19 @@ class _Supervisor:
     def _on_result(
         self, worker: _Worker, message: Mapping[str, object], now: float
     ) -> None:
-        """Handle a ``result`` of the current attempt; ignore late replies."""
+        """Handle a ``result`` of the current attempt; ignore late replies.
+
+        Every parsed result first lets a pending commit-cap report act (a raise
+        or a retirement, :meth:`_note_cap_hits`) and then checks the worker's
+        own commit against its recycle threshold (:meth:`_check_recycle`),
+        late replies included, because the snapshot measures the worker as it
+        is now.
+        """
         result = self._parse_result(worker, message)
         if result is None:
             return
+        self._note_cap_hits(worker, now)
+        self._check_recycle(worker, result.memory)
         job = self._jobs.get(result.job_id)
         if (
             job is None
@@ -1237,12 +1488,17 @@ class _Supervisor:
             result.status == "error"
             and result.error_kind == ERROR_KIND_TRANSCRIBE_FAILED
             and job.cancel_reason is None
-            and self._cap_reported(worker)
+            and self._ran_under_reported_cap(worker, job)
         ):
             # * The failing allocation may have been in a child (ffmpeg) whose
             # * failure reached the engine as an unclassified error; every other
-            # * error kind keeps its own classification.
-            limit = self._job_limit_bytes(worker.reservation)
+            # * error kind keeps its own classification. An attempt covered by
+            # * a live raise failed under the cap it ran with, the old one.
+            limit = (
+                worker.pre_raise_limit_bytes
+                if self._raise_covers(worker, job)
+                else self._job_limit_bytes(worker.reservation)
+            )
             failure = _cap_failure(worker, result, limit)
             self._on_resource_error(job, worker, failure, now)
         else:
@@ -1258,6 +1514,7 @@ class _Supervisor:
                 error_detail=result.error_detail,
                 run_s=result.run_s,
                 data=result.data if succeeded else None,
+                memory=result.memory,
             )
             self._publish(job, outcome, worker=worker, now=now)
 
@@ -1302,7 +1559,12 @@ class _Supervisor:
         """
         reason = job.cancel_reason
         if reason is not None:
-            outcome = _Outcome(status=reason, error_kind=reason, run_s=result.run_s)
+            outcome = _Outcome(
+                status=reason,
+                error_kind=reason,
+                run_s=result.run_s,
+                memory=result.memory,
+            )
             self._publish(job, outcome, worker=worker, now=now)
             return
         logger.warning(
@@ -1324,6 +1586,7 @@ class _Supervisor:
                 error_kind=ERROR_KIND_CANCELLED,
                 error_detail=detail,
                 run_s=result.run_s,
+                memory=result.memory,
             )
             self._publish(job, outcome, worker=worker, now=now)
 
@@ -1341,19 +1604,29 @@ class _Supervisor:
         worker. A commit-cap failure pins the job to the backend it failed on,
         ``auto`` jobs included, and retries on a fresh worker of the same key.
         Without attempts left the error is published.
+
+        A commit-cap failure of an attempt that ran when the worker's job cap
+        was raised live (:meth:`_raise_covers`) neither retires the worker nor
+        grows the estimate again (the raise did): the job retries the same
+        way and may run on the raised worker again.
         """
-        if worker.state == "ready":
+        covered = result.error_kind == ERROR_KIND_MEMORY_LIMIT and self._raise_covers(
+            worker, job
+        )
+        if not covered and worker.state == "ready":
             worker.state = "retiring"
         logger.warning(
-            "job hit a resource limit; worker retiring: job_id=%s worker_id=%s "
-            "key=%s error_kind=%s attempts=%d",
+            "job hit a resource limit; worker %s: job_id=%s worker_id=%s "
+            "key=%s error_kind=%s attempts=%d %s",
+            "keeps serving under its raised cap" if covered else "retiring",
             job.job_id,
             worker.worker_id,
             worker.key.label,
             result.error_kind,
             job.attempts,
+            _Telemetry(result.memory, worker.proc.peak_memory_bytes()).log_fields(),
         )
-        if result.error_kind == ERROR_KIND_MEMORY_LIMIT:
+        if result.error_kind == ERROR_KIND_MEMORY_LIMIT and not covered:
             self._bump_memory_once(worker, vram=False, reason="job memory_limit")
         elif result.error_kind == ERROR_KIND_CUDA_OOM and worker.key.backend == "gpu":
             self._bump_memory_once(worker, vram=True, reason="job cuda_oom")
@@ -1373,6 +1646,7 @@ class _Supervisor:
             error_kind=result.error_kind,
             error_detail=result.error_detail,
             run_s=result.run_s,
+            memory=result.memory,
         )
         self._publish(job, outcome, worker=worker, now=now)
 
@@ -1399,9 +1673,16 @@ class _Supervisor:
     def _publish(
         self, job: _Job, outcome: _Outcome, *, worker: _Worker | None, now: float
     ) -> None:
-        """Publish the terminal result of an admitted job and forget the job."""
+        """Publish the terminal result of an admitted job and forget the job.
+
+        The worker's memory snapshot of the result and its Job Object's peak
+        so far are logged with the publication (``result published``).
+        """
         start = job.started_at if job.started_at is not None else now
         queued_s = max(0.0, start - job.record.submitted_at)
+        telemetry = _NO_TELEMETRY
+        if worker is not None:
+            telemetry = _Telemetry(outcome.memory, worker.proc.peak_memory_bytes())
         self._detach(job, now)
         self._jobs.pop(job.job_id, None)
         record = ResultRecord(
@@ -1424,6 +1705,7 @@ class _Supervisor:
             key_label=worker.key.label if worker else None,
             now=now,
             deadline_at=job.record.deadline_at,
+            telemetry=telemetry,
         )
 
     def _publish_file(
@@ -1447,22 +1729,27 @@ class _Supervisor:
         key_label: str | None,
         now: float,
         deadline_at: float | None,
+        telemetry: _Telemetry = _NO_TELEMETRY,
     ) -> None:
         """Write a result once; on failure keep it for retries on later ticks.
 
         The job files are deleted and the job is remembered as done only after
         the result is on disk (or the retries gave up), so a computed result is
         not lost to a transient write failure and its job is never re-run.
+        *telemetry* is logged with the publication, also after a retry.
         """
         error = self._try_write_result(record)
         if error is None:
-            self._finish_terminal(record, key_label=key_label)
+            self._finish_terminal(record, key_label=key_label, telemetry=telemetry)
             return
         give_up_at = now + max(0.0, self._options.result_retry_s)
         if deadline_at is not None:
             give_up_at = max(give_up_at, deadline_at)
         self._unpublished[record.job_id] = _Unpublished(
-            record=record, key_label=key_label, give_up_at=give_up_at
+            record=record,
+            key_label=key_label,
+            give_up_at=give_up_at,
+            telemetry=telemetry,
         )
         logger.warning(
             "cannot write result; retrying every tick for %.0f s: job_id=%s "
@@ -1502,7 +1789,9 @@ class _Supervisor:
                     entry.failures,
                     job_id,
                 )
-                self._finish_terminal(entry.record, key_label=entry.key_label)
+                self._finish_terminal(
+                    entry.record, key_label=entry.key_label, telemetry=entry.telemetry
+                )
                 continue
             entry.failures += 1
             if final:
@@ -1534,19 +1823,31 @@ class _Supervisor:
                     error,
                 )
 
-    def _finish_terminal(self, record: ResultRecord, *, key_label: str | None) -> None:
-        """Delete the job files of a written result and remember the job as done."""
+    def _finish_terminal(
+        self,
+        record: ResultRecord,
+        *,
+        key_label: str | None,
+        telemetry: _Telemetry = _NO_TELEMETRY,
+    ) -> None:
+        """Delete the job files of a written result and remember the job as done.
+
+        The ``result published`` line ends with the memory figures of
+        *telemetry* (``None`` for an unknown figure, for example the CUDA
+        figures of a CPU worker or every figure of a never admitted job).
+        """
         delete_job_files(self._paths, record.job_id)
         self._remember_terminal(record.job_id)
         logger.info(
             "result published: job_id=%s status=%s error_kind=%s worker_id=%s "
-            "key=%s attempts=%d",
+            "key=%s attempts=%d %s",
             record.job_id,
             record.status,
             record.error_kind,
             record.worker_id,
             key_label,
             record.attempts,
+            telemetry.log_fields(),
         )
 
     def _remember_terminal(self, job_id: str) -> None:
@@ -2087,7 +2388,9 @@ class _Supervisor:
             threads_per_slot=threads_for(key, self._limits),
             host_threads=action.reservation.host_threads,
             device=device_for_backend(key.backend),
-            options=self._spec_options(key, action.capacity),
+            options=worker_spec_options(
+                self._config, self._limits, key, action.capacity, action.reservation
+            ),
             engine_factory=self._options.engine_factory,
         )
         proc = self._start_process(spec, action.reservation)
@@ -2151,7 +2454,10 @@ class _Supervisor:
         try:
             proc = WorkerProcess(
                 spec.worker_id,
-                self._launch(key, self._thread_env(key, reservation)),
+                self._launch(
+                    key,
+                    worker_environment(self._config, self._limits, key, reservation),
+                ),
                 log_path=self._paths.worker_log(spec.worker_id),
                 memory_limit_bytes=limit if limit > 0 else None,
                 on_event=self._on_worker_event,
@@ -2178,44 +2484,6 @@ class _Supervisor:
             proc.close(timeout_s=CLOSE_TIMEOUT_S)
             return None
         return proc
-
-    def _spec_options(self, key: WorkerKey, capacity: int) -> dict[str, object]:
-        """Return the engine options of a worker ``spec`` (spec 6.3).
-
-        A GPU worker batches as many lanes as the capacity it was granted: its
-        VRAM and commit reservation is sized for that capacity, which can be
-        below the configured lanes when the budgets are tight. CPU engines run
-        ``capacity`` slots and take no lane count. A speaker diarization
-        worker gets no speech-to-text options: only its compute type, the
-        threads of its slot (``diarization.threads_per_slot``, the same value
-        as the spec's ``threads_per_slot``) and the priority aging.
-        """
-        if worker_kind(key.provider) == "diarize":
-            return {
-                "compute_type": key.compute_type,
-                "threads_per_slot": threads_for(key, self._limits),
-                "priority_aging_s": self._config.scheduling.priority_aging_s,
-            }
-        family = provider_family(key.provider)
-        return {
-            "whisper_model": key.model if family == "whisper" else None,
-            "compute_type": key.compute_type,
-            "batch_lanes": capacity if key.backend == "gpu" else None,
-            "whisper_batch_max_clip_s": WHISPER_BATCH_MAX_CLIP_S,
-            "priority_aging_s": self._config.scheduling.priority_aging_s,
-        }
-
-    def _thread_env(self, key: WorkerKey, reservation: Reservation) -> dict[str, str]:
-        """Return the BLAS/OpenMP thread caps of a worker process.
-
-        GPU workers get their reserved host threads; CPU workers the threads of
-        one slot of their key (:func:`~core.stt_pool.scheduler.threads_for`).
-        """
-        if key.backend == "gpu":
-            threads = max(1, reservation.host_threads)
-        else:
-            threads = max(1, threads_for(key, self._limits))
-        return dict.fromkeys(_THREAD_ENV_VARS, str(threads))
 
     def _launch(self, key: WorkerKey, env: Mapping[str, str]) -> WorkerLaunch:
         """Return the launch of a worker (injected or production)."""
@@ -2319,18 +2587,65 @@ class _Supervisor:
             limit_hit,
         )
 
-    @staticmethod
-    def _cap_reported(worker: _Worker) -> bool:
-        """Return whether the worker's Job Object reported its commit cap.
+    def _cap_reported(self, worker: _Worker) -> bool:
+        """Return whether the worker's Job Object reported its current commit cap.
 
         The handle's flag is set on the monitor thread before the event is
         queued, so it also covers a report whose event is still waiting behind
-        the worker's result.
+        the worker's result. After a live raise only a report of the raised
+        cap counts: the report that led to the raise was answered by it, so a
+        later unrelated exit is not blamed on memory (its failed pre-raise
+        attempts already retried, see :meth:`_raise_covers`).
         """
+        if worker.cap_raised_at is not None:
+            return self._cap_hits(worker) > worker.cap_hits_at_raise
         return worker.memory_limit_reported or worker.proc.memory_limit_hit
 
+    @staticmethod
+    def _cap_hits(worker: _Worker) -> int:
+        """Return how many commit-cap reports the worker's Job Object made.
+
+        The handle counts a report on its monitor thread before the event is
+        queued, so the count also covers reports whose events still wait.
+        """
+        return max(worker.cap_events, worker.proc.memory_limit_hits)
+
+    def _raise_covers(self, worker: _Worker, job: _Job) -> bool:
+        """Return whether *job*'s attempt ran when the worker's cap was raised live.
+
+        Such an attempt may have failed under the old cap, and no report of
+        the raised cap followed: its failure does not retire the worker.
+        """
+        return (
+            worker.cap_raised_at is not None
+            and self._cap_hits(worker) <= worker.cap_hits_at_raise
+            and job.attempt_id in worker.pre_raise_attempts
+        )
+
+    def _ran_under_reported_cap(self, worker: _Worker, job: _Job) -> bool:
+        """Return whether *job*'s attempt ran under a commit cap that was reported.
+
+        Without a live raise any report of the worker counts. After a raise, a
+        report of the raised cap counts for every attempt, and the report
+        that led to the raise only for the attempts that ran at the raise
+        (the raise does not erase their failure).
+        """
+        hits = self._cap_hits(worker)
+        if hits == 0:
+            return False
+        if worker.cap_raised_at is None or hits > worker.cap_hits_at_raise:
+            return True
+        return job.attempt_id in worker.pre_raise_attempts
+
     def _memory_limit_hit(self, worker: _Worker, peak: int | None) -> bool:
-        """Return whether the worker reached its Job Object commit cap."""
+        """Return whether the worker reached its Job Object commit cap.
+
+        A report of the current cap (:meth:`_cap_reported`; after a live raise,
+        a report of the raised cap) or a peak at
+        :data:`MEMORY_LIMIT_PEAK_RATIO` of the current (raised) cap counts.
+        The verdict decides how an exit is classified and whether its
+        re-queued jobs are pinned to the worker's backend.
+        """
         if self._cap_reported(worker):
             return True
         limit = self._job_limit_bytes(worker.reservation)
@@ -2535,13 +2850,47 @@ class _Supervisor:
     # * Housekeeping.
 
     def _housekeeping(self, now: float, mono: float) -> None:
-        """Enforce load, stop and cancel timeouts and run periodic purges."""
+        """Enforce load, stop and cancel timeouts, the uptime cap and purges."""
         for worker in list(self._workers.values()):
+            self._check_max_uptime(worker, now)
             self._check_worker_timers(worker, now, mono)
         self._check_cancel_grace(now)
         if mono >= self._next_purge:
             self._next_purge = mono + self._options.purge_interval_s
             self._housekeep_files()
+
+    def _check_max_uptime(self, worker: _Worker, now: float) -> None:
+        """Retire a ready worker whose uptime since spawn reached the cap.
+
+        ``lifecycle.worker_max_uptime_h`` bounds whatever growth no other
+        limit covers (the CUDA context, CTranslate2's own allocator, native
+        leaks below the recycle threshold). A retiring worker takes no new
+        jobs, finishes the running ones and stops once idle, so no job is
+        interrupted; the uptime counts from the spawn and a worker leaves
+        ``ready`` once, so each worker is replaced at most once per uptime
+        cap. ``0`` disables the cap.
+
+        Args:
+            worker: Worker to check.
+            now: Current clock value.
+
+        """
+        max_uptime = self._config.lifecycle.worker_max_uptime_s
+        if max_uptime <= 0 or worker.state != "ready":
+            return
+        uptime = now - worker.spawned_at
+        if uptime < max_uptime:
+            return
+        worker.state = "retiring"
+        logger.info(
+            "worker retiring: it reached the maximum uptime: worker_id=%s key=%s "
+            "uptime_s=%.0f max_uptime_s=%.0f running=%d",
+            worker.worker_id,
+            worker.key.label,
+            uptime,
+            max_uptime,
+            len(worker.running),
+        )
 
     def _check_worker_timers(self, worker: _Worker, now: float, mono: float) -> None:
         """Kill a worker past its load or stop deadline; finalize a lost exit."""
@@ -2640,6 +2989,10 @@ class _Supervisor:
                     "capacity": worker.capacity,
                     "running": len(worker.running),
                     "pid": worker.proc.pid,
+                    "spawned_at": worker.spawned_at,
+                    "commit_bytes": worker.reservation.commit_bytes,
+                    "job_limit_bytes": self._job_limit_bytes(worker.reservation),
+                    "cap_raised": worker.cap_raised_at is not None,
                 }
                 for worker in self._workers.values()
             ],

@@ -13,6 +13,10 @@ Behavior is controlled through environment variables (inherited from the test).
 * ``FAKE_DIR`` - directory for markers: ``worker-<child>.pid`` (interpreter pid),
   ``grandchild-<child>.pid``, ``order.txt`` (one config name per load), and
   ``summary-<child>.json`` written on close (load count, peak thread overlap).
+  Each ``<kind>-<child>.pid`` has a ``<kind>-<child>.created`` twin holding the
+  creation time of that process, recorded while it is certainly the process: a
+  pid file outlives its process, only the creation time tells it from a stranger
+  that took over the pid.
 * ``FAKE_LOAD_S`` - comma list of load seconds, indexed by child index.
 * ``FAKE_LOAD_FAIL`` - raise while loading.
 * ``FAKE_ITEM_S`` - seconds one ``transcribe`` call takes.
@@ -40,6 +44,8 @@ import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+import psutil
 
 _ROOT = Path(__file__).resolve().parents[1]
 for _path in (_ROOT, _ROOT / "tools"):
@@ -89,17 +95,28 @@ class FakeEngine:
                 self._memory.append(bytearray(block_mb * 1024**2))
                 retained_mb += block_mb
 
+    def _record_process(self, kind: str, pid: int) -> None:
+        """Publish *pid* as ``<kind>-<child>.pid`` with its creation time beside it.
+
+        The creation time goes first, so a reader that finds the pid file finds the
+        identity of the process that wrote it.
+        """
+        index = self._spec.child_index
+        created = psutil.Process(pid).create_time()
+        (self._dir / f"{kind}-{index}.created").write_text(repr(created))
+        (self._dir / f"{kind}-{index}.pid").write_text(str(pid))
+
     def load(self) -> dict[str, object]:
         """Record the load, optionally start a grandchild, sleep, or fail."""
         index = self._spec.child_index
-        (self._dir / f"worker-{index}.pid").write_text(str(os.getpid()))
+        self._record_process("worker", os.getpid())
         with (self._dir / "order.txt").open("a", encoding="utf-8") as handle:
             handle.write(self._spec.config.name + "\n")
         if os.environ.get("FAKE_GRANDCHILD"):
             grandchild = subprocess.Popen(  # noqa: S603
                 [sys.executable, "-c", f"import time; time.sleep({_HANG_S})"],
             )
-            (self._dir / f"grandchild-{index}.pid").write_text(str(grandchild.pid))
+            self._record_process("grandchild", grandchild.pid)
         delays = [float(x) for x in os.environ.get("FAKE_LOAD_S", "0").split(",")]
         time.sleep(delays[index % len(delays)])
         if os.environ.get("FAKE_LOAD_FAIL"):

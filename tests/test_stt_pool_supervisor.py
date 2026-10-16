@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import ctypes
+import logging
 import os
+import queue
+import re
 import sys
 import threading
 import time
 from dataclasses import replace
+from logging.handlers import QueueHandler
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -16,7 +20,7 @@ import pytest
 
 from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import fsio, winjob
-from core.stt_pool.estimates import EstimateStore
+from core.stt_pool.estimates import EstimateStore, seed_estimate
 from core.stt_pool.keys import make_key
 from core.stt_pool.queue import (
     JobOptions,
@@ -31,7 +35,7 @@ from core.stt_pool.queue import (
 from core.stt_pool.supervisor import run_supervisor
 from core.stt_pool.sysprobe import hardware_fingerprint
 from tests.stt_pool_supervisor_support import GIB, SupervisorHarness, configuration
-from tests.stt_pool_windows_support import WinEvent
+from tests.stt_pool_windows_support import JobCapKernel, WinEvent
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -40,6 +44,309 @@ if TYPE_CHECKING:
     from core.stt_pool.procs import WorkerLaunch
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group(name="pool_supervisor")]
+
+
+@pytest.fixture
+def memory_logs() -> Iterator[queue.Queue[logging.LogRecord]]:
+    """Observe publication without scheduling sleeps or assertions on log prose."""
+    records: queue.Queue[logging.LogRecord] = queue.Queue()
+    handler = QueueHandler(records)
+    logger = logging.getLogger("core.stt_pool.supervisor")
+    logger.addHandler(handler)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        handler.close()
+
+
+def _memory_log_fields(
+    records: queue.Queue[logging.LogRecord], job_id: str
+) -> dict[str, str]:
+    """Await memory facts at the external logging boundary with a hang deadline."""
+    deadline = time.monotonic() + 30
+    while True:
+        record = records.get(timeout=max(0.0, deadline - time.monotonic()))
+        fields = dict(re.findall(r"\b([a-z_]+)=([^\s]+)", record.getMessage()))
+        if fields.get("job_id") == job_id and "job_peak_bytes" in fields:
+            return fields
+
+
+@pytest.mark.parametrize("source", ["cpu", "cuda", "malformed", "not_an_object"])
+@pytest.mark.parametrize("outcome", ["ok", "memory_limit"])
+def test_worker_memory_facts_survive_publication_and_resource_errors(
+    pool: SupervisorHarness,
+    memory_logs: queue.Queue[logging.LogRecord],
+    source: str,
+    outcome: str,
+) -> None:
+    """Catch telemetry breaking results, resource diagnostics or CUDA isolation."""
+    pool.config = configuration(scheduling={"max_attempts": 1})
+    marker = pool.engine_root / "unexpected-cuda-access"
+    pool.plan(
+        memory_probe="initialized" if source == "cuda" else "uninitialized",
+        cuda_marker=str(marker),
+    )
+    options: dict[str, object] = {}
+    if source == "malformed":
+        options["memory"] = {
+            "private_bytes": -1,
+            "cuda_reserved_bytes": True,
+            "cuda_allocated_bytes": 2048,
+            "cuda_max_reserved_bytes": "bad",
+            "cufft_plan_cache_size": [],
+            "unknown": 99,
+        }
+    elif source == "not_an_object":
+        options["wire_memory"] = []
+    job = pool.job(mode=outcome, **options)
+    pool.start()
+    fields = _memory_log_fields(memory_logs, job.job_id)
+    if outcome == "memory_limit":
+        assert fields["error_kind"] == "memory_limit"
+        assert "status" not in fields
+        publication = _memory_log_fields(memory_logs, job.job_id)
+        assert all(
+            publication[key] == value
+            for key, value in fields.items()
+            if key != "job_peak_bytes"
+        )
+        fields = publication
+    assert "status" in fields
+    result = read_result(pool.paths, job.job_id)
+    assert result is not None
+    assert result.attempts == 1
+    assert result.status == ("ok" if outcome == "ok" else "error")
+    if outcome == "ok":
+        assert result.text == Path(job.input_path).stem
+    else:
+        assert result.error_kind == "memory_limit"
+    if source in {"malformed", "not_an_object"}:
+        assert fields["private_bytes"] == "None"
+        assert fields["cuda_allocated_bytes"] == (
+            "2048" if source == "malformed" else "None"
+        )
+    else:
+        if sys.platform == "win32":
+            assert int(fields["private_bytes"]) > 0
+        else:
+            assert fields["private_bytes"] == "None"
+        assert fields["cuda_allocated_bytes"] == (
+            "1024" if source == "cuda" else "None"
+        )
+    assert fields["cuda_reserved_bytes"] == ("8192" if source == "cuda" else "None")
+    assert fields["cuda_max_reserved_bytes"] == (
+        "16384" if source == "cuda" else "None"
+    )
+    assert fields["cufft_plan_cache_size"] == ("7" if source == "cuda" else "None")
+    if sys.platform == "win32":
+        assert int(fields["job_peak_bytes"]) > 0
+    assert not marker.exists()
+    pool.finish()
+
+
+@pytest.mark.parametrize(
+    ("device", "limit", "inherited", "expected"),
+    [
+        ("cuda", None, None, "256"),
+        ("cuda", 19, "77", "19"),
+        ("cuda", 0, None, None),
+        ("cuda", 0, "77", "77"),
+        ("cpu", 19, None, None),
+        ("cpu", 19, "77", "77"),
+    ],
+)
+@pytest.mark.parametrize("vram_cap", [True, False])
+def test_gpu_cache_policy_reaches_the_real_worker_environment(
+    pool: SupervisorHarness,
+    memory_logs: queue.Queue[logging.LogRecord],
+    monkeypatch: pytest.MonkeyPatch,
+    device: str,
+    limit: int | None,
+    inherited: str | None,
+    expected: str | None,
+    *,
+    vram_cap: bool,
+) -> None:
+    """Catch unbounded cuDNN caches or zero overwriting inherited policy."""
+    name = "TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT"
+    if inherited is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, inherited)
+    gpu: dict[str, object] = {
+        "max_workers": 1,
+        "cufft_plan_cache_max_size": 7,
+        "idle_cache_release_s": 0.125,
+        "vram_cap": vram_cap,
+        "vram_cap_margin_gib": 0.375,
+    }
+    if limit is not None:
+        gpu["cudnn_v8_lru_cache_limit"] = limit
+    pool.config = configuration(gpu=gpu)
+    pool.hardware.gpu_available = True
+    job = pool.job(provider="gigaam-e2e-ctc", device=device)
+    pool.start()
+    _memory_log_fields(memory_logs, job.job_id)
+    result = read_result(pool.paths, job.job_id)
+    assert result is not None
+    assert result.status == "ok"
+    constructed = pool.events("constructed")
+    assert len(constructed) == 1
+    assert constructed[0]["cudnn_v8_lru_cache_limit"] == expected
+    options = constructed[0]["options"]
+    assert options["cufft_plan_cache_max_size"] == (7 if device == "cuda" else None)
+    assert options["idle_cache_release_s"] == (0.125 if device == "cuda" else None)
+    expected_cap = None
+    if device == "cuda" and vram_cap:
+        seed = seed_estimate(make_key("gigaam-e2e-ctc", "small", "auto", "gpu"))
+        expected_cap = (
+            seed.vram_base_bytes
+            + constructed[0]["capacity"] * seed.vram_per_lane_bytes
+            + 3 * GIB // 8
+        )
+    assert options["vram_cap_bytes"] == expected_cap
+    pool.finish()
+
+
+@pytest.mark.parametrize(
+    ("fraction", "offset", "retires"),
+    [(1.0, 0, True), (0.5, 0, True), (1.0, -1, False), (0.0, 1, False)],
+)
+def test_commit_recycle_drains_busy_worker_and_routes_backlog_to_fresh_process(
+    pool: SupervisorHarness, fraction: float, offset: int, *, retires: bool
+) -> None:
+    """Catch threshold errors, lost running jobs or reuse under continuous load."""
+    pool.config = configuration(
+        cpu={"max_slots": 2, "max_slots_per_worker": 2},
+        memory={"recycle_commit_fraction": fraction},
+    )
+    warm = pool.job(memory={"private_bytes": 1})
+    pool.start()
+    original = pool.result(warm)
+    heartbeat = pool.heartbeat(lambda value: value["queue"]["running"] == 0)
+    reserved = heartbeat["workers"][0]["commit_bytes"]
+    private = int(fraction * reserved) + offset if fraction else 2 * reserved
+    busy = pool.job(mode="hold", memory={"private_bytes": 1})
+    trigger = pool.job(wait=True, memory={"private_bytes": private})
+    assert pool.submitted(busy)["worker_id"] == original.worker_id
+    assert pool.submitted(trigger)["worker_id"] == original.worker_id
+    pending = pool.job(call=2, mode="hold", memory={"private_bytes": 1})
+    pool.heartbeat(lambda value: value["queue"] == {"pending": 1, "running": 2})
+    pool.release(trigger)
+    assert pool.result(trigger).status == "ok"
+    if retires:
+        pool.heartbeat(
+            lambda value: any(
+                worker["worker_id"] == original.worker_id
+                and worker["state"] == "retiring"
+                and worker["running"] == 1
+                for worker in value["workers"]
+            )
+        )
+        assert not any(
+            event["worker_id"] == original.worker_id
+            for event in pool.events("submitted", pending)
+        )
+        assert not any(
+            event["worker_id"] == original.worker_id for event in pool.events("closed")
+        )
+    else:
+        assert pool.submitted(pending)["worker_id"] == original.worker_id
+    pool.release(busy)
+    completed = pool.result(busy)
+    assert completed.status == "ok"
+    assert completed.attempts == 1
+    following = pool.submitted(pending)
+    assert (following["worker_id"] != original.worker_id) is retires
+    pool.release(pending)
+    assert pool.result(pending).status == "ok"
+    if retires:
+        pool.heartbeat(
+            lambda value: all(
+                worker["worker_id"] != original.worker_id for worker in value["workers"]
+            )
+        )
+        assert (
+            sum(
+                event["worker_id"] == original.worker_id
+                for event in pool.events("closed")
+            )
+            == 1
+        )
+    assert pool.result(trigger).attempts == 1
+    pool.finish()
+
+
+@pytest.mark.parametrize("busy", [True, False])
+@pytest.mark.parametrize("hours", [0, 1])
+def test_uptime_cap_replaces_once_without_interrupting_running_work(
+    pool: SupervisorHarness, hours: int, *, busy: bool
+) -> None:
+    """Catch missed busy retirement, a wrong uptime origin or disabled-cap churn."""
+    pool.config = configuration(
+        lifecycle={"worker_max_uptime_h": hours, "worker_idle_ttl_s": 10000}
+    )
+    warm = pool.job(memory={"private_bytes": 1})
+    pool.start()
+    original = pool.result(warm)
+    baseline = pool.heartbeat(lambda value: value["queue"]["running"] == 0)
+    spawned_at = baseline["workers"][0]["spawned_at"]
+    running = pool.job(mode="hold") if busy else None
+    if running is not None:
+        assert pool.submitted(running)["worker_id"] == original.worker_id
+    pool.clock.advance(spawned_at + 3599 - pool.clock.peek())
+    # * Heartbeats after the jump form a barrier without real-time policy waits.
+    before = pool.heartbeat(lambda value: value["sequence"] >= baseline["sequence"] + 2)
+    assert before["workers"][0]["state"] == "ready"
+    pool.clock.advance(2)
+    if hours and busy:
+        pool.heartbeat(
+            lambda value: any(
+                worker["worker_id"] == original.worker_id
+                and worker["state"] == "retiring"
+                and worker["running"] == 1
+                for worker in value["workers"]
+            )
+        )
+        assert not any(
+            event["worker_id"] == original.worker_id for event in pool.events("closed")
+        )
+    elif hours:
+        pool.heartbeat(
+            lambda value: all(
+                worker["worker_id"] != original.worker_id for worker in value["workers"]
+            )
+        )
+    else:
+        pool.heartbeat(lambda value: value["sequence"] >= before["sequence"] + 2)
+    following = pool.job(call=2)
+    if running is not None:
+        pool.release(running)
+        result = pool.result(running)
+        assert result.status == "ok"
+        assert result.attempts == 1
+    result = pool.result(following)
+    assert result.status == "ok"
+    assert (result.worker_id != original.worker_id) is bool(hours)
+    if hours:
+        pool.heartbeat(
+            lambda value: all(
+                worker["worker_id"] != original.worker_id for worker in value["workers"]
+            )
+        )
+        assert (
+            sum(
+                event["worker_id"] == original.worker_id
+                for event in pool.events("closed")
+            )
+            == 1
+        )
+        assert len(pool.events("constructed")) == 2
+    else:
+        assert not pool.events("closed")
+        assert len(pool.events("constructed")) == 1
+    pool.finish()
 
 
 @pytest.mark.parametrize("kind", ["stt", "diarize"])
@@ -404,6 +711,269 @@ def tiny_job_caps(monkeypatch: pytest.MonkeyPatch) -> list[int]:
 
     monkeypatch.setattr(winjob, "_kernel32", CappedKernel)
     return limits
+
+
+@pytest.fixture
+def live_job_caps(monkeypatch: pytest.MonkeyPatch) -> JobCapKernel:
+    """Keep real Job Object growth while scaling allocations to a small test cap."""
+    if sys.platform != "win32":
+        pytest.skip("requires real Windows Job Object caps and notifications")
+    kernel = JobCapKernel(initial_cap=96 * 1024**2)
+    monkeypatch.setattr(winjob, "_kernel32", lambda: kernel)
+    return kernel
+
+
+def test_child_cap_raises_once_retries_on_live_worker_and_retires_on_second_hit(
+    pool: SupervisorHarness,
+    live_job_caps: JobCapKernel,
+    memory_logs: queue.Queue[logging.LogRecord],
+) -> None:
+    """Catch unbounded raises, stale accounting, missed hits or lost retries."""
+    pool.config = configuration(cpu={"max_slots": 2, "max_slots_per_worker": 2})
+    with WinEvent() as capped, WinEvent() as release:
+        job = pool.job(
+            mode="child_cap_report",
+            cap_signal=capped.name,
+            result_gate=release.name,
+            fail_attempts=1,
+        )
+        pool.start()
+        started = pool.submitted(job)
+        capped.wait()
+        heartbeat = pool.heartbeat(
+            lambda value: any(worker["cap_raised"] for worker in value["workers"])
+        )
+        worker = next(
+            worker
+            for worker in heartbeat["workers"]
+            if worker["worker_id"] == started["worker_id"]
+        )
+        assert worker["state"] == "ready"
+        changes = list(live_job_caps.updates)
+        assert len(changes) == 2
+        assert all(change["success"] for change in changes)
+        headroom = pool.config.memory.child_headroom_bytes
+        assert changes[1]["requested"] - headroom == pytest.approx(
+            (changes[0]["requested"] - headroom) * 1.25, abs=2
+        )
+        assert worker["commit_bytes"] == changes[1]["requested"] - headroom
+        assert worker["job_limit_bytes"] == changes[1]["requested"]
+        current = live_job_caps.query(changes[0]["handle"])
+        assert current.JobMemoryLimit == changes[1]["applied"] > changes[0]["applied"]
+        assert current.BasicLimitInformation.LimitFlags == changes[0]["flags"]
+        assert current.BasicLimitInformation.LimitFlags & 0x2000
+        canary = pool.job(call=2)
+        assert pool.result(canary).worker_id == started["worker_id"]
+        release.set()
+        retry = pool.result(job)
+        fields = _memory_log_fields(memory_logs, job.job_id)
+        assert fields["error_kind"] == "memory_limit"
+        assert retry.status == "ok"
+        assert retry.attempts == 2
+        assert retry.worker_id == started["worker_id"]
+        assert len(pool.events("submitted", job)) == 2
+        assert not pool.events("closed")
+    with WinEvent() as second_hit, WinEvent() as release:
+        second = pool.job(
+            call=3,
+            mode="child_cap_report",
+            cap_signal=second_hit.name,
+            result_gate=release.name,
+            fail_attempts=1,
+        )
+        assert pool.submitted(second)["worker_id"] == started["worker_id"]
+        second_hit.wait()
+        pool.heartbeat(
+            lambda value: any(
+                worker["worker_id"] == started["worker_id"]
+                and worker["state"] == "retiring"
+                for worker in value["workers"]
+            )
+        )
+        assert (
+            len(
+                [
+                    change
+                    for change in live_job_caps.updates
+                    if change["handle"] == changes[0]["handle"]
+                ]
+            )
+            == 2
+        )
+        release.set()
+        result = pool.result(second)
+        assert result.status == "ok"
+        assert result.attempts == 2
+        assert result.worker_id != started["worker_id"]
+        pool.heartbeat(
+            lambda value: all(
+                worker["worker_id"] != started["worker_id"]
+                for worker in value["workers"]
+            )
+        )
+        assert (
+            sum(
+                event["worker_id"] == started["worker_id"]
+                for event in pool.events("closed")
+            )
+            == 1
+        )
+    assert len(set(live_job_caps.raw_hits)) == 2
+    pool.finish()
+    learned = fsio.read_json(pool.paths.estimates_file)
+    assert learned is not None
+    assert (
+        learned["keys"][make_key("whisper", "small", "auto", "cpu").label][
+            "commit_factor"
+        ]
+        == 1.25
+    )
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "budget",
+        "guard",
+        "critical",
+        "ceiling",
+        "disabled",
+        "query",
+        "post",
+        "set",
+        "unknown_pid",
+    ],
+)
+def test_blocked_child_cap_raise_retires_and_preserves_the_running_attempt(
+    pool: SupervisorHarness, live_job_caps: JobCapKernel, blocker: str
+) -> None:
+    """Catch unsafe growth, ignored disable switches or failed Win32 updates."""
+    key = make_key("whisper", "small", "auto", "cpu")
+    seed = seed_estimate(key)
+    reserved = seed.commit_base_bytes + seed.commit_per_slot_bytes
+    memory: dict[str, object] = {}
+    if blocker == "budget":
+        memory["commit_budget_gib"] = reserved / GIB
+    if blocker == "disabled":
+        memory["live_cap_raise"] = False
+    pool.config = configuration(memory=memory, scheduling={"max_attempts": 1})
+    if blocker == "ceiling":
+        store = EstimateStore(
+            pool.paths.estimates_file,
+            fingerprint=hardware_fingerprint(None),
+            clock=pool.clock,
+        )
+        store.bump_memory(key, factor=4.0)
+        assert store.save_if_due(force=True)
+    with WinEvent() as before_cap, WinEvent() as capped, WinEvent() as release:
+        job = pool.job(
+            mode="child_cap_report",
+            before_cap_gate=before_cap.name,
+            cap_signal=capped.name,
+            result_gate=release.name,
+        )
+        pool.start()
+        started = pool.submitted(job)
+        initial = pool.heartbeat(lambda value: value["queue"]["running"] == 1)
+        original = initial["workers"][0]
+        if blocker == "guard":
+            growth = round(0.25 * reserved)
+            pool.hardware.free_commit = (
+                pool.config.memory.free_commit_guard_bytes + growth - 1024
+            )
+        elif blocker == "critical":
+            pool.hardware.free_commit = (
+                pool.config.memory.critical_free_commit_bytes - 1024
+            )
+        if blocker in {"query", "post", "set"}:
+            live_job_caps.fail_update = blocker
+        live_job_caps.unknown_pid = blocker == "unknown_pid"
+        before_cap.set()
+        capped.wait()
+        heartbeat = pool.heartbeat(
+            lambda value: any(
+                worker["worker_id"] == started["worker_id"]
+                and worker["state"] == "retiring"
+                for worker in value["workers"]
+            )
+        )
+        worker = next(
+            worker
+            for worker in heartbeat["workers"]
+            if worker["worker_id"] == started["worker_id"]
+        )
+        assert not worker["cap_raised"]
+        assert worker["commit_bytes"] == original["commit_bytes"]
+        assert worker["job_limit_bytes"] == original["job_limit_bytes"]
+        assert (
+            len([change for change in live_job_caps.updates if change["success"]]) == 1
+        )
+        assert not pool.events("closed")
+        release.set()
+        result = pool.result(job)
+        assert result.status == "error"
+        assert result.error_kind == "memory_limit"
+        assert result.attempts == 1
+    pool.finish()
+
+
+@pytest.mark.parametrize("attempts", [1, 2])
+def test_unrelated_crash_after_live_raise_keeps_crash_kind_and_auto_backend_choice(
+    pool: SupervisorHarness, live_job_caps: JobCapKernel, attempts: int
+) -> None:
+    """Catch old cap reports reclassifying crashes or pinning auto retries."""
+    # * A denied VirtualAlloc can raise the peak above the old enforced cap.
+    live_job_caps.raise_floor_bytes = 384 * 1024**2
+    pool.config = configuration(
+        gpu={"max_workers": 1}, scheduling={"max_attempts": attempts}
+    )
+    with WinEvent() as capped, WinEvent() as release:
+        warm = pool.job(
+            mode="child_cap_report",
+            cap_signal=capped.name,
+            result_gate=release.name,
+            after_cap="ok",
+        )
+        pool.start()
+        started = pool.submitted(warm)
+        capped.wait()
+        pool.heartbeat(
+            lambda value: any(worker["cap_raised"] for worker in value["workers"])
+        )
+        release.set()
+        assert pool.result(warm).status == "ok"
+    changes = list(live_job_caps.updates)
+    assert len(changes) == 2
+    real = live_job_caps.query(changes[0]["handle"])
+    assert real.PeakJobMemoryUsed < real.JobMemoryLimit * 0.95
+    crash = pool.job(
+        call=2, device="auto", duration=600, mode="crash", wait=True, fail_attempts=1
+    )
+    assert pool.submitted(crash)["worker_id"] == started["worker_id"]
+    calls = pool.hardware.gpu_calls
+    pool.hardware.gpu_available = True
+    pool.until(lambda: pool.hardware.gpu_calls, lambda count: count >= calls + 2)
+    pool.release(crash)
+    result = pool.result(crash)
+    assert result.attempts == attempts
+    if attempts == 1:
+        assert result.status == "error"
+        assert result.error_kind == "worker_crashed"
+    else:
+        assert result.status == "ok"
+        assert [event["backend"] for event in pool.events("submitted", crash)] == [
+            "cpu",
+            "gpu",
+        ]
+    pool.finish()
+    learned = fsio.read_json(pool.paths.estimates_file)
+    assert learned is not None
+    assert (
+        learned["keys"][make_key("whisper", "small", "auto", "cpu").label][
+            "commit_factor"
+        ]
+        == 1.25
+    )
 
 
 @pytest.mark.parametrize("mode", ["crash", "retry_crash", "handled"])
@@ -1336,15 +1906,19 @@ def test_two_resource_errors_of_one_worker_bump_each_memory_estimate_once(
 
 
 def test_transient_result_write_failure_retries_without_rerunning_job(
-    pool: SupervisorHarness, monkeypatch: pytest.MonkeyPatch
+    pool: SupervisorHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    memory_logs: queue.Queue[logging.LogRecord],
 ) -> None:
-    """Catch lost publication, premature deletion or repeated inference."""
+    """Catch lost publication/telemetry, premature deletion or repeated inference."""
+    pool.plan(memory_probe="initialized")
     job = pool.job(text="stored transcript")
     target = pool.paths.result_file(job.job_id)
     original_link, original_replace = os.link, os.replace
     blocked = threading.Event()
     blocked.set()
     failed_writes: list[object] = []
+    writes_denied = threading.Event()
 
     def link_at_filesystem(source: object, destination: object) -> None:
         if Path(destination) == target and blocked.is_set():
@@ -1355,6 +1929,8 @@ def test_transient_result_write_failure_retries_without_rerunning_job(
     def replace_at_filesystem(source: object, destination: object) -> None:
         if Path(destination) == target and blocked.is_set():
             failed_writes.append(destination)
+            if len(failed_writes) >= 3:
+                writes_denied.set()
             msg = "test result directory is temporarily unwritable"
             raise PermissionError(msg)
         original_replace(source, destination)
@@ -1362,16 +1938,25 @@ def test_transient_result_write_failure_retries_without_rerunning_job(
     monkeypatch.setattr(os, "link", link_at_filesystem)
     monkeypatch.setattr(os, "replace", replace_at_filesystem)
     pool.start()
-    pool.until(lambda: len(failed_writes), lambda count: count >= 3)
+    assert writes_denied.wait(30)
     assert pool.paths.incoming_file(job.job_id).exists()
     assert read_attempts(pool.paths, job.job_id) == 1
     assert len(pool.events("submitted", job)) == 1
     blocked.clear()
-    result = pool.result(job)
+    fields = _memory_log_fields(memory_logs, job.job_id)
+    result = read_result(pool.paths, job.job_id)
+    assert result is not None
     assert result.status == "ok"
     assert result.text == "stored transcript"
     assert not pool.paths.incoming_file(job.job_id).exists()
     assert len(pool.events("submitted", job)) == 1
+    assert fields["cuda_reserved_bytes"] == "8192"
+    assert fields["cuda_allocated_bytes"] == "1024"
+    assert fields["cuda_max_reserved_bytes"] == "16384"
+    assert fields["cufft_plan_cache_size"] == "7"
+    if sys.platform == "win32":
+        assert int(fields["private_bytes"]) > 0
+        assert int(fields["job_peak_bytes"]) > 0
     pool.finish()
 
 

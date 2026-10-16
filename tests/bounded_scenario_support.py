@@ -55,8 +55,10 @@ def run_bounded_scenario(
     """Bound the entire scenario, including executor shutdown and native pipes.
 
     The parent owns the child and its descendants before any media process
-    starts. Closing the Windows Job Object or killing the POSIX process group
-    reaps only the processes started by this scenario.
+    starts. Closing the Windows Job Object reaps only the processes started by
+    this scenario. On POSIX the process group is killed only while the peer has
+    not exited yet (its group id cannot belong to a stranger before the join);
+    descendants left behind by a peer that exited on its own are not reaped.
 
     Args:
         scenario: Picklable scenario whose assertions execute in the child.
@@ -92,11 +94,12 @@ def run_bounded_scenario(
     finally:
         job.close()
         if started:
-            if sys.platform != "win32":
-                with contextlib.suppress(ProcessLookupError):
-                    if peer.pid is not None:
-                        os.killpg(peer.pid, signal.SIGKILL)
+            # * Signal only a peer that has not been reaped: its pid, and the group id
+            # * it leads after ``setsid``, cannot belong to a stranger before the join.
             if peer.is_alive():
+                if sys.platform != "win32" and peer.pid is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(peer.pid, signal.SIGKILL)
                 peer.kill()
             peer.join(_REAP_TIMEOUT_S)
             assert not peer.is_alive()

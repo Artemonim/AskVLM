@@ -42,9 +42,32 @@ DEFAULT_CRITICAL_FREE_COMMIT_GIB = 4.0
 # * prep threads, one per slot in a CPU worker) usually commit tens to a few
 # * hundred MiB each, so 1 GiB leaves a wide margin for large video inputs.
 DEFAULT_CHILD_HEADROOM_GIB = 1.0
+# * A ready worker whose own commit (private bytes of the worker process, its
+# * children excluded) reaches this fraction of its commit reservation takes
+# * no new jobs and is replaced once idle; ``0`` disables the recycle. At 1.0
+# * the worker is replaced when it uses all it reserved, while the job cap
+# * (reservation + child headroom) still leaves the headroom to its children.
+# * A fraction below 1 can churn once the reservation is learned from
+# * observed peaks: the next worker's reservation is about the previous peak,
+# * so a fresh worker may already start above a lower threshold.
+DEFAULT_RECYCLE_COMMIT_FRACTION = 1.0
+# * A ready worker's first commit-cap report raises its live job cap once to
+# * the grown reservation (when the budgets allow) instead of retiring it.
+DEFAULT_LIVE_CAP_RAISE = True
 DEFAULT_VRAM_BUDGET_GIB = 4.0
 DEFAULT_VRAM_FREE_GUARD_GIB = 0.5
 DEFAULT_WORKER_IDLE_TTL_S = 600.0
+# * A ready worker whose uptime since spawn reaches this many hours takes no
+# * new jobs and is replaced once idle: a safety net for residual growth that
+# * no other bound covers (the CUDA context, CTranslate2's own allocator,
+# * native leaks below every threshold). ``0`` disables it. Twelve hours keep
+# * a replacement (one cold load) per worker per half day.
+DEFAULT_WORKER_MAX_UPTIME_H = 12.0
+# * A nonzero cap below one hour would retire every worker in the tick it
+# * becomes ready (housekeeping runs before the plan) and starve the queue.
+MIN_WORKER_MAX_UPTIME_H = 1.0
+MAX_WORKER_MAX_UPTIME_H = 8760.0
+_SECONDS_PER_HOUR = 3600.0
 DEFAULT_SUPERVISOR_LINGER_S = 30.0
 DEFAULT_STOP_GRACE_S = 20.0
 DEFAULT_CANCEL_GRACE_S = 30.0
@@ -55,6 +78,41 @@ DEFAULT_GPU_CPU_CONTENTION = 0.5
 DEFAULT_PRIORITY_AGING_S = 300.0
 DEFAULT_LOAD_FAILURE_COOLDOWN_S = 300.0
 DEFAULT_CRASH_COOLDOWN_S = 60.0
+
+# * Shape-keyed caches of a GPU worker (torch engines; GigaAM on CUDA). One job
+# * runs at a time with at most 18 windows of at most 20 s in batches of at most
+# * 8, so the hot input shapes are the full-window batches (8 shapes) plus the
+# * last window of each job, whose length varies. Both libraries cache per
+# * shape and never shrink by themselves: torch keeps up to 4096 cuFFT plans
+# * per device and 10000 cuDNN v8 execution plans (torch's own estimate: about
+# * 200 KiB each, so about 2 GiB), which a long-lived worker fills one job tail
+# * at a time. The bounds keep every hot shape cached with room for recent
+# * tails; a miss only rebuilds a plan (milliseconds) next to a 20 s window.
+# * ``0`` keeps the library default (no bound set by the pool).
+DEFAULT_GPU_CUFFT_PLAN_CACHE_MAX_SIZE = 32
+DEFAULT_GPU_CUDNN_V8_LRU_CACHE_LIMIT = 256
+# * Environment variable that carries ``gpu.cudnn_v8_lru_cache_limit`` to a GPU
+# * worker: torch reads it once, at the first convolution of the process.
+CUDNN_V8_LRU_CACHE_ENV = "TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT"
+# * Idle time after which a GPU worker returns its cached CUDA blocks to the
+# * driver (``gc.collect()`` + ``torch.cuda.empty_cache()``); ``0`` disables it.
+# * Short enough to free VRAM between bursts, long enough not to churn inside
+# * one (the next batch then allocates its blocks again, tens of ms at most).
+DEFAULT_GPU_IDLE_CACHE_RELEASE_S = 15.0
+MAX_GPU_IDLE_CACHE_RELEASE_S = 86400.0
+# * Largest accepted cache bound: the cuDNN limit reaches torch through an
+# * environment variable parsed as a C ``int``.
+MAX_GPU_CACHE_BOUND = 2**31 - 1
+# * A torch GPU worker caps its CUDA caching allocator at its VRAM reservation
+# * plus this margin (``torch.cuda.set_per_process_memory_fraction``, before
+# * the model loads); an allocation beyond it fails as a CUDA OOM. The cap
+# * excludes the CUDA context and the loaded kernels, which the reservation
+# * (an nvidia-smi figure) includes, so the effective slack is larger. The
+# * margin covers a full warm-up batch when the per-lane estimate is low: a
+# * load that runs out of memory cools the key down.
+DEFAULT_GPU_VRAM_CAP = True
+DEFAULT_GPU_VRAM_CAP_MARGIN_GIB = 1.0
+DEFAULT_GPU_VRAM_CAP_MARGIN_BYTES = round(DEFAULT_GPU_VRAM_CAP_MARGIN_GIB * GIB)
 
 # * CPU threads of one running speaker diarization job (the sherpa-onnx
 # * networks). Without an explicit setting the value is clamped to the thread
@@ -84,7 +142,17 @@ _CPU_KEYS = frozenset({"max_slots", "threads_per_slot", "max_slots_per_worker"})
 _DIARIZATION_KEYS = frozenset({"threads_per_slot"})
 _DIARIZATION_THREADS_PATH = "diarization.threads_per_slot"
 _GPU_KEYS = frozenset(
-    {"max_workers", "batch_lanes", "host_threads", "scale_out_backlog_s"}
+    {
+        "max_workers",
+        "batch_lanes",
+        "host_threads",
+        "scale_out_backlog_s",
+        "cufft_plan_cache_max_size",
+        "cudnn_v8_lru_cache_limit",
+        "idle_cache_release_s",
+        "vram_cap",
+        "vram_cap_margin_gib",
+    }
 )
 _THREADS_KEYS = frozenset({"budget"})
 _MEMORY_KEYS = frozenset(
@@ -93,11 +161,19 @@ _MEMORY_KEYS = frozenset(
         "free_commit_guard_gib",
         "critical_free_commit_gib",
         "child_headroom_gib",
+        "recycle_commit_fraction",
+        "live_cap_raise",
     }
 )
 _VRAM_KEYS = frozenset({"budget_gib", "free_guard_gib"})
 _LIFECYCLE_KEYS = frozenset(
-    {"worker_idle_ttl_s", "supervisor_linger_s", "stop_grace_s", "cancel_grace_s"}
+    {
+        "worker_idle_ttl_s",
+        "supervisor_linger_s",
+        "stop_grace_s",
+        "cancel_grace_s",
+        "worker_max_uptime_h",
+    }
 )
 _SCHEDULING_KEYS = frozenset(
     {
@@ -163,6 +239,19 @@ class GpuConfig:
         host_threads: CPU threads reserved for one GPU worker per family.
         scale_out_backlog_s: Predicted GPU backlog that justifies one more
             GPU worker of the same configuration.
+        cufft_plan_cache_max_size: Most cuFFT plans a GPU worker caches per
+            device (``torch.backends.cuda.cufft_plan_cache``); ``0`` keeps the
+            torch default (4096).
+        cudnn_v8_lru_cache_limit: ``TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT`` set in
+            a GPU worker's environment (most cached cuDNN v8 execution plans);
+            ``0`` leaves the variable alone (inherited value, or the torch
+            default of 10000).
+        idle_cache_release_s: Idle time (no running or queued job) after which
+            a GPU worker returns its cached CUDA blocks to the driver; ``0``
+            disables the release.
+        vram_cap: Whether a torch GPU worker caps its CUDA caching allocator
+            at its VRAM reservation plus ``vram_cap_margin_bytes``.
+        vram_cap_margin_bytes: Margin of that cap above the VRAM reservation.
 
     """
 
@@ -170,6 +259,11 @@ class GpuConfig:
     batch_lanes: Mapping[ProviderFamily, int]
     host_threads: Mapping[ProviderFamily, int]
     scale_out_backlog_s: float
+    cufft_plan_cache_max_size: int = DEFAULT_GPU_CUFFT_PLAN_CACHE_MAX_SIZE
+    cudnn_v8_lru_cache_limit: int = DEFAULT_GPU_CUDNN_V8_LRU_CACHE_LIMIT
+    idle_cache_release_s: float = DEFAULT_GPU_IDLE_CACHE_RELEASE_S
+    vram_cap: bool = DEFAULT_GPU_VRAM_CAP
+    vram_cap_margin_bytes: int = DEFAULT_GPU_VRAM_CAP_MARGIN_BYTES
 
     def __post_init__(self) -> None:
         """Replace the per-family mappings with read-only views of copies."""
@@ -208,6 +302,14 @@ class MemoryConfig:
             that share the job's cap. It is not reserved: the commit budget
             and the scheduler count only the reservation. ``0`` caps the job
             at the reservation.
+        recycle_commit_fraction: Share of its commit reservation that a ready
+            worker's own commit (private bytes in its result snapshots) may
+            reach before the worker takes no new jobs and is replaced once
+            idle; ``0`` disables the recycle.
+        live_cap_raise: Whether a ready worker's first commit-cap report
+            raises its live job cap once to the grown reservation (when the
+            commit budget and the free-commit guard allow it) instead of
+            retiring the worker.
 
     """
 
@@ -215,6 +317,8 @@ class MemoryConfig:
     free_commit_guard_bytes: int
     critical_free_commit_bytes: int
     child_headroom_bytes: int
+    recycle_commit_fraction: float = DEFAULT_RECYCLE_COMMIT_FRACTION
+    live_cap_raise: bool = DEFAULT_LIVE_CAP_RAISE
 
 
 @dataclass(frozen=True, slots=True)
@@ -240,6 +344,10 @@ class LifecycleConfig:
         supervisor_linger_s: Time the supervisor stays up with no work.
         stop_grace_s: Wait for a graceful worker shutdown before termination.
         cancel_grace_s: Wait for a cooperative cancel before the worker is killed.
+        worker_max_uptime_s: Uptime since spawn after which a ready worker
+            takes no new jobs and is replaced once idle (the config key is
+            ``worker_max_uptime_h``, in hours: ``0`` disables it, otherwise
+            1 to 8760).
 
     """
 
@@ -247,6 +355,7 @@ class LifecycleConfig:
     supervisor_linger_s: float
     stop_grace_s: float
     cancel_grace_s: float
+    worker_max_uptime_s: float = DEFAULT_WORKER_MAX_UPTIME_H * _SECONDS_PER_HOUR
 
 
 @dataclass(frozen=True, slots=True)
@@ -409,6 +518,25 @@ def _as_float(
         bound = low if maximum is None else f"{low} and <= {maximum}"
         raise _fail(path, f"must be {bound}, got {value}")
     return number
+
+
+def _as_bool(value: object, path: str) -> bool:
+    """Validate a JSON boolean (numbers and strings are rejected).
+
+    Args:
+        value: Candidate value.
+        path: Dotted JSON path for error messages.
+
+    Returns:
+        The validated boolean.
+
+    Raises:
+        PoolConfigError: When the value is not ``true`` or ``false``.
+
+    """
+    if not isinstance(value, bool):
+        raise _fail(path, f"expected true or false, got {value!r}")
+    return value
 
 
 def _as_gib_bytes(value: object, path: str, *, allow_zero: bool) -> int:
@@ -592,6 +720,35 @@ def _parse_gpu(payload: Mapping[str, object]) -> GpuConfig:
             "gpu.scale_out_backlog_s",
             exclusive_minimum=True,
         ),
+        cufft_plan_cache_max_size=_as_int(
+            section.get(
+                "cufft_plan_cache_max_size", DEFAULT_GPU_CUFFT_PLAN_CACHE_MAX_SIZE
+            ),
+            "gpu.cufft_plan_cache_max_size",
+            minimum=0,
+            maximum=MAX_GPU_CACHE_BOUND,
+        ),
+        cudnn_v8_lru_cache_limit=_as_int(
+            section.get(
+                "cudnn_v8_lru_cache_limit", DEFAULT_GPU_CUDNN_V8_LRU_CACHE_LIMIT
+            ),
+            "gpu.cudnn_v8_lru_cache_limit",
+            minimum=0,
+            maximum=MAX_GPU_CACHE_BOUND,
+        ),
+        idle_cache_release_s=_as_float(
+            section.get("idle_cache_release_s", DEFAULT_GPU_IDLE_CACHE_RELEASE_S),
+            "gpu.idle_cache_release_s",
+            maximum=MAX_GPU_IDLE_CACHE_RELEASE_S,
+        ),
+        vram_cap=_as_bool(
+            section.get("vram_cap", DEFAULT_GPU_VRAM_CAP), "gpu.vram_cap"
+        ),
+        vram_cap_margin_bytes=_as_gib_bytes(
+            section.get("vram_cap_margin_gib", DEFAULT_GPU_VRAM_CAP_MARGIN_GIB),
+            "gpu.vram_cap_margin_gib",
+            allow_zero=True,
+        ),
     )
 
 
@@ -646,6 +803,15 @@ def _parse_memory(payload: Mapping[str, object]) -> MemoryConfig:
             section.get("child_headroom_gib", DEFAULT_CHILD_HEADROOM_GIB),
             "memory.child_headroom_gib",
             allow_zero=True,
+        ),
+        recycle_commit_fraction=_as_float(
+            section.get("recycle_commit_fraction", DEFAULT_RECYCLE_COMMIT_FRACTION),
+            "memory.recycle_commit_fraction",
+            maximum=1.0,
+        ),
+        live_cap_raise=_as_bool(
+            section.get("live_cap_raise", DEFAULT_LIVE_CAP_RAISE),
+            "memory.live_cap_raise",
         ),
     )
 
@@ -719,7 +885,39 @@ def _parse_lifecycle(payload: Mapping[str, object]) -> LifecycleConfig:
         cancel_grace_s=_positive_seconds(
             section, "cancel_grace_s", "lifecycle", DEFAULT_CANCEL_GRACE_S
         ),
+        worker_max_uptime_s=_max_uptime_seconds(section),
     )
+
+
+def _max_uptime_seconds(section: Mapping[str, object]) -> float:
+    """Parse ``lifecycle.worker_max_uptime_h`` and return it in seconds.
+
+    Args:
+        section: The ``lifecycle`` section.
+
+    Returns:
+        The uptime cap in seconds; ``0`` when disabled.
+
+    Raises:
+        PoolConfigError: When the value is not ``0`` and not between
+            :data:`MIN_WORKER_MAX_UPTIME_H` and :data:`MAX_WORKER_MAX_UPTIME_H`
+            hours: a smaller cap would retire every worker as soon as it is
+            ready and starve the queue.
+
+    """
+    path = "lifecycle.worker_max_uptime_h"
+    hours = _as_float(
+        section.get("worker_max_uptime_h", DEFAULT_WORKER_MAX_UPTIME_H),
+        path,
+        maximum=MAX_WORKER_MAX_UPTIME_H,
+    )
+    if 0 < hours < MIN_WORKER_MAX_UPTIME_H:
+        raise _fail(
+            path,
+            f"must be 0 (disabled) or between {MIN_WORKER_MAX_UPTIME_H} and "
+            f"{MAX_WORKER_MAX_UPTIME_H} hours inclusive, got {hours}",
+        )
+    return hours * _SECONDS_PER_HOUR
 
 
 def _parse_scheduling(payload: Mapping[str, object]) -> SchedulingConfig:
@@ -1136,6 +1334,11 @@ def config_summary(config: PoolConfig) -> dict[str, object]:
             "batch_lanes": dict(config.gpu.batch_lanes),
             "host_threads": dict(config.gpu.host_threads),
             "scale_out_backlog_s": config.gpu.scale_out_backlog_s,
+            "cufft_plan_cache_max_size": config.gpu.cufft_plan_cache_max_size,
+            "cudnn_v8_lru_cache_limit": config.gpu.cudnn_v8_lru_cache_limit,
+            "idle_cache_release_s": config.gpu.idle_cache_release_s,
+            "vram_cap": config.gpu.vram_cap,
+            "vram_cap_margin_bytes": config.gpu.vram_cap_margin_bytes,
         },
         "threads": {"budget": config.threads.budget},
         "diarization": {"threads_per_slot": config.diarization.threads_per_slot},
@@ -1144,6 +1347,8 @@ def config_summary(config: PoolConfig) -> dict[str, object]:
             "free_commit_guard_bytes": config.memory.free_commit_guard_bytes,
             "critical_free_commit_bytes": config.memory.critical_free_commit_bytes,
             "child_headroom_bytes": config.memory.child_headroom_bytes,
+            "recycle_commit_fraction": config.memory.recycle_commit_fraction,
+            "live_cap_raise": config.memory.live_cap_raise,
         },
         "vram": {
             "budget_bytes": config.vram.budget_bytes,
@@ -1154,6 +1359,7 @@ def config_summary(config: PoolConfig) -> dict[str, object]:
             "supervisor_linger_s": config.lifecycle.supervisor_linger_s,
             "stop_grace_s": config.lifecycle.stop_grace_s,
             "cancel_grace_s": config.lifecycle.cancel_grace_s,
+            "worker_max_uptime_s": config.lifecycle.worker_max_uptime_s,
         },
         "scheduling": {
             "spill_ratio": config.scheduling.spill_ratio,

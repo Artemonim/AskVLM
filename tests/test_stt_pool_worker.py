@@ -75,6 +75,7 @@ class WorkerPeer:
         """Verify identity from the live subprocess, including its Windows cap."""
         hello = self.next_message("hello")
         assert hello["pid"] == self.worker.pid
+        assert hello["protocol"] == 2
         if sys.platform == "win32":
             assert self.worker.in_job
 
@@ -157,7 +158,9 @@ def test_worker_from_zero_mode_protects_children_from_modal_loader_failures(
         assert details["worker_mode"] & 0x8003 == 0x8003
         assert details["child_mode"] & 0x8003 == 0x8003
         if probe == "loader_failure":
-            assert details["loader_exit"] == 0xC000012D
+            # * One free commit page can deny the loader heap or stack guard growth.
+            assert details["loader_exit"] in {0xC000012D, 0xC00000FD}
+            assert details["loader_cap_reported"]
             assert details["loader_stdout"] == ""
         peer.shutdown()
     finally:
@@ -180,6 +183,7 @@ def test_real_worker_replaces_oversized_utf8_payload_for_the_same_attempt(
         assert result["job_id"] == item.job_id
         assert result["attempt_id"] == item.attempt_id
         assert not result.get("data")
+        assert isinstance(result.get("memory"), dict)
         following = _item(tmp_path, 2)
         assert peer.worker.send(following.to_message())
         assert peer.next_message("result")["attempt_id"] == following.attempt_id
@@ -188,11 +192,13 @@ def test_real_worker_replaces_oversized_utf8_payload_for_the_same_attempt(
         peer.worker.close(timeout_s=_TIMEOUT_S)
 
 
+@pytest.mark.parametrize("memory_probe", ["unimported", "uninitialized", "initialized"])
 def test_real_worker_handshake_result_stdout_and_bye(
-    worker_peer: WorkerPeer, tmp_path: Path
+    worker_peer: WorkerPeer, tmp_path: Path, memory_probe: str
 ) -> None:
-    """Catch missing engine wiring, native stdout leakage, Unicode damage or duplicate results."""
-    worker_peer.start()
+    """Catch broken results, lost telemetry or a CPU result initializing CUDA."""
+    marker = tmp_path / "unexpected-cuda-access"
+    worker_peer.start(memory_probe=memory_probe, cuda_marker=str(marker))
     item = _item(tmp_path)
     assert worker_peer.worker.send(item.to_message())
     result = worker_peer.next_message("result")
@@ -201,6 +207,24 @@ def test_real_worker_handshake_result_stdout_and_bye(
     assert result["status"] == "ok"
     assert result["text"] == "ru:русский.wav"
     assert result["backend"] == "cpu"
+    memory = result["memory"]
+    assert isinstance(memory, dict)
+    private = memory["private_bytes"]
+    if sys.platform == "win32":
+        assert isinstance(private, int)
+        assert private > 0
+    else:
+        assert private is None
+    if memory_probe == "initialized":
+        assert memory["cuda_reserved_bytes"] == 8192
+        assert memory["cuda_allocated_bytes"] == 1024
+        assert memory["cuda_max_reserved_bytes"] == 16384
+        assert memory["cufft_plan_cache_size"] == 7
+    else:
+        assert all(
+            value is None for key, value in memory.items() if key != "private_bytes"
+        )
+    assert not marker.exists()
     worker_peer.shutdown()
     assert worker_peer.close_marker.is_file()
     log = worker_peer.log_path.read_text(encoding="utf-8")
@@ -378,6 +402,7 @@ def test_real_worker_unencodable_result_is_replaced_for_the_same_attempt(
         assert result["status"] == "error"
         assert result["error_kind"] == "protocol_error"
         assert result["text"] == ""
+        assert isinstance(result.get("memory"), dict)
     worker_peer.shutdown()
 
 

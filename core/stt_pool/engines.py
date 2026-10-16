@@ -39,9 +39,9 @@ fate of unfinished attempts of a stopping worker). An item of a kind or with
 options the engine does not serve gets an ``error`` result, never a silent
 default.
 
-Importing this module loads no ML package: the pipeline (torch,
-faster-whisper), sherpa-onnx, numpy and ffmpeg helpers are imported inside
-:meth:`load` and the engine threads.
+Importing this module loads no ML package: the pipeline (torch, and
+faster-whisper for Whisper only), sherpa-onnx, numpy and ffmpeg helpers are
+imported inside :meth:`load` and the engine threads.
 """
 
 from __future__ import annotations
@@ -51,7 +51,9 @@ import contextlib
 import itertools
 import logging
 import math
+import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -69,9 +71,10 @@ from typing import (
     TypeVar,
 )
 
+from core.gigaam_device import cuda_memory_stats, limit_cuda_allocator
 from core.stt_errors import DeviceUnavailableError
 from core.stt_output import segments_json
-from core.stt_pool.config import DEFAULT_PRIORITY_AGING_S
+from core.stt_pool.config import CUDNN_V8_LRU_CACHE_ENV, DEFAULT_PRIORITY_AGING_S
 from core.stt_pool.engine_api import EngineResult, LoadInfo
 from core.stt_pool.keys import (
     DEFAULT_PRIORITY,
@@ -670,6 +673,42 @@ def _positive_int(value: object, name: str) -> int | None:
     return value
 
 
+def _non_negative_int_option(options: Mapping[str, object], name: str) -> int:
+    """Return a non-negative integer option, or ``0`` when it is absent or null.
+
+    Raises:
+        ValueError: When the option is present but not an integer >= 0.
+
+    """
+    value = options.get(name)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        msg = f"engine option {name!r} must be a non-negative integer, got {value!r}"
+        raise ValueError(msg)
+    return value
+
+
+def _non_negative_seconds_option(options: Mapping[str, object], name: str) -> float:
+    """Return a non-negative finite number option, or ``0.0`` when it is absent.
+
+    Raises:
+        ValueError: When the option is present but not a finite number >= 0.
+
+    """
+    value = options.get(name)
+    if value is None:
+        return 0.0
+    number = math.nan
+    if not isinstance(value, bool) and isinstance(value, int | float):
+        with contextlib.suppress(OverflowError):
+            number = float(value)
+    if not (math.isfinite(number) and number >= 0):
+        msg = f"engine option {name!r} must be a non-negative number, got {value!r}"
+        raise ValueError(msg)
+    return number
+
+
 def _positive_seconds(
     options: Mapping[str, object], name: str, default: float
 ) -> float:
@@ -734,7 +773,9 @@ def _new_pipeline(
         The unloaded pipeline.
 
     """
-    # ! The pipeline module imports torch and faster-whisper.
+    # ! The pipeline brings the STT backend: a Whisper pipeline imports
+    # ! faster-whisper (and torch) when it is built, a GigaAM pipeline imports
+    # ! torch and transformers at load and never imports faster-whisper.
     from core import pipelines  # noqa: PLC0415 - heavy ML import inside the worker only
 
     key = spec.key
@@ -963,6 +1004,10 @@ class _EngineBase(abc.ABC):
         self._model_loaded = False
         self._load_info: LoadInfo | None = None
         self._keepalive = _KeepAlive(KEEPALIVE_INTERVAL_S)
+        # * ``time.monotonic()`` since which the engine holds no job (queued,
+        # * prepared or running), ``None`` while it holds one; guarded by
+        # * ``_cond``, which is notified when the last job finishes.
+        self._idle_since: float | None = time.monotonic()
 
     # * ---- engine-specific hooks --------------------------------------------
 
@@ -1110,6 +1155,7 @@ class _EngineBase(abc.ABC):
             )
             self._jobs[key] = job
             self._queued.append(job)
+            self._idle_since = None
             self._cond.notify_all()
         logger.debug("job %s attempt %s held", item.job_id, item.attempt_id)
 
@@ -1358,6 +1404,10 @@ class _EngineBase(abc.ABC):
             job.finished = True
             if self._jobs.get(job.key) is job:
                 del self._jobs[job.key]
+            if not self._jobs and self._idle_since is None:
+                # * Wakes a thread that waits for the engine to become idle.
+                self._idle_since = time.monotonic()
+                self._cond.notify_all()
         logger.info(
             "job %s attempt %s finished: %s in %.2f s",
             job.item.job_id,
@@ -1484,6 +1534,9 @@ class _PipelineEngine(_EngineBase):
     def _build_pipeline(self) -> LocalPipeline:
         """Construct the engine's pipeline (not loaded yet)."""
 
+    def _before_model_load(self) -> None:
+        """Prepare the process right before the model loads (best effort)."""
+
     def _on_loaded(self, pipeline: LocalPipeline) -> None:
         """Keep references the engine needs after a successful load."""
 
@@ -1496,6 +1549,7 @@ class _PipelineEngine(_EngineBase):
         """Build, load and verify the pipeline; unload it again on any failure."""
         pipeline = self._build_pipeline()
         try:
+            self._before_model_load()
             pipeline.ensure_stt_loaded()
             active = self._checked_device(_active_device(pipeline))
             self._on_loaded(pipeline)
@@ -1656,15 +1710,39 @@ class GigaamGpuBatchEngine(_PipelineEngine):
     windows kept, media-relative times), like the wrapper's default path. A
     failed batch fails only the jobs that had windows in it; a cancel drops
     the job's remaining windows at the next batch boundary.
+
+    Memory bounds of a long-lived process (spec options set by the
+    supervisor from the ``gpu`` config; absent or ``0`` keeps the library
+    behavior): ``vram_cap_bytes`` caps the CUDA caching allocator of the
+    process (:func:`~core.gigaam_device.limit_cuda_allocator`) before the
+    model loads, so the weights, the warm-up and every batch count against
+    it and an allocation beyond it fails as a CUDA OOM;
+    ``cufft_plan_cache_max_size`` bounds the cuFFT plan cache of the model's
+    device right after the load; ``idle_cache_release_s`` makes the
+    batch-loop thread, the only thread that runs CUDA inference, return the
+    cached CUDA blocks to the driver once the engine has held no job for that
+    long and has run CUDA work since the last release, so a release never
+    overlaps a batch and happens at most once per idle period.
     """
 
     def __init__(self, spec: WorkerSpec) -> None:
         super().__init__(spec)
         self._lanes = _batch_lanes(spec)
         self._prep_threads = max(1, min(MAX_PREP_THREADS, spec.capacity))
+        self._vram_cap_bytes = _non_negative_int_option(spec.options, "vram_cap_bytes")
+        self._cufft_plan_cache_max_size = _non_negative_int_option(
+            spec.options, "cufft_plan_cache_max_size"
+        )
+        self._idle_release_s = _non_negative_seconds_option(
+            spec.options, "idle_cache_release_s"
+        )
+        self._vram_cap_in_effect: int | None = None
+        self._cufft_plan_cache_bound: int | None = None
         self._wrapper: Any = None
         # * Lane rotation between batches; only the batch-loop thread uses it.
         self._rotation: LaneRotation[_Job] = LaneRotation()
+        # * CUDA work ran since the last idle release; guarded by ``_cond``.
+        self._cache_dirty = False
 
     def _build_pipeline(self) -> LocalPipeline:
         host_threads = self._spec.host_threads
@@ -1676,17 +1754,44 @@ class GigaamGpuBatchEngine(_PipelineEngine):
             gigaam_warmup_batch=self._lanes,
         )
 
+    def _before_model_load(self) -> None:
+        """Cap the CUDA caching allocator before the model's first allocation."""
+        if self._vram_cap_bytes <= 0:
+            return
+        # ! The GigaAM pipeline imports torch at load anyway.
+        import torch  # noqa: PLC0415 - heavy ML import inside the worker only
+
+        self._vram_cap_in_effect = limit_cuda_allocator(torch, self._vram_cap_bytes)
+        logger.info(
+            "CUDA caching allocator capped: requested_bytes=%d cap_bytes=%s",
+            self._vram_cap_bytes,
+            self._vram_cap_in_effect,
+        )
+
     def _on_loaded(self, pipeline: LocalPipeline) -> None:
         if pipeline.gigaam is None:
             msg = "GigaAM backend is not configured"
             raise RuntimeError(msg)
         self._wrapper = pipeline.gigaam
+        if self._cufft_plan_cache_max_size > 0:
+            self._cufft_plan_cache_bound = self._wrapper.bound_cufft_plan_cache(
+                self._cufft_plan_cache_max_size
+            )
+        # * The warm-up batches left their blocks in the CUDA cache.
+        self._cache_dirty = True
 
     def _drop_model_refs(self) -> None:
         self._wrapper = None
 
     def _details(self) -> dict[str, object]:
-        return {"lanes": self._lanes, "prep_threads": self._prep_threads}
+        return {
+            "lanes": self._lanes,
+            "prep_threads": self._prep_threads,
+            "vram_cap_bytes": self._vram_cap_in_effect,
+            "cufft_plan_cache_max_size": self._cufft_plan_cache_bound,
+            "cudnn_v8_lru_cache_limit": os.environ.get(CUDNN_V8_LRU_CACHE_ENV),
+            "idle_cache_release_s": self._idle_release_s,
+        }
 
     def _thread_targets(self) -> list[tuple[str, Callable[[], None]]]:
         preps: list[tuple[str, Callable[[], None]]] = [
@@ -1729,15 +1834,77 @@ class GigaamGpuBatchEngine(_PipelineEngine):
         self._release_ready(job)
 
     def _claim_active(self) -> list[_Job] | None:
-        """Wait for prepared jobs and claim them all (``None`` = stop)."""
-        with self._cond:
-            while not self._closing and not self._ready:
-                self._cond.wait()
-            if self._closing:
-                return None
-            for job in self._ready:
-                job.claimed = True
-            return list(self._ready)
+        """Wait for prepared jobs and claim them all (``None`` = stop).
+
+        While it waits, the batch-loop thread also performs the idle release
+        of the cached CUDA blocks when it falls due (:meth:`_idle_release_wait`).
+        """
+        while True:
+            with self._cond:
+                release_due = False
+                while not self._closing and not self._ready:
+                    wait_s = self._idle_release_wait(time.monotonic())
+                    if wait_s is not None and wait_s <= 0:
+                        release_due = True
+                        break
+                    self._cond.wait(wait_s)
+                if not release_due:
+                    if self._closing:
+                        return None
+                    for job in self._ready:
+                        job.claimed = True
+                    return list(self._ready)
+                idle_since = self._idle_since
+                idle_s = 0.0 if idle_since is None else time.monotonic() - idle_since
+                self._cache_dirty = False
+            # * Outside the lock: submissions and prep threads continue; a job
+            # * that becomes ready meanwhile waits for this release to end.
+            self._release_idle_cache(idle_s)
+
+    def _idle_release_wait(self, now: float) -> float | None:
+        """Return the wait until the idle cache release is due (caller holds ``_cond``).
+
+        Returns:
+            ``None`` when no release is pending (disabled, nothing ran on
+            CUDA since the last release, or the engine holds a job: the last
+            job to finish notifies ``_cond``); otherwise the seconds left until
+            the engine has been idle for ``idle_cache_release_s`` (``<= 0``:
+            due now), capped at :data:`threading.TIMEOUT_MAX`.
+
+        """
+        if self._idle_release_s <= 0 or not self._cache_dirty:
+            return None
+        idle_since = self._idle_since
+        if self._jobs or idle_since is None:
+            return None
+        return min(idle_since + self._idle_release_s - now, threading.TIMEOUT_MAX)
+
+    def _release_idle_cache(self, idle_s: float) -> None:
+        """Return the idle model's cached CUDA blocks to the driver (batch loop)."""
+        wrapper = self._wrapper
+        if wrapper is None:
+            return
+        torch_mod = sys.modules.get("torch")
+        before = cuda_memory_stats(torch_mod)
+        started = time.perf_counter()
+        try:
+            released = bool(wrapper.release_cached_cuda_memory())
+        except Exception:  # noqa: BLE001 - a failed release must not stop the batch loop
+            logger.warning("idle CUDA cache release failed", exc_info=True)
+            return
+        if not released:
+            return
+        after = cuda_memory_stats(torch_mod)
+        logger.info(
+            "idle CUDA cache released: idle_s=%.1f release_s=%.3f "
+            "cuda_reserved_bytes_before=%s cuda_reserved_bytes_after=%s "
+            "cuda_allocated_bytes=%s",
+            idle_s,
+            time.perf_counter() - started,
+            before["cuda_reserved_bytes"],
+            after["cuda_reserved_bytes"],
+            after["cuda_allocated_bytes"],
+        )
 
     def _batch_loop(self) -> None:
         """Run window batches over the active jobs until the engine closes."""
@@ -1836,6 +2003,8 @@ class GigaamGpuBatchEngine(_PipelineEngine):
             rotation=self._rotation,
         )
         if batch:
+            with self._cond:
+                self._cache_dirty = True
             self._run_batch(batch)
         for job in live:
             self._settle(job)

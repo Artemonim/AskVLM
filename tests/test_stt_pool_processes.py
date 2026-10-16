@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import gc
 import json
 import queue
@@ -20,6 +21,7 @@ from core.stt_pool.keys import make_key
 from core.stt_pool.procs import WorkerProcess, WorkerSpawnError, default_worker_launch
 from core.stt_pool.queue import QueuePaths, SupervisorLock
 from core.stt_pool.sysprobe import query_gpu
+from tests.stt_pool_windows_support import JobCapKernel, allocation_child
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -149,6 +151,138 @@ def test_job_memory_limit_is_reported_without_unbounded_allocation(
     assert peak > 0
     assert peer.worker.pid is not None
     assert psutil.Process(peer.worker.pid).memory_info().private <= _MEMORY_CAP
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Real Windows Job Object reports")
+def test_live_cap_rearms_for_new_processes_and_preserves_kill_on_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch repeated-process notifications, a lost re-arm or orphaned raised jobs."""
+    kernel = JobCapKernel()
+    monkeypatch.setattr(winjob, "_kernel32", lambda: kernel)
+    reports: queue.Queue[int] = queue.Queue()
+    job = winjob.WorkerJob(memory_limit_bytes=96 * 1024**2, on_memory_limit=reports.put)
+    try:
+        assert job.active, job.error
+        with allocation_child() as first:
+            assert job.assign(first.process.pid), job.assign_error
+            assert first.allocate(256 * 1024**2)["denied"]
+            assert reports.get(timeout=30) == first.process.pid
+            assert job.memory_limit_hits == 1
+            for _ in range(2):
+                assert first.allocate(256 * 1024**2)["denied"]
+            kernel.fence(job)
+            assert kernel.raw_hits == [first.process.pid]
+            original = kernel.query(job._handle)  # noqa: SLF001 - observe real external job limits
+            assert job.set_memory_limit(128 * 1024**2), job.limit_error
+            raised = kernel.query(job._handle)  # noqa: SLF001 - observe real external job limits
+            assert raised.JobMemoryLimit == 128 * 1024**2
+            assert (
+                raised.BasicLimitInformation.LimitFlags
+                == original.BasicLimitInformation.LimitFlags
+            )
+            assert raised.BasicLimitInformation.LimitFlags & 0x2000
+            assert first.allocate(256 * 1024**2)["denied"]
+            kernel.fence(job)
+            assert kernel.raw_hits == [first.process.pid]
+            assert reports.empty()
+            assert job.memory_limit_hits == 1
+            with allocation_child() as second:
+                assert job.assign(second.process.pid), job.assign_error
+                assert second.allocate(256 * 1024**2)["denied"]
+                assert reports.get(timeout=30) == second.process.pid
+                kernel.fence(job)
+                assert kernel.raw_hits == [first.process.pid, second.process.pid]
+                assert job.memory_limit_hits == 2
+                assert job.memory_limit_pid == second.process.pid
+                assert job.memory_limit_hit
+                job.close()
+                # * Both children must exit before the controller sends any EOF.
+                first.process.wait(timeout=30)
+                second.process.wait(timeout=30)
+                assert first.process.poll() is not None
+                assert second.process.poll() is not None
+        assert job.memory_limit_hits == 2
+    finally:
+        job.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Real Job Object update failures")
+@pytest.mark.parametrize("failure", ["query", "post", "set"])
+def test_failed_live_cap_update_keeps_the_enforced_limit_and_flags(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Catch partial Win32 failures silently removing the cap or kill-on-close."""
+    kernel = JobCapKernel()
+    monkeypatch.setattr(winjob, "_kernel32", lambda: kernel)
+    job = winjob.WorkerJob(memory_limit_bytes=96 * 1024**2)
+    try:
+        assert job.active, job.error
+        original = kernel.query(job._handle)  # noqa: SLF001 - real external state
+        kernel.fail_update = failure
+        assert not job.set_memory_limit(128 * 1024**2)
+        assert job.limit_error is not None
+        unchanged = kernel.query(job._handle)  # noqa: SLF001 - real external state
+        assert unchanged.JobMemoryLimit == original.JobMemoryLimit
+        assert (
+            unchanged.BasicLimitInformation.LimitFlags
+            == original.BasicLimitInformation.LimitFlags
+        )
+        assert job.memory_limit_bytes == 96 * 1024**2
+        kernel.fail_update = None
+        assert job.set_memory_limit(128 * 1024**2), job.limit_error
+        assert job.limit_error is None
+        assert kernel.query(job._handle).JobMemoryLimit == 128 * 1024**2  # noqa: SLF001 - real external state
+    finally:
+        job.close()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Real completion-port FIFO")
+def test_rearm_discards_queued_old_denials_before_reporting_a_new_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catch stale packets consuming the raised cap's one-shot report."""
+    kernel = JobCapKernel()
+    monkeypatch.setattr(winjob, "_kernel32", lambda: kernel)
+    reports: queue.Queue[int] = queue.Queue()
+    release_monitor = threading.Event()
+
+    def report(pid: int) -> None:
+        reports.put(pid)
+        if not release_monitor.wait(30):
+            msg = "test did not release the first completion-port callback"
+            raise TimeoutError(msg)
+
+    job = winjob.WorkerJob(memory_limit_bytes=128 * 1024**2, on_memory_limit=report)
+    try:
+        assert job.active, job.error
+        with contextlib.ExitStack() as stack:
+            first, stale, fresh = [
+                stack.enter_context(allocation_child()) for _ in range(3)
+            ]
+            assert job.assign(first.process.pid), job.assign_error
+            assert first.allocate(256 * 1024**2)["denied"]
+            assert reports.get(timeout=30) == first.process.pid
+            # * The monitor remains in its callback while old packets queue.
+            assert job.assign(stale.process.pid), job.assign_error
+            assert stale.allocate(256 * 1024**2)["denied"]
+            assert job.set_memory_limit(192 * 1024**2), job.limit_error
+            assert job.assign(fresh.process.pid), job.assign_error
+            assert fresh.allocate(256 * 1024**2)["denied"]
+            release_monitor.set()
+            assert reports.get(timeout=30) == fresh.process.pid
+            kernel.fence(job)
+            assert kernel.raw_hits == [
+                first.process.pid,
+                stale.process.pid,
+                fresh.process.pid,
+            ]
+            assert job.memory_limit_hits == 2
+            assert job.memory_limit_pid == fresh.process.pid
+            assert reports.empty()
+    finally:
+        release_monitor.set()
+        job.close()
 
 
 def test_supervisor_lock_is_exclusive_across_processes_and_released_on_death(

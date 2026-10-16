@@ -26,6 +26,7 @@ from core.stt_pool.scheduler import (
     Spawn,
     Stop,
     admission_order,
+    commit_growth_blockers,
     plan,
 )
 
@@ -140,6 +141,51 @@ def _state(
 def _running(call: str, *, end: float = _NOW + 60) -> RunningJob:
     """Build a job already in service, which priority cannot preempt."""
     return RunningJob(f"running-{call}", call, _NOW - 1, end)
+
+
+@pytest.mark.parametrize(
+    ("budget", "free", "guard", "critical", "target", "blocked"),
+    [
+        (8 * _GIB, 10 * _GIB, _GIB, 0, 5 * _GIB, False),
+        (8 * _GIB - 1, 10 * _GIB, _GIB, 0, 5 * _GIB, True),
+        (8 * _GIB, 3 * _GIB, 2 * _GIB, 0, 5 * _GIB, False),
+        (8 * _GIB, 3 * _GIB - 1, 2 * _GIB, 0, 5 * _GIB, True),
+        (8 * _GIB, 2 * _GIB, 0, 2 * _GIB, 4 * _GIB + 1, False),
+        (8 * _GIB, 2 * _GIB - 1, 0, 2 * _GIB, 4 * _GIB + 1, True),
+        (7 * _GIB, 0, 0, _GIB, 3 * _GIB, False),
+    ],
+)
+def test_live_commit_growth_counts_other_workers_and_inclusive_boundaries(
+    limits: Limits,
+    estimates: EstimateStore,
+    budget: int,
+    free: int,
+    guard: int,
+    critical: int,
+    target: int,
+    *,
+    blocked: bool,
+) -> None:
+    """Catch overbooking live growth or rejecting an exact budget/guard fit."""
+    owner = replace(
+        _worker("owner", estimates), reservation=Reservation(4 * _GIB, 0, 0)
+    )
+    stopping = replace(
+        _worker("other", estimates, backend="gpu", state="stopping"),
+        reservation=Reservation(3 * _GIB, _GIB, 1),
+    )
+    state = _state(limits, estimates, (), (owner, stopping))
+    state = replace(
+        state,
+        limits=replace(
+            limits,
+            commit_budget_bytes=budget,
+            free_commit_guard_bytes=guard,
+            critical_free_commit_bytes=critical,
+        ),
+        probes=replace(state.probes, free_commit_bytes=free),
+    )
+    assert bool(commit_growth_blockers(state, "owner", target)) is blocked
 
 
 def test_configuration_demand_and_ttl_sequence(

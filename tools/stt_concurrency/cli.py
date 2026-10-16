@@ -13,6 +13,8 @@ from typing import Annotated
 import psutil  # type: ignore[import-untyped]
 import typer
 
+from core.stt_pool.engine_api import DEFAULT_ENGINE_FACTORY
+
 from . import report
 from .combo import COMBO_DIRNAME, run_combos, write_combo_summary
 from .configs import (
@@ -23,6 +25,33 @@ from .configs import (
     apply_estimate_overrides,
     default_matrix,
     estimate_need,
+)
+from .growth_inputs import (
+    AUDIO_FORMATS,
+    AUDIO_OPUS,
+    DURATION_MODES,
+    DURATION_VARIED,
+    SAPI_VOICE,
+    SOURCE_SAPI,
+    DurationPlan,
+)
+from .memory_growth import (
+    BOUNDS_POOL,
+    DEFAULT_COMMIT_RESERVE_GIB,
+    DEFAULT_JOB_TIMEOUT_S,
+    DEFAULT_JOBS,
+    DEFAULT_LOAD_TIMEOUT_S,
+    DEFAULT_MAX_ERRORS,
+    DEFAULT_MIN_FREE_COMMIT_GIB,
+    DEFAULT_MIN_FREE_VRAM_GIB,
+    DEFAULT_OUT_DIR,
+    DEFAULT_PLATEAU_TOLERANCE_MIB,
+    DEFAULT_PROGRESS_EVERY,
+    GPU_MEMORY_BOUNDS,
+    GrowthOptions,
+    is_growth_run,
+    rebuild_summary,
+    run_memory_growth,
 )
 from .paths import RESULTS_DIRNAME
 from .quality import ManifestError
@@ -60,6 +89,11 @@ DEFAULT_SAMPLE_INTERVAL_S = 0.5
 DEFAULT_COOLDOWN_S = 5.0
 DEFAULT_CLIPS_PER_STREAM = 12
 DEFAULT_MIN_STEP_SECONDS = 45.0
+DEFAULT_GROWTH_MIN_DURATION_S = 1.0
+DEFAULT_GROWTH_MAX_DURATION_S = 60.0
+DEFAULT_GROWTH_FIXED_DURATION_S = 13.0
+DEFAULT_GROWTH_SEED = 1
+DEFAULT_GROWTH_LABEL = "run"
 _MAX_WHISPER_CHUNK_S = 30.0
 _EXIT_USAGE = 2
 _EXIT_INTERRUPTED = 130
@@ -73,7 +107,9 @@ app = typer.Typer(
         "GigaAM-Multilingual ctc) scale on this PC: P = N processes with N models, "
         "S = one model served by N threads, B = batching inside one process. "
         "'run' measures a fixed matrix, 'sweep' searches the saturation knee per "
-        "group, 'combo' runs a GPU and a CPU configuration at the same time. Every "
+        "group, 'combo' runs a GPU and a CPU configuration at the same time, "
+        "'memory-growth' feeds sequential jobs to one long-lived GigaAM GPU pool "
+        "worker and tracks its memory per job. Every "
         "measurement uses fresh child processes. VRAM is read with "
         "'nvidia-smi --id=0' (whole GPU 0) while CUDA work runs on cuda:0; on a "
         "multi-GPU machine whose CUDA order (or CUDA_VISIBLE_DEVICES) differs from "
@@ -741,6 +777,263 @@ def combo_command(  # noqa: PLR0913 - a benchmark CLI exposes its knobs as optio
     _guarded(_action)
 
 
+@app.command("memory-growth")
+def memory_growth_command(  # noqa: PLR0913 - a benchmark CLI exposes its knobs as options
+    *,
+    jobs: Annotated[
+        int, typer.Option(min=1, help="Jobs fed one after another to the worker.")
+    ] = DEFAULT_JOBS,
+    durations: Annotated[
+        str,
+        typer.Option(
+            help=(
+                f"{' or '.join(DURATION_MODES)}: varied draws each job's duration "
+                "uniformly from [--duration-min-s, --duration-max-s] (seeded, ms "
+                "resolution, so nearly every job has its own input shape, like "
+                "voice notes); fixed gives every job --fixed-duration-s (constant "
+                "input shapes, only the content differs)."
+            ),
+        ),
+    ] = DURATION_VARIED,
+    duration_min_s: Annotated[
+        float, typer.Option(help="Shortest varied duration (s).")
+    ] = DEFAULT_GROWTH_MIN_DURATION_S,
+    duration_max_s: Annotated[
+        float, typer.Option(help="Longest varied duration (s).")
+    ] = DEFAULT_GROWTH_MAX_DURATION_S,
+    fixed_duration_s: Annotated[
+        float,
+        typer.Option(help="Duration of every fixed job (s; below 20 s = one window)."),
+    ] = DEFAULT_GROWTH_FIXED_DURATION_S,
+    seed: Annotated[
+        int, typer.Option(help="Seed of the durations and source offsets.")
+    ] = DEFAULT_GROWTH_SEED,
+    source: Annotated[
+        str,
+        typer.Option(
+            help=(
+                f"Speech source: '{SOURCE_SAPI}' synthesizes Russian narration with "
+                f"'{SAPI_VOICE}' through pwsh (PowerShell 7), or an audio/video file "
+                "such as tests/fixtures/test_video_short.mp4. Clips are cut from the "
+                "looped source at seeded offsets. Never pass user recordings."
+            ),
+        ),
+    ] = SOURCE_SAPI,
+    audio_format: Annotated[
+        str,
+        typer.Option(
+            help=(
+                f"Clip format: {', '.join(AUDIO_FORMATS)} (opus = Ogg Opus 16 kHz "
+                "mono, like a Telegram voice note)."
+            ),
+        ),
+    ] = AUDIO_OPUS,
+    gpu_memory_bounds: Annotated[
+        str,
+        typer.Option(
+            help=(
+                f"{' or '.join(GPU_MEMORY_BOUNDS)}: pool keeps the GPU memory "
+                "bounds of the pool config (gpu.cufft_plan_cache_max_size, "
+                "gpu.cudnn_v8_lru_cache_limit, gpu.idle_cache_release_s, "
+                "gpu.vram_cap); library switches all four off (cuFFT and cuDNN "
+                "plan caches at the torch defaults, no idle release, no VRAM cap), "
+                "the behavior before the bounds existed. --pool-set wins over both."
+            ),
+        ),
+    ] = BOUNDS_POOL,
+    pool_config: Annotated[
+        Path | None,
+        typer.Option(
+            help=(
+                "Base pool config JSON. Default: the code defaults; stt_pool.json "
+                "and ASKVLM_STT_POOL_CONFIG are never read."
+            ),
+            dir_okay=False,
+            resolve_path=True,
+        ),
+    ] = None,
+    pool_set: Annotated[
+        list[str] | None,
+        typer.Option(
+            help=(
+                "Override a pool config key: PATH=VALUE with a dotted PATH and a "
+                "JSON VALUE, e.g. gpu.cufft_plan_cache_max_size=0, "
+                "gpu.batch_lanes.gigaam=8, memory.recycle_commit_fraction=0.9 "
+                "(repeat the option; validated like stt_pool.json)."
+            ),
+        ),
+    ] = None,
+    reservation_commit_gib: Annotated[
+        float | None,
+        typer.Option(
+            help=(
+                "Commit reservation (GiB) instead of the seed estimate; the Job "
+                "Object cap adds memory.child_headroom_gib."
+            ),
+        ),
+    ] = None,
+    reservation_vram_gib: Annotated[
+        float | None,
+        typer.Option(
+            help=(
+                "VRAM reservation (GiB) instead of the seed estimate; the VRAM cap "
+                "adds gpu.vram_cap_margin_gib."
+            ),
+        ),
+    ] = None,
+    idle_gap_s: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Idle pause (s) after every --idle-gap-every-th job; longer than "
+                "gpu.idle_cache_release_s lets the worker release its CUDA cache. "
+                "0: back to back."
+            ),
+        ),
+    ] = 0.0,
+    idle_gap_every: Annotated[
+        int, typer.Option(min=1, help="Pause after every N-th job.")
+    ] = 1,
+    out_dir: Annotated[
+        Path,
+        typer.Option(
+            "--out-dir",
+            help=(
+                "Parent of the run directory <UTC stamp>-<label> (default inside "
+                "the gitignored .cache)."
+            ),
+            file_okay=False,
+            resolve_path=True,
+        ),
+    ] = DEFAULT_OUT_DIR,
+    label: Annotated[
+        str, typer.Option(help="Run label (A-Z, a-z, 0-9, '.', '_', '-').")
+    ] = DEFAULT_GROWTH_LABEL,
+    keep_inputs: Annotated[
+        bool, typer.Option(help="Keep the generated clips in <run dir>/inputs.")
+    ] = False,
+    min_free_commit_gib: Annotated[
+        float,
+        typer.Option(help="Refuse to start below this free system commit (GiB)."),
+    ] = DEFAULT_MIN_FREE_COMMIT_GIB,
+    min_free_vram_gib: Annotated[
+        float,
+        typer.Option(help="Refuse to start below this free VRAM (GiB; 0: no check)."),
+    ] = DEFAULT_MIN_FREE_VRAM_GIB,
+    commit_reserve_gib: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "Stop the run when free system commit drops below this (GiB); "
+                "the guard also refuses to start when the worker's Job Object "
+                "cap does not fit into free commit minus this reserve."
+            ),
+        ),
+    ] = DEFAULT_COMMIT_RESERVE_GIB,
+    job_timeout_s: Annotated[
+        float, typer.Option(help="Longest wait for one job's result (s).")
+    ] = DEFAULT_JOB_TIMEOUT_S,
+    load_timeout_s: Annotated[
+        float, typer.Option(help="Longest model load and warm-up (s).")
+    ] = DEFAULT_LOAD_TIMEOUT_S,
+    max_errors: Annotated[
+        int, typer.Option(min=0, help="Stop after more failed jobs than this.")
+    ] = DEFAULT_MAX_ERRORS,
+    gpu_sample: Annotated[
+        bool,
+        typer.Option(help="Record whole-GPU used VRAM (nvidia-smi) after each job."),
+    ] = True,
+    probe_stack: Annotated[
+        bool,
+        typer.Option(
+            help=(
+                "Record torch/CUDA/cuDNN/transformers versions in run.json (a "
+                "short torch child, run only after the guard passed)."
+            ),
+        ),
+    ] = True,
+    plateau_tolerance_mib: Annotated[
+        float,
+        typer.Option(
+            help=(
+                "A figure plateaus when the median of the last 20% of the jobs "
+                "exceeds the median of the 20% before them by at most this "
+                "tolerance (MiB)."
+            ),
+        ),
+    ] = DEFAULT_PLATEAU_TOLERANCE_MIB,
+    progress_every: Annotated[
+        int, typer.Option(min=0, help="Progress line every N jobs (0: none).")
+    ] = DEFAULT_PROGRESS_EVERY,
+    engine_factory: Annotated[
+        str,
+        typer.Option(hidden=True, help="Engine factory of the worker spec (tests)."),
+    ] = "",
+    dry_run: DryRunOpt = False,
+) -> None:
+    """Track the memory of one long-lived GigaAM GPU pool worker job by job.
+
+    Starts ONE real pool worker (production launch path, own Job Object,
+    GigaamGpuBatchEngine) for gigaam-e2e-ctc/ai-sage/GigaAM-v3@e2e_ctc/fp32/gpu,
+    feeds --jobs synthetic jobs one after another and writes per job the
+    worker's memory snapshot (private bytes, CUDA reserved/allocated/peak,
+    cuFFT plans), the Job Object peak and timings to
+    <out-dir>/<stamp>-<label>/results.jsonl and results.csv, then
+    summary.json/summary.md: baseline after load, slope per job and per hour
+    over the last 80% of the jobs, plateau, maxima, cuFFT and CUDA
+    trajectories, throughput, and where the pool's recycle threshold would
+    have retired the worker. Runs one real model: check free commit and VRAM
+    first (the guard refuses below --min-free-commit-gib/--min-free-vram-gib,
+    and when the worker's Job Object cap does not fit into free commit minus
+    --commit-reserve-gib; the commit rules are checked again after the inputs
+    are cut, right before the worker spawn).
+    Exit codes: 0 all jobs ran and the summary was written; 1 the run ended
+    early; 2 invalid input, or the inputs could not be built (status
+    inputs_failed; the run folder keeps run.json and the summary); 3 the guard
+    refused (at the start, before any probe, or right before the worker
+    spawn); 4 all jobs ran but the summary could not be written; 130 Ctrl+C.
+    """
+
+    def _action() -> int:
+        options = GrowthOptions(
+            jobs=jobs,
+            durations=DurationPlan(
+                mode=durations,
+                min_s=duration_min_s,
+                max_s=duration_max_s,
+                fixed_s=fixed_duration_s,
+                seed=seed,
+            ),
+            source=source,
+            audio_format=audio_format,
+            out_dir=out_dir,
+            label=label,
+            pool_config=pool_config,
+            gpu_memory_bounds=gpu_memory_bounds,
+            pool_set=tuple(pool_set or ()),
+            reservation_commit_gib=reservation_commit_gib,
+            reservation_vram_gib=reservation_vram_gib,
+            idle_gap_s=idle_gap_s,
+            idle_gap_every=idle_gap_every,
+            keep_inputs=keep_inputs,
+            min_free_commit_gib=min_free_commit_gib,
+            min_free_vram_gib=min_free_vram_gib,
+            commit_reserve_gib=commit_reserve_gib,
+            job_timeout_s=job_timeout_s,
+            load_timeout_s=load_timeout_s,
+            max_errors=max_errors,
+            gpu_sample=gpu_sample,
+            probe_stack=probe_stack,
+            plateau_tolerance_mib=plateau_tolerance_mib,
+            progress_every=progress_every,
+            dry_run=dry_run,
+            engine_factory=engine_factory or DEFAULT_ENGINE_FACTORY,
+        )
+        return run_memory_growth(options)
+
+    _guarded(_action)
+
+
 @app.command("list")
 def list_command(
     *,
@@ -772,13 +1065,31 @@ def summarize_command(
     *,
     out_dir: Annotated[
         Path,
-        typer.Option("--out-dir", help="Benchmark output directory.", file_okay=False),
+        typer.Option(
+            "--out-dir",
+            help="Benchmark output directory, or one memory-growth run directory.",
+            file_okay=False,
+        ),
     ],
+    plateau_tolerance_mib: Annotated[
+        float,
+        typer.Option(help="Plateau tolerance of a memory-growth run (MiB)."),
+    ] = DEFAULT_PLATEAU_TOLERANCE_MIB,
 ) -> None:
-    """Rebuild the summaries in --out-dir from the newest fingerprint of each kind."""
+    """Rebuild the summaries in --out-dir from the newest fingerprint of each kind.
+
+    A memory-growth run directory (one that holds run.json) gets its
+    summary.json, summary.md and results.csv recomputed instead.
+    """
     if not out_dir.is_dir():
         typer.secho(f"ERROR: --out-dir does not exist: {out_dir}", err=True, fg="red")
         raise typer.Exit(code=_EXIT_USAGE)
+    if is_growth_run(out_dir):
+        for line in rebuild_summary(
+            out_dir, plateau_tolerance_mib=plateau_tolerance_mib
+        ):
+            typer.echo(line)
+        return
     run_fp = latest_fingerprint(report.load_results(out_dir))
     md_path, table = report.write_summary(out_dir, run_fp)
     typer.echo(table)

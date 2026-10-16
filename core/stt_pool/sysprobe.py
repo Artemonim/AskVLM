@@ -341,6 +341,28 @@ def total_memory_bytes() -> int | None:
     return total if total > 0 else None
 
 
+def process_private_bytes() -> int | None:
+    """Return the private bytes (Windows commit) of the calling process.
+
+    One ``GetProcessMemoryInfo`` call through ``psutil``; cheap enough to run
+    after every job.
+
+    Returns:
+        ``PrivateUsage`` of this process, or ``None`` on a platform without it
+        (``psutil`` reports ``private`` only on Windows) or when the query
+        fails.
+
+    """
+    try:
+        info = psutil.Process().memory_info()
+    except (OSError, RuntimeError, psutil.Error):
+        return None
+    private = getattr(info, "private", None)
+    if isinstance(private, bool) or not isinstance(private, int) or private < 0:
+        return None
+    return private
+
+
 def _windows_cpu_name() -> str | None:
     """Return the marketing CPU name from the Windows registry, if available."""
     if sys.platform != "win32":

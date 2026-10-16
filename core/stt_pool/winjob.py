@@ -9,7 +9,8 @@ its own Job Object owned by the supervisor:
 * ``JOB_OBJECT_LIMIT_JOB_MEMORY`` (optional): the summed commit charge of the
   job's processes is capped. An allocation that would cross the cap fails, and
   Windows posts ``JOB_OBJECT_MSG_JOB_MEMORY_LIMIT`` to the job's completion
-  port; a monitor thread reports it once.
+  port; a monitor thread reports it once. :meth:`WorkerJob.set_memory_limit`
+  changes the cap of the live job and re-arms that one-shot report.
 
 Jobs nest on Windows 8 and newer: when the supervisor itself runs inside a job,
 a worker's job becomes a child of that job and both limits apply. Off Windows
@@ -60,9 +61,11 @@ _SEM_NOOPENFILEERRORBOX = 0x8000
 _SUPPRESSED_ERROR_DIALOGS = (
     _SEM_FAILCRITICALERRORS | _SEM_NOGPFAULTERRORBOX | _SEM_NOOPENFILEERRORBOX
 )
-# * Completion keys of the job's notification port.
+# * Completion keys of the job's notification port. ``_REARM_KEY`` packets are
+# * posted by :meth:`WorkerJob.set_memory_limit`.
 _JOB_KEY = 1
 _STOP_KEY = 2
+_REARM_KEY = 3
 _PORT_WAIT_MS = 200
 _MONITOR_JOIN_TIMEOUT_S = 5.0
 
@@ -205,13 +208,28 @@ def _last_error() -> int:
 class WorkerJob:
     """Kill-on-close Job Object of one worker, with an optional commit cap.
 
+    The memory-limit report is one-shot: the monitor reports the first
+    ``JOB_OBJECT_MSG_JOB_MEMORY_LIMIT`` and ignores later ones until
+    :meth:`set_memory_limit` re-arms it, so a burst of denied allocations is
+    one report and a hit of a raised cap is one more. Windows itself posts the
+    message only for the first denied allocation of each process of the job
+    (measured on Windows 11 22631: three denials of one process gave one
+    message, and neither a raised cap, a toggled limit flag nor a second port
+    association brought another; a child process got its own message). A
+    process whose denial was reported is therefore never reported again,
+    whatever the cap; a re-armed report sees processes not denied before.
+
     Attributes:
         memory_limit_bytes: Job-wide commit cap, or ``None`` for no cap.
-        memory_limit_pid: Process id reported with the first memory-limit
-            notification, or ``None`` while the cap was not hit.
+        memory_limit_pid: Process id reported with the latest memory-limit
+            report, or ``None`` while the cap was not hit.
+        memory_limit_hits: Number of memory-limit reports so far (at most one
+            per arming); it only grows and is updated on the monitor thread
+            before the callback runs.
         error: Why the job is unusable (``None`` when it is active).
         monitor_error: Why a hit of an enforced cap cannot be reported.
         assign_error: Why the last :meth:`assign` failed, if it did.
+        limit_error: Why the last :meth:`set_memory_limit` failed, if it did.
 
     """
 
@@ -226,8 +244,9 @@ class WorkerJob:
         Args:
             memory_limit_bytes: Job-wide commit cap in bytes, or ``None`` for no
                 cap.
-            on_memory_limit: Called once, from the monitor thread, with the
-                offending process id when the cap is hit.
+            on_memory_limit: Called from the monitor thread with the offending
+                process id when the cap is hit, once per arming of the report
+                (see :meth:`set_memory_limit`).
 
         Raises:
             ValueError: When *memory_limit_bytes* is not positive.
@@ -246,9 +265,11 @@ class WorkerJob:
         self._closing = False
         self.memory_limit_bytes = memory_limit_bytes
         self.memory_limit_pid: int | None = None
+        self.memory_limit_hits = 0
         self.error: str | None = None
         self.monitor_error: str | None = None
         self.assign_error: str | None = None
+        self.limit_error: str | None = None
         if sys.platform != "win32":
             self.error = "job objects are Windows-only"
             return
@@ -315,7 +336,12 @@ class WorkerJob:
         self._monitor.start()
 
     def _watch_port(self, port: int) -> None:
-        """Read job notifications until :meth:`close`; report the memory cap once.
+        """Read job notifications until :meth:`close`; report the cap once per arming.
+
+        The arming lives on this thread only: a ``_REARM_KEY`` packet arms the
+        next report. The port delivers packets in FIFO order, so the
+        notifications Windows queued before a re-arm packet are drained while
+        disarmed and never count as a hit of the new cap.
 
         Args:
             port: Completion port associated with the job.
@@ -327,6 +353,7 @@ class WorkerJob:
         message = _DWORD()
         key = ctypes.c_size_t()
         overlapped = ctypes.c_void_p()
+        armed = True
         while not self._stop.is_set():
             if not kernel32.GetQueuedCompletionStatus(
                 port,
@@ -338,13 +365,16 @@ class WorkerJob:
                 continue
             if key.value == _STOP_KEY:
                 return
-            if (
-                message.value == _JOB_OBJECT_MSG_JOB_MEMORY_LIMIT
-                and self.memory_limit_pid is None
-            ):
+            if key.value == _REARM_KEY:
+                armed = True
+                continue
+            if message.value == _JOB_OBJECT_MSG_JOB_MEMORY_LIMIT and armed:
+                armed = False
                 # * For this message the "overlapped" value is the process id.
-                self.memory_limit_pid = int(overlapped.value or 0)
-                self._report_memory_limit(self.memory_limit_pid)
+                pid = int(overlapped.value or 0)
+                self.memory_limit_pid = pid
+                self.memory_limit_hits += 1
+                self._report_memory_limit(pid)
 
     def _report_memory_limit(self, pid: int) -> None:
         """Call the memory-limit callback; its failures never stop the monitor."""
@@ -417,6 +447,88 @@ class WorkerJob:
             return bool(
                 _kernel32().TerminateJobObject(self._handle, JOB_TERMINATE_EXIT_CODE)
             )
+
+    def set_memory_limit(self, limit_bytes: int) -> bool:
+        """Change the job-wide commit cap of the live job and re-arm its report.
+
+        Query-modify-set of ``JOBOBJECT_EXTENDED_LIMIT_INFORMATION`` under the
+        handle lock: only ``JobMemoryLimit`` changes, every limit flag
+        (``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` included) and every other field
+        keep their current values. The re-arm packet is posted before the new
+        cap is set, so a notified denial after the change is always reported;
+        one denied under the old cap in between may be reported too (never
+        missed, at worst counted early). Windows notifies only the first
+        denial of each process (see the class docstring), so after the change
+        only processes not denied before can be reported.
+
+        Args:
+            limit_bytes: New job-wide commit cap in bytes.
+
+        Returns:
+            ``True`` when the new cap is in effect. ``False`` (with
+            :attr:`limit_error`) when the job is inactive or closed, was
+            created without a cap, has no working memory-limit monitor (a hit
+            of the new cap could not be reported), or a Win32 call failed; the
+            old cap then stays in effect (after a failed set the report stays
+            re-armed, so a later hit of the old cap is reported again).
+
+        Raises:
+            ValueError: When *limit_bytes* is not positive.
+
+        """
+        if limit_bytes <= 0:
+            msg = f"limit_bytes must be positive, got {limit_bytes}"
+            raise ValueError(msg)
+        with self._handle_lock:
+            error = self._set_memory_limit_locked(int(limit_bytes))
+            self.limit_error = error
+            if error is not None:
+                return False
+            self.memory_limit_bytes = int(limit_bytes)
+            return True
+
+    def _limit_change_blocker_locked(self) -> str | None:
+        """Return why the cap cannot change; the caller holds the handle lock."""
+        if self._handle is None or sys.platform != "win32":
+            return self.error or "the job is closed"
+        if self.memory_limit_bytes is None:
+            return "the job was created without a commit cap"
+        if self._port is None:
+            return self.monitor_error or "the job has no memory-limit monitor"
+        return None
+
+    def _set_memory_limit_locked(self, limit_bytes: int) -> str | None:
+        """Query, re-arm and set the cap; the caller holds the handle lock.
+
+        Returns:
+            ``None`` when the new cap is in effect, otherwise why not.
+
+        """
+        blocker = self._limit_change_blocker_locked()
+        if blocker is not None:
+            return blocker
+        kernel32 = _kernel32()
+        info = _JobExtendedLimitInformation()
+        if not kernel32.QueryInformationJobObject(
+            self._handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+            None,
+        ):
+            return f"QueryInformationJobObject failed (WinError {_last_error()})"
+        if not kernel32.PostQueuedCompletionStatus(self._port, 0, _REARM_KEY, None):
+            return f"PostQueuedCompletionStatus failed (WinError {_last_error()})"
+        info.BasicLimitInformation.LimitFlags |= _JOB_OBJECT_LIMIT_JOB_MEMORY
+        info.JobMemoryLimit = limit_bytes
+        if not kernel32.SetInformationJobObject(
+            self._handle,
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            return f"SetInformationJobObject failed (WinError {_last_error()})"
+        return None
 
     def _query_peak_locked(self) -> int | None:
         """Return ``PeakJobMemoryUsed``; the caller holds the handle lock."""

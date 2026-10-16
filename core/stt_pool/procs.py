@@ -185,7 +185,8 @@ class WorkerProcess:
                 message)`` for each decoded worker message and once with
                 ``(worker_id, None)`` at EOF.
             on_memory_limit: Called from the job monitor thread with
-                ``(worker_id, pid)`` when the commit cap is hit.
+                ``(worker_id, pid)`` when the commit cap is hit: once, and
+                once more after each :meth:`raise_memory_limit`.
             require_job: Refuse to run a worker outside its Job Object;
                 defaults to ``True`` on Windows and ``False`` elsewhere.
 
@@ -230,6 +231,76 @@ class WorkerProcess:
         """Return whether the worker's Job Object reported its commit cap."""
         job = self._job
         return job is not None and job.memory_limit_hit
+
+    @property
+    def memory_limit_hits(self) -> int:
+        """Return how many commit-cap reports the worker's Job Object made.
+
+        At most one per arming of the report: the first hit, and one more
+        after each :meth:`raise_memory_limit` (Windows notifies only the
+        first denial of each process, see
+        :class:`~core.stt_pool.winjob.WorkerJob`). The count is updated before
+        the ``on_memory_limit`` callback runs.
+        """
+        job = self._job
+        return job.memory_limit_hits if job is not None else 0
+
+    @property
+    def memory_limit_pid(self) -> int | None:
+        """Return the process the latest commit-cap report named (``None``: none).
+
+        It is set before :attr:`memory_limit_hits` grows, so a reader that
+        sees a report also sees its process.
+        """
+        job = self._job
+        return job.memory_limit_pid if job is not None else None
+
+    def raise_memory_limit(self, limit_bytes: int) -> bool:
+        """Set a new commit cap on the live worker's Job Object.
+
+        See :meth:`~core.stt_pool.winjob.WorkerJob.set_memory_limit`: the
+        other job limits stay, and the one-shot commit-cap report is re-armed.
+
+        Args:
+            limit_bytes: New job-wide commit cap in bytes.
+
+        Returns:
+            ``True`` when the new cap is in effect; ``False`` when the worker
+            does not run in a capped Job Object or the change failed (logged;
+            the old cap stays).
+
+        Raises:
+            ValueError: When *limit_bytes* is not positive.
+
+        """
+        if limit_bytes <= 0:
+            msg = f"limit_bytes must be positive, got {limit_bytes}"
+            raise ValueError(msg)
+        with self._lock:
+            job, in_job = self._job, self._in_job
+        if job is None or not in_job:
+            logger.warning(
+                "worker commit cap not raised: worker_id=%s detail=no Job Object",
+                self.worker_id,
+            )
+            return False
+        if not job.set_memory_limit(limit_bytes):
+            logger.warning(
+                "worker commit cap not raised: worker_id=%s limit_bytes=%d detail=%s",
+                self.worker_id,
+                limit_bytes,
+                job.limit_error,
+            )
+            return False
+        old = self._memory_limit_bytes
+        self._memory_limit_bytes = limit_bytes
+        logger.info(
+            "worker commit cap raised: worker_id=%s old_limit_bytes=%s limit_bytes=%d",
+            self.worker_id,
+            old,
+            limit_bytes,
+        )
+        return True
 
     @property
     def in_job(self) -> bool:

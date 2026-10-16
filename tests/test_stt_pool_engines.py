@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import threading
+import types
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
@@ -22,8 +24,10 @@ from core.stt_pool.engines import AdmissionTicket, admission_order, deal_lanes
 from core.stt_pool.keys import DIARIZE_PROVIDER
 from tests.stt_pool_engine_support import (
     RATE,
+    EngineClock,
     EngineHandle,
     EngineRuntime,
+    FakePipeline,
     OptionsPipeline,
     item,
     spec,
@@ -101,6 +105,51 @@ def test_engine_actual_device_mismatch_fails_without_cpu_recovery(
         runtime.open(spec(provider, "gpu"))
     assert runtime.load_count == 1
     assert runtime.unload_count == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("cap", "expected"),
+    [(None, None), (0, None), (3 * 1024**3, 0.375), (16 * 1024**3, 1.0)],
+)
+def test_gigaam_allocator_cap_precedes_weight_loading_on_the_current_device(
+    runtime: EngineRuntime,
+    monkeypatch: pytest.MonkeyPatch,
+    cap: int | None,
+    expected: float | None,
+) -> None:
+    """Catch uncapped weights, wrong-device fractions or a disabled cap applied."""
+    limits: list[tuple[float, int]] = []
+    at_load: list[list[tuple[float, int]]] = []
+    torch = types.ModuleType("torch")
+    torch.cuda = types.SimpleNamespace(
+        is_available=lambda: True,
+        current_device=lambda: 1,
+        get_device_properties=lambda device: types.SimpleNamespace(
+            total_memory=8 * 1024**3 if device == 1 else 0
+        ),
+        set_per_process_memory_fraction=lambda fraction, device: limits.append(
+            (fraction, device)
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch)
+
+    class LoadingPipeline(FakePipeline):
+        """Observe allocator state at the external weight loader boundary."""
+
+        def ensure_stt_loaded(self) -> None:
+            at_load.append(list(limits))
+            super().ensure_stt_loaded()
+
+    runtime.pipeline_type = LoadingPipeline
+    handle = runtime.open(spec("gigaam-e2e-ctc", "gpu", vram_cap_bytes=cap))
+    expected_limits = [] if expected is None else [(expected, 1)]
+    assert at_load == [expected_limits]
+    assert limits == expected_limits
+    info = handle.engine.load()
+    assert info.details["vram_cap_bytes"] == (
+        None if expected is None else round(expected * 8 * 1024**3)
+    )
 
 
 def test_cpu_slots_keep_language_and_temp_resources_per_job(
@@ -265,6 +314,68 @@ def test_gigaam_windows_are_joined_and_inferred_from_one_thread(
     assert len(batches) >= 3
     assert all(len(batch.markers) <= 2 for batch in batches)
     assert len({batch.thread_id for batch in batches}) == 1
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("idle_s", [0.0, 10.0])
+def test_gigaam_idle_release_waits_for_all_jobs_and_rearms_only_after_cuda_work(
+    runtime: EngineRuntime,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    idle_s: float,
+) -> None:
+    """Catch releases racing busy jobs, churning forever or never rearming."""
+    clock = EngineClock()
+    clock.install(monkeypatch)
+    handle = EngineHandle(
+        engines.create_engine(
+            spec("gigaam-e2e-ctc", "gpu", idle_cache_release_s=idle_s)
+        )
+    )
+    runtime.handles.append(handle)
+    handle.engine._cond = clock.condition  # noqa: SLF001 - scheduling barrier, production orchestration remains real
+    handle.engine.load()
+    runtime.batch_gate = threading.Event()
+    first = item(wav(tmp_path / "first.wav", [1000], window_s=0.1))
+    second = item(wav(tmp_path / "second.wav", [2000], window_s=0.1), seq=2)
+    # * The initial warm-up cache must survive a queued job beyond the idle deadline.
+    handle.engine.submit(first)
+    clock.advance(100)
+    handle.engine.start(handle.results.put)
+    runtime.batch_calls.get(timeout=WAIT_S)
+    assert runtime.cache_releases == []
+    handle.engine.submit(second)
+    handle.wait_ready(second)
+    clock.advance(100)
+    assert runtime.cache_releases == []
+    runtime.batch_gate.set()
+    assert {handle.result().text, handle.result().text} == {"1000", "2000"}
+    clock.parked()
+    clock.advance(9.5)
+    clock.parked()
+    assert runtime.cache_releases == []
+    clock.advance(0.5)
+    clock.parked()
+    assert len(runtime.cache_releases) == (1 if idle_s else 0)
+    clock.advance(1000)
+    clock.parked()
+    assert len(runtime.cache_releases) == (1 if idle_s else 0)
+    # * A failed preparation adds no CUDA work and must not trigger another release.
+    handle.engine.submit(item(tmp_path / "missing.wav", seq=3))
+    assert handle.result().status == "error"
+    clock.parked()
+    clock.advance(100)
+    clock.parked()
+    assert len(runtime.cache_releases) == (1 if idle_s else 0)
+    handle.engine.submit(item(first.input_path, seq=4))
+    assert handle.result().text == "1000"
+    clock.parked()
+    clock.advance(10)
+    clock.parked()
+    assert len(runtime.cache_releases) == (2 if idle_s else 0)
+    handle.engine.close()
+    batch_threads = {batch.thread_id for batch in runtime.batch_calls.queue}
+    assert set(runtime.cache_releases) <= batch_threads
 
 
 @pytest.mark.integration

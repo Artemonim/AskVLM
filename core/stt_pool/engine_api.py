@@ -61,6 +61,20 @@ ERROR_KIND_RESULT_TOO_LARGE = "result_too_large"
 # * Production engine factory named in the ``spec`` message.
 DEFAULT_ENGINE_FACTORY = "core.stt_pool.engines:create_engine"
 
+# * Keys of the optional ``memory`` snapshot of a ``result`` message, in log
+# * order: the worker process's private bytes (Windows commit; ``None`` on
+# * other platforms), the CUDA caching allocator's reserved, allocated and
+# * peak reserved bytes of the current device, and the number of cached cuFFT
+# * plans of that device. The CUDA figures are ``None`` in a process whose
+# * CUDA context is not initialized (CPU keys, Whisper on CTranslate2).
+MEMORY_SNAPSHOT_KEYS: tuple[str, ...] = (
+    "private_bytes",
+    "cuda_reserved_bytes",
+    "cuda_allocated_bytes",
+    "cuda_max_reserved_bytes",
+    "cufft_plan_cache_size",
+)
+
 _ENGINE_STATUSES: dict[str, EngineStatus] = {
     "ok": "ok",
     "empty": "empty",
@@ -217,6 +231,35 @@ def _optional_object(
         )
         raise ValueError(msg)
     return dict(cast("Mapping[str, object]", value))
+
+
+def memory_snapshot_from_wire(value: object) -> dict[str, int | None] | None:
+    """Return the ``memory`` snapshot of a ``result`` message (lenient).
+
+    Telemetry never fails a result: a missing or malformed snapshot is
+    ``None``, a key outside :data:`MEMORY_SNAPSHOT_KEYS` is dropped, and a
+    value that is not a non-negative integer (booleans included) becomes
+    ``None``.
+
+    Args:
+        value: The ``memory`` field of the message (``None`` when absent).
+
+    Returns:
+        A mapping with every key of :data:`MEMORY_SNAPSHOT_KEYS`, or ``None``
+        when *value* is not a JSON object.
+
+    """
+    if not isinstance(value, Mapping):
+        return None
+    raw = cast("Mapping[object, object]", value)
+    snapshot: dict[str, int | None] = {}
+    for key in MEMORY_SNAPSHOT_KEYS:
+        number = raw.get(key)
+        if isinstance(number, int) and not isinstance(number, bool) and number >= 0:
+            snapshot[key] = number
+        else:
+            snapshot[key] = None
+    return snapshot
 
 
 def job_message_fields(
@@ -520,6 +563,11 @@ class EngineResult:
         data: Structured payload of an ``ok``/``empty`` result (a JSON object:
             ``{"segments": [...]}`` for transcription, ``{"turns": [...]}`` for
             diarization), or ``None``.
+        memory: Memory snapshot of the worker process taken when the result
+            was sent (every key of :data:`MEMORY_SNAPSHOT_KEYS`, a figure that
+            is unknown is ``None``), or ``None`` without a snapshot. Engines
+            leave it unset; the worker process attaches it to every result.
+            It is telemetry only: it never changes the result's handling.
 
     """
 
@@ -533,6 +581,7 @@ class EngineResult:
     run_s: float
     audio_s: float | None
     data: Mapping[str, object] | None = None
+    memory: Mapping[str, int | None] | None = None
 
     @classmethod
     def for_text(
@@ -682,7 +731,9 @@ class EngineResult:
             message: Decoded protocol message.
 
         Returns:
-            The engine result.
+            The engine result; the optional ``memory`` snapshot is parsed
+            leniently (:func:`memory_snapshot_from_wire`) and never makes the
+            message invalid.
 
         Raises:
             ValueError: When a field is missing or invalid.
@@ -711,6 +762,7 @@ class EngineResult:
             run_s=_number(message, "run_s", minimum=0.0),
             audio_s=_optional_number(message, "audio_s", minimum=0.0),
             data=_optional_object(message, "data"),
+            memory=memory_snapshot_from_wire(message.get("memory")),
         )
 
     def to_message(self) -> dict[str, object]:
@@ -718,8 +770,8 @@ class EngineResult:
 
         Returns:
             A JSON-serializable mapping accepted by :meth:`from_message`; the
-            error detail is cut to 4000 characters and ``data`` is present only
-            when set.
+            error detail is cut to 4000 characters, and ``data`` and
+            ``memory`` are present only when set.
 
         """
         message: dict[str, object] = {
@@ -736,6 +788,8 @@ class EngineResult:
         }
         if self.data is not None:
             message["data"] = dict(self.data)
+        if self.memory is not None:
+            message["memory"] = dict(self.memory)
         return message
 
 

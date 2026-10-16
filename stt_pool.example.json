@@ -16,7 +16,12 @@
       "gigaam": 3,
       "whisper": 2
     },
-    "scale_out_backlog_s": 30.0
+    "scale_out_backlog_s": 30.0,
+    "cufft_plan_cache_max_size": 32,
+    "cudnn_v8_lru_cache_limit": 256,
+    "idle_cache_release_s": 15,
+    "vram_cap": true,
+    "vram_cap_margin_gib": 1
   },
   "threads": {
     "budget": 28
@@ -28,7 +33,9 @@
     "commit_budget_gib": 24,
     "free_commit_guard_gib": 8,
     "critical_free_commit_gib": 4,
-    "child_headroom_gib": 1
+    "child_headroom_gib": 1,
+    "recycle_commit_fraction": 1.0,
+    "live_cap_raise": true
   },
   "vram": {
     "budget_gib": 7,
@@ -38,7 +45,8 @@
     "worker_idle_ttl_s": 600,
     "supervisor_linger_s": 30,
     "stop_grace_s": 20,
-    "cancel_grace_s": 30
+    "cancel_grace_s": 30,
+    "worker_max_uptime_h": 12
   },
   "scheduling": {
     "spill_ratio": 0.8,
