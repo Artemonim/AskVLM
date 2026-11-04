@@ -34,7 +34,7 @@ from pathlib import Path
 from time import sleep, time
 from typing import TYPE_CHECKING, Literal, Self, TypeGuard
 
-from core.settings import get_project_cache_dir
+from core.settings import get_project_root
 from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import fsio
 from core.stt_pool.keys import (
@@ -195,7 +195,7 @@ def resolve_queue_root(explicit: Path | None = None) -> Path:
     env_value = os.environ.get(ENV_QUEUE_DIR)
     if env_value:
         return Path(env_value).resolve()
-    return (get_project_cache_dir() / "external_queue").resolve()
+    return (get_project_root() / ".cache" / "external_queue").resolve()
 
 
 @dataclass(frozen=True, slots=True)

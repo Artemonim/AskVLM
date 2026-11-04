@@ -1,0 +1,33 @@
+{
+  "schema": "askvlm.stt_pool.config",
+  "version": 1,
+  "cpu": {
+    "max_slots": 1,
+    "threads_per_slot": 2,
+    "max_slots_per_worker": 1
+  },
+  "gpu": {
+    "max_workers": 0
+  },
+  "threads": {
+    "budget": 2
+  },
+  "diarization": {
+    "threads_per_slot": 2
+  },
+  "memory": {
+    "commit_budget_gib": 6,
+    "free_commit_guard_gib": 6,
+    "critical_free_commit_gib": 3,
+    "child_headroom_gib": 1,
+    "recycle_commit_fraction": 1.0,
+    "live_cap_raise": true
+  },
+  "lifecycle": {
+    "worker_idle_ttl_s": 300,
+    "supervisor_linger_s": 30,
+    "stop_grace_s": 20,
+    "cancel_grace_s": 30,
+    "worker_max_uptime_h": 12
+  }
+}

@@ -20,6 +20,7 @@ import pytest
 
 from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool import fsio, winjob
+from core.stt_pool.config import load_pool_config
 from core.stt_pool.estimates import EstimateStore, seed_estimate
 from core.stt_pool.keys import make_key
 from core.stt_pool.queue import (
@@ -547,8 +548,11 @@ def test_diarization_scales_as_single_slot_processes_with_its_own_memory_seed(
 
 
 @pytest.fixture
-def pool(tmp_path: Path) -> Iterator[SupervisorHarness]:
+def pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[SupervisorHarness]:
     """Check lock, heartbeat and fake process teardown even when a scenario fails."""
+    monkeypatch.delenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", raising=False)
     harness = SupervisorHarness(tmp_path)
     try:
         yield harness
@@ -560,10 +564,16 @@ def pool(tmp_path: Path) -> Iterator[SupervisorHarness]:
             harness.cleanup()
 
 
+@pytest.mark.parametrize("managed", [False, True])
 def test_architect_example_configuration_workers_ttl_and_idle_exit(
     pool: SupervisorHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    managed: bool,
 ) -> None:
     """Catch configuration monopoly, wrong scale-out or TTL shutdown."""
+    if managed:
+        monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", "1")
     pool.config = configuration(cpu={"max_slots": 3, "max_slots_per_worker": 1})
     first = pool.job(model="tiny", text="model A")
     pool.start()
@@ -595,9 +605,61 @@ def test_architect_example_configuration_workers_ttl_and_idle_exit(
     pool.release(fourth)
     assert pool.result(fourth).status == "ok"
     pool.clock.advance(31)
-    pool.heartbeat(lambda value: not value["workers"])
+    idle = pool.heartbeat(lambda value: not value["workers"])
     pool.clock.advance(6)
-    pool.finish(request_stop=False)
+    if managed:
+        current = pool.heartbeat(
+            lambda value: value["sequence"] >= idle["sequence"] + 2
+        )
+        assert current["instance_id"] == idle["instance_id"]
+        late = pool.job(call=4, text="after managed idle")
+        assert pool.result(late).text == "after managed idle"
+        pool.finish()
+    else:
+        pool.finish(request_stop=False)
+
+
+def test_linux_cpu_example_serves_stt_and_diarization_with_one_two_thread_slot(
+    pool: SupervisorHarness,
+) -> None:
+    """Catch an invalid CPU deployment example, GPU use or unschedulable diarization."""
+    pool.config = load_pool_config(
+        Path(__file__).resolve().parents[1] / "stt_pool.linux-server.example.json",
+        env={},
+        logical_cpus=4,
+    )
+    assert pool.config.cpu.max_slots == 1
+    assert pool.config.cpu.max_slots_per_worker == 1
+    assert pool.config.cpu.threads_per_slot == 2
+    assert pool.config.diarization.threads_per_slot == 2
+    assert pool.config.threads.budget == 2
+    assert pool.config.gpu.max_workers == 0
+    assert pool.config.memory.commit_budget_bytes == 6 * GIB
+    assert pool.config.memory.free_commit_guard_bytes == 6 * GIB
+    assert pool.config.memory.critical_free_commit_bytes == 3 * GIB
+    pool.hardware.gpu_available = True
+    stt = pool.job(device="auto", mode="hold")
+    diarize = pool.job(
+        kind="diarize",
+        provider="sherpa-diarize",
+        call=2,
+        mode="hold",
+        data={"turns": []},
+    )
+    pool.start()
+    pool.submitted(stt)
+    pool.heartbeat(lambda value: value["queue"] == {"pending": 1, "running": 1})
+    assert not pool.events("submitted", diarize)
+    pool.release(stt)
+    assert pool.result(stt).status == "ok"
+    pool.submitted(diarize)
+    constructed = pool.events("constructed")
+    assert {worker["key"]["backend"] for worker in constructed} == {"cpu"}
+    assert all(worker["capacity"] == 1 for worker in constructed)
+    assert all(worker["threads_per_slot"] == 2 for worker in constructed)
+    pool.release(diarize)
+    assert pool.result(diarize).status == "ok"
+    pool.finish()
 
 
 def test_cpu_gpu_limits_apply_independently(pool: SupervisorHarness) -> None:

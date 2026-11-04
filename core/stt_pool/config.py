@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from core.stt_pool.keys import ProviderFamily
 
 ENV_POOL_CONFIG = "ASKVLM_STT_POOL_CONFIG"
+ENV_SUPERVISOR_MANAGED = "ASKVLM_EXTERNAL_SUPERVISOR_MANAGED"
 CONFIG_FILENAME = "stt_pool.json"
 CONFIG_SCHEMA = "askvlm.stt_pool.config"
 CONFIG_VERSION = 1
@@ -1118,6 +1119,20 @@ def default_pool_config(*, logical_cpus: int | None = None) -> PoolConfig:
 
     """
     return parse_pool_config({}, source="defaults", logical_cpus=logical_cpus)
+
+
+def is_supervisor_managed() -> bool:
+    """Return whether an external service manager owns the supervisor lifecycle.
+
+    Only ``ASKVLM_EXTERNAL_SUPERVISOR_MANAGED=1`` opts in. Service-manager
+    variables such as ``INVOCATION_ID`` do not identify the AskVLM supervisor.
+
+    Returns:
+        Whether clients must leave startup to the manager and the supervisor
+        must stay alive while idle.
+
+    """
+    return os.environ.get(ENV_SUPERVISOR_MANAGED) == "1"
 
 
 def project_root() -> Path:

@@ -16,15 +16,18 @@ through the shared queue (see :mod:`core.stt_pool.queue`):
    ``diarize`` job in diarize mode. All jobs of the call share one
    ``call_id``, the deadline, the priority and the ``max_parallel`` cap, and
    their ``submitted_at`` follows the input order (``stt`` before ``diarize``).
-4. Without a fresh supervisor heartbeat a detached supervisor is spawned.
+4. Without a fresh supervisor heartbeat a detached supervisor is spawned,
+   unless ``ASKVLM_EXTERNAL_SUPERVISOR_MANAGED=1`` leaves startup to an
+   external service manager.
 5. Results are polled until every input is final or the deadline passes. An
    input is final once all of its jobs have results, or as soon as one of them
    fails (its other job is then cancelled); the results of an input are merged
    into ONE outcome (see :class:`InputOutcome`). A supervisor that is not alive
    is respawned at most once per :data:`RESPAWN_INTERVAL_S`; when no fresh
-   heartbeat was ever seen within the start timeout of the first spawn (also
-   without a deadline), the unfinished inputs are ``unavailable`` and the
-   detail names the supervisor's output log.
+   heartbeat was ever seen within the startup wait (also without a deadline),
+   the unfinished inputs are ``unavailable``. Managed clients use the same
+   bounded startup wait without spawning or respawning a supervisor; their
+   diagnostics name the service, heartbeat and supervisor log.
 6. Inputs still unfinished at the deadline get cancel markers on every pending
    job and end as ``timeout``; an interrupted call writes cancel markers before
    it unwinds, so an abandoned call never leaves the supervisor working for
@@ -52,7 +55,11 @@ from core.stt_output import (
     speaker_text,
     voice_count,
 )
-from core.stt_pool.config import project_root
+from core.stt_pool.config import (
+    ENV_SUPERVISOR_MANAGED,
+    is_supervisor_managed,
+    project_root,
+)
 from core.stt_pool.keys import (
     DIARIZE_COMPUTE_TYPE,
     DIARIZE_MODEL_IDENTITY,
@@ -108,7 +115,7 @@ _FAILURE_PRIORITY: tuple[InputStatus, ...] = ("timeout", "unavailable", "error")
 
 # * Pause between two result polls.
 DEFAULT_POLL_INTERVAL_S = 0.2
-# * Longest wait for the first fresh heartbeat after the first spawn.
+# * Longest wait for the first fresh heartbeat once startup is needed.
 DEFAULT_START_TIMEOUT_S = 30.0
 # * Shortest pause between two spawns while no supervisor is alive.
 RESPAWN_INTERVAL_S = 10.0
@@ -914,11 +921,12 @@ class _Call:
         self._poll_interval_s = poll_interval_s
         self._start_timeout_s = start_timeout_s
         self._stale_after_s = stale_after_s
+        self._managed = is_supervisor_managed()
         self._outcomes: dict[int, InputOutcome] = {}
         self._pending: dict[int, dict[JobKind, str]] = {}
         self._received: dict[int, dict[JobKind, InputOutcome]] = {}
         self._seen_alive = False
-        self._first_spawn_at: float | None = None
+        self._startup_wait_at: float | None = None
         self._last_spawn_at: float | None = None
         self._spawn_error: str | None = None
 
@@ -1083,8 +1091,8 @@ class _Call:
 
     def _spawn_now(self, now: float) -> None:
         """Spawn a supervisor; a failed spawn counts as an attempt."""
-        if self._first_spawn_at is None:
-            self._first_spawn_at = now
+        if self._startup_wait_at is None:
+            self._startup_wait_at = now
         self._last_spawn_at = now
         try:
             self._spawn(self._paths)
@@ -1093,25 +1101,35 @@ class _Call:
             logger.warning("supervisor spawn failed: %s", self._spawn_error)
 
     def ensure_supervisor(self) -> None:
-        """Spawn a supervisor when jobs are pending and none is alive."""
+        """Start the heartbeat wait and, unless managed, spawn a supervisor."""
         if not self._pending:
             return
         now = self._clock()
         if not self._alive(now):
-            self._spawn_now(now)
+            self._startup_wait_at = now
+            if not self._managed:
+                self._spawn_now(now)
 
     def _never_started(self) -> bool:
-        """Return whether a spawn happened and no fresh heartbeat was ever seen."""
-        return self._first_spawn_at is not None and not self._seen_alive
+        """Return whether startup was awaited and no fresh heartbeat was seen."""
+        return self._startup_wait_at is not None and not self._seen_alive
 
     def _unavailable_detail(self) -> str:
         """Return the detail of inputs abandoned for lack of a supervisor.
 
-        The detail ends with the path of the supervisor's output log, where a
-        startup error of the spawned process (for example a config error) is
-        written.
+        Detached startup errors go to the output log. Managed startup errors
+        go to the service journal; the heartbeat and rotating log paths help
+        diagnose mismatched queue roots and a supervisor that stops answering.
         """
         detail = UNAVAILABLE_DETAIL
+        if self._managed:
+            return (
+                f"{detail} ({ENV_SUPERVISOR_MANAGED}=1; automatic startup disabled); "
+                "check systemctl status askvlm-external-transcriber.service and "
+                "journalctl -u askvlm-external-transcriber.service; "
+                f"heartbeat: {self._paths.heartbeat_file}; "
+                f"supervisor log: {self._paths.supervisor_log}"
+            )
         if self._spawn_error is not None:
             detail = f"{detail} (spawn failed: {self._spawn_error})"
         return f"{detail}; supervisor log: {self._paths.supervisor_out_log}"
@@ -1201,16 +1219,18 @@ class _Call:
                     self.abandon("timeout", self.timeout_detail())
                 return
             if not self._alive(now):
-                first_spawn_at = self._first_spawn_at
+                startup_wait_at = self._startup_wait_at
                 if (
-                    first_spawn_at is not None
+                    startup_wait_at is not None
                     and not self._seen_alive
-                    and now - first_spawn_at >= self._start_timeout_s
+                    and now - startup_wait_at >= self._start_timeout_s
                 ):
                     self.abandon("unavailable", self._unavailable_detail())
                     return
                 last_spawn_at = self._last_spawn_at
-                if last_spawn_at is None or now - last_spawn_at >= RESPAWN_INTERVAL_S:
+                if not self._managed and (
+                    last_spawn_at is None or now - last_spawn_at >= RESPAWN_INTERVAL_S
+                ):
                     self._spawn_now(now)
             pause = self._poll_interval_s
             if deadline is not None:
@@ -1285,7 +1305,8 @@ def run_client(  # noqa: PLR0913 - the keyword seams are the test and caller con
             :func:`~core.stt_pool.queue.resolve_queue_root` (the
             ``ASKVLM_EXTERNAL_QUEUE_DIR`` environment variable is honored).
         spawn: Starts a supervisor for a queue; defaults to
-            :func:`spawn_supervisor`.
+            :func:`spawn_supervisor`. Never called when
+            ``ASKVLM_EXTERNAL_SUPERVISOR_MANAGED=1``.
         clock: Wall-clock source of the deadline, the spawn timing and the job
             timestamps.
         sleeper: Pause between polls.
@@ -1295,7 +1316,8 @@ def run_client(  # noqa: PLR0913 - the keyword seams are the test and caller con
             completion order.
         poll_interval_s: Pause between result polls.
         start_timeout_s: Longest wait for the first fresh heartbeat after the
-            first spawn (bounded by the deadline).
+            first missing heartbeat (bounded by the deadline), also in managed
+            mode and without a call deadline.
         stale_after_s: Largest heartbeat age that counts as alive.
 
     Returns:

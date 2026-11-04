@@ -5,6 +5,8 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
+ENV_CACHE_DIR = "ASKVLM_CACHE_DIR"
+
 # * Resolve project directories
 
 
@@ -22,15 +24,29 @@ def _find_project_root(start: Path | None = None) -> Path:
     return here.parent
 
 
-def get_project_cache_dir() -> Path:
-    """Return the project-local cache directory for ML assets.
+def get_project_root() -> Path:
+    """Return the project root independently of cache configuration.
 
-    The layout places all vendor caches under a single root:
-    - huggingface → `<root>/.cache/huggingface`
-    - torch       → `<root>/.cache/torch`
-    - whisper     → `<root>/.cache/whisper`
+    Returns:
+        The absolute repository root discovered from this module's location.
+
     """
-    root = _find_project_root()
+    return _find_project_root()
+
+
+def get_project_cache_dir() -> Path:
+    """Return the cache directory for ML assets.
+
+    ``ASKVLM_CACHE_DIR`` overrides the default ``<project>/.cache`` root.
+    The layout places all vendor caches under a single root:
+    - huggingface → `<cache>/huggingface`
+    - torch       → `<cache>/torch`
+    - whisper     → `<cache>/whisper`
+    """
+    configured = os.environ.get(ENV_CACHE_DIR, "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    root = get_project_root()
     return root / ".cache"
 
 

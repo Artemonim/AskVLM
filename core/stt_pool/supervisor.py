@@ -7,7 +7,8 @@ admits v2 jobs from ``incoming/``, runs the pure scheduler of
 (each in its own Job Object, see :mod:`core.stt_pool.procs`), dispatches jobs,
 publishes terminal results, keeps the heartbeat, learns estimates, and exits
 after idling for ``lifecycle.supervisor_linger_s`` or when its stop event is
-set.
+set. With ``ASKVLM_EXTERNAL_SUPERVISOR_MANAGED=1`` it stays alive while idle;
+the external service manager owns its lifetime, while worker idle TTLs apply.
 
 Threads: the main thread owns every piece of state. Worker reader threads and
 Job Object monitor threads only put events on a queue that the main loop waits
@@ -38,7 +39,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, TypeAlias
 
 from core.stt_pool import fsio, ipc
-from core.stt_pool.config import config_summary, project_root
+from core.stt_pool.config import config_summary, is_supervisor_managed, project_root
 from core.stt_pool.engine_api import (
     DEFAULT_ENGINE_FACTORY,
     ERROR_KIND_CUDA_OOM,
@@ -913,6 +914,7 @@ class _Supervisor:
         self._config = config
         self._options = options
         self._stop_event = stop_event
+        self._managed = is_supervisor_managed()
         self._clock = options.clock
         self._limits = Limits.from_config(config)
         self._instance_id = uuid.uuid4().hex
@@ -1048,7 +1050,9 @@ class _Supervisor:
         )
 
     def _idle_exit_due(self, now: float) -> bool:
-        """Return whether nothing ran for the linger time (after a final scan)."""
+        """Return whether an unmanaged supervisor reached its idle linger."""
+        if self._managed:
+            return False
         if self._busy():
             self._idle_since = None
             return False

@@ -24,7 +24,7 @@ By default `external-transcribe` is a **thin client** of one STT supervisor (`ex
 ### Call flow
 
 1. The client starts one wall-clock deadline (`--client-timeout`, default 300 s) for the whole call, probes each input's duration with `ffprobe` (a failed probe only means "duration unknown"), and writes one job per input (two with `--diarization`: transcription and diarization) into the file queue `<queue root>/v2/` (queue root: `ASKVLM_EXTERNAL_QUEUE_DIR` or `<project>/.cache/external_queue`). All inputs of one call share a call id, `--priority` and `--max-parallel`.
-2. If no supervisor heartbeat is fresh, the client starts a **detached** supervisor (with `CREATE_BREAKAWAY_FROM_JOB` when the caller's job object allows it, so the supervisor survives the caller) and keeps re-starting it at most every 10 s while none answers. If no supervisor becomes reachable within 30 s, the unfinished inputs end as `unavailable` (exit `11`); the message names the supervisor log `<queue root>/v2/control/supervisor.out.log`.
+2. If no supervisor heartbeat is fresh, the client starts a **detached** supervisor (with `CREATE_BREAKAWAY_FROM_JOB` when the caller's job object allows it, so the supervisor survives the caller) and keeps re-starting it at most every 10 s while none answers. If no supervisor becomes reachable within 30 s, the unfinished inputs end as `unavailable` (exit `11`); the message names the supervisor log `<queue root>/v2/control/supervisor.out.log`. With `ASKVLM_EXTERNAL_SUPERVISOR_MANAGED=1` the client leaves startup and restarts to an external service manager and uses the same bounded startup wait (section "Linux managed supervisor").
 3. The client waits for the results until the deadline. When the deadline passes, it writes cancel markers for the unfinished jobs (the supervisor drops or stops them) and reports `timeout` (exit `10`). `--client-timeout inf` waits without a deadline.
 4. There is **no in-process CPU recovery** in the client: a GPU job that cannot finish is not re-run on CPU inside the client process.
 
@@ -35,7 +35,7 @@ By default `external-transcribe` is a **thin client** of one STT supervisor (`ex
   - CPU worker: one model shared by several concurrent jobs (CPU slots); each slot runs on `threads_per_slot` threads (default 2).
   - Diarization worker (key `sherpa-diarize/pyannote-seg-3.0+wespeaker-resnet34-lm/fp32/cpu`): CPU only and exactly one slot per process, because sherpa-onnx holds the GIL for its whole run; parallelism comes from several processes. The slot runs on `diarization.threads_per_slot` threads (default 4) and shares the CPU slots, the thread budget and the commit budget with STT.
   - GPU worker: one process that batches across jobs — up to 8 GigaAM 20-second windows or up to 4 Whisper clips of at most 30 s with an explicit language (other Whisper jobs run sequentially). GigaAM never runs CUDA inference from several threads.
-- **Workers start on demand** for the configurations that are queued and stop after an idle TTL (default 600 s, `--idle-shutdown`). When a new configuration does not fit, idle workers of other configurations are stopped first (least recently used). Busy workers are never stopped to free resources. The supervisor exits shortly after the last worker stops with an empty queue.
+- **Workers start on demand** for the configurations that are queued and stop after an idle TTL (default 600 s, `--idle-shutdown`). When a new configuration does not fit, idle workers of other configurations are stopped first (least recently used). Busy workers are never stopped to free resources. The supervisor exits shortly after the last worker stops with an empty queue, except in managed mode, where it keeps serving the queue.
 - **Every worker lives in its own Windows Job Object** with a memory limit equal to its commit reservation plus `memory.child_headroom_gib` (default 1 GiB). The limit covers the whole process tree, so child processes such as `ffmpeg` count against it; the headroom is not reserved and not counted in the commit budget. The whole tree dies with the job, so no orphaned GPU processes remain. When the job reaches its limit (in the worker or in a child), the reservation for that configuration grows by 25% (once per worker). On its first such report a ready worker gets its live limit raised to the grown reservation (exactly what a fresh worker would reserve; `memory.live_cap_raise`) when a child process (not the worker itself) hit the limit and the commit budget, the free-commit guard and the critical free commit allow it, and keeps serving; otherwise, and on a second report, it takes no new jobs and stops once its running jobs end (a worker that hit the limit while loading still serves). A job that failed under a reported limit without a more specific error kind is retried as `memory_limit` while attempts remain (after a live raise possibly on the same worker). `ffmpeg` exit codes that mean "out of memory" (`0xC000012D`, `0xC0000017`, `-12`) count as a memory failure as well. Workers run with the Windows error dialogs turned off, so a child that cannot start (for example with `0xC000012D`) exits with its code instead of waiting for a click on an "Application Error" box.
 - **Admission control:** before a worker starts, the supervisor reserves CPU slots and threads, commit (Windows private bytes) and, for GPU workers, VRAM. It starts at most one cold load at a time and checks the system free commit and the physically free VRAM (`nvidia-smi`) against guards. A request that can never fit the configured limits gets `unavailable` with the numbers.
 - **Device policy:** `cpu` runs on CPU; `cuda` runs on the GPU and waits for GPU capacity (it falls back to CPU only when no CUDA device exists, with the warning `ASKVLM_CUDA_UNAVAILABLE`); `auto` prefers the GPU and moves a job to CPU only when its estimated time to result on CPU is below 0.8 × the estimate for waiting for the GPU, so a long `auto` queue can fill both GPU and CPU slots. `gigaam-ctc` is CPU-only. CPU and GPU results may differ slightly.
@@ -81,6 +81,35 @@ python cli.py external-transcribe-daemon --cpu-slots 4 --gpu-workers 1 --commit-
 
 The old daemon flags `--workers`, `--stt-provider`, `--whisper-model`, `--device`, `--compute-type` and `--language` are accepted and ignored (a note with `ASKVLM_DEPRECATED` goes to `stderr`): the pool serves every configuration.
 
+### Linux managed supervisor
+
+Set `ASKVLM_EXTERNAL_SUPERVISOR_MANAGED=1` in **both** the supervisor service and the environment of every CLI client (for a bot, in the bot's service environment). Only the exact value `1` opts in; an inherited systemd `INVOCATION_ID` does not enable this mode. Without the flag, detached startup and respawning remain unchanged, including on Windows.
+
+A managed client never spawns a supervisor, including when a heartbeat is missing or stale. The first fresh heartbeat must arrive within the existing 30 s startup budget or the remaining call deadline, whichever is shorter; `--client-timeout inf` still has this finite startup budget. Failure cancels the pending jobs and returns the usual `ASKVLM_DAEMON_UNAVAILABLE` / exit `11`, with the heartbeat path, rotating supervisor log path and `systemctl status` / `journalctl -u askvlm-external-transcriber.service` diagnostics. Once a heartbeat has been seen, the existing result/deadline behavior applies while the service manager handles any restart. Output formats and exit codes of the external commands are unchanged.
+
+The managed supervisor ignores `lifecycle.supervisor_linger_s` and stays up until stopped or failed, so `Restart=on-failure` also works after a long idle period. Worker idle TTL, resource admission and graceful shutdown keep their normal behavior.
+
+The unit [askvlm-external-transcriber.service](../deploy/systemd/askvlm-external-transcriber.service) uses a static service account, an explicit `HOME`, the checkout as `WorkingDirectory`, and its `.venv/bin/python`. Its **example layout** is `/srv/askvlm` for the checkout, `/var/lib/askvlm` for the home/queue, `/var/cache/askvlm` for caches, and `/etc/askvlm/stt_pool.json` for configuration. Adapt the account and paths before installation, including `RequiresMountsFor`. Place the queue and model caches on SSD.
+
+Server setup, performed by the operator:
+
+1. Create a static service account with a writable home, deploy the checkout, and install Python 3.11, FFmpeg (`ffmpeg` and `ffprobe` on `PATH`) and the CPU dependencies below. Create the home, cache and configuration directories with appropriate ownership; keep the home, queue and caches private to the service identity.
+2. Copy [stt_pool.linux-server.example.json](../stt_pool.linux-server.example.json) to the configured path. This starting point for **4 vCPU / 16 GiB shared with the bot and PostgreSQL** has zero GPU workers, one CPU slot with two threads, a two-thread pool budget and explicit two-thread diarization. Transcription and diarization share that one slot. Worker reservations are capped at 6 GiB, with a 6 GiB free-memory guard and a 3 GiB critical threshold; tune after measuring server workloads. These are admission limits, not Linux hard memory isolation; the current Linux probe still approximates free commit as available RAM plus free swap.
+3. Set `ASKVLM_CACHE_DIR` to an absolute, writable SSD directory (the unit uses `/var/cache/askvlm`). It selects the shared cache root for GigaAM, Whisper, sherpa diarization and vendor caches; without it, the default remains `<project>/.cache`. ML setup derives Hugging Face, Torch, Whisper and XDG cache variables from this root unless explicitly overridden. `HF_HOME` alone does **not** relocate the pipelines' explicit model paths. Models download on first use; provision disk space and outbound access, and calibrate the client's timeout for a cold model load.
+4. Optionally create `/etc/askvlm/external-transcriber.env` (mode `0600`) to override the unit's queue, configuration or cache environment. It uses systemd `KEY=value` syntax, without shell `export`; a missing file is allowed. Give all clients the **same absolute queue root** and the managed flag. With `UMask=0077`, run clients under the same static service UID, or deliberately configure filesystem ACLs and permissions for a different UID. The supervisor must also be able to read the clients' input media; keep shared media paths visible to both services.
+5. Stop any detached supervisor serving the same queue, or let it idle out, before enabling the adapted unit: a second supervisor exits with code `0` because of the queue lock and is not restarted by `Restart=on-failure`. Install the unit and enable it manually. The bot unit can order and depend on `askvlm-external-transcriber.service` through `After=` / `Requires=`; ordering does not prove heartbeat readiness, which the client checks itself.
+
+```powershell
+sudo install -m 0644 deploy/systemd/askvlm-external-transcriber.service /etc/systemd/system/askvlm-external-transcriber.service
+sudo systemd-analyze verify /etc/systemd/system/askvlm-external-transcriber.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now askvlm-external-transcriber.service
+sudo systemctl status askvlm-external-transcriber.service
+sudo journalctl -u askvlm-external-transcriber.service -n 100
+```
+
+The unit uses `Restart=on-failure`, a 5 s restart delay and at most five starts per 300 s, `KillMode=control-group`, a 90 s stop timeout, `UMask=0077` and journald output. It has neither `DynamicUser` nor `ProtectHome`. `Delegate=yes` prepares the service for per-worker cgroup v2 limits; this slice does not implement `memory.max`, `memory.events` or new OOM/SIGKILL classification. See the systemd references for [service restart policy](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html), [environment files](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html) and [cgroup delegation](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html).
+
 ### Batch calls
 
 ```powershell
@@ -111,6 +140,8 @@ python cli.py external-transcribe "C:\media\call.wav" --no-daemon
 
 ## Installation
 
+For CPU-only Linux use the subsection below; the following example is for the usual CUDA environment.
+
 First install the project and ML dependencies (Whisper + both GigaAM providers share one extra):
 
 ```powershell
@@ -125,6 +156,18 @@ The `[ml]` stack includes torch/torchaudio **2.10** (CUDA wheels repaired by `ru
 Model load uses Hugging Face Transformers with `trust_remote_code=True` **only** for two pinned repos: `ai-sage/GigaAM-Multilingual` at revision `ctc` and `ai-sage/GigaAM-v3` at revision `e2e_ctc` (the cards' official remote-code API). That trust is scoped to these models/revisions, not to arbitrary HF repos. For v3 the wrapper patches `hydra.utils.instantiate` (CPU device) and `PreTrainedModel._finalize_model_loading` (transformers 5.x compat) around `from_pretrained` and **always** restores the originals in `finally`, including when load raises. The v3 weights are always loaded on CPU and cast to fp32; for `--device auto|cuda` the finished model is then moved to CUDA as a whole, after the patches are removed. The model is not converted to fp16 as a whole: the mel frontend (n_fft=320) stays fp32, and on CUDA the encoder runs under the remote code's own `torch.autocast(float16)`. If remote code raises `ImportError`/`ModuleNotFoundError` because `[ml]` is incomplete, the wrapper surfaces `pip install -e ".[ml]"` and keeps the missing module name.
 
 Do not install `torch` from PyPI on top of a CUDA build without a follow-up `run.ps1`/`build.ps1`: bare `pip install -e .[ml]` often leaves CPU `torch 2.10.0`. Opt out with `-SkipEnsureCUDA`. See `doc/CUDA_SETUP.md`.
+
+### CPU-only Linux installation
+
+In a fresh server venv, install the project's compatible torch/torchaudio 2.10 CPU wheels **before** the ML extra, so pip can reuse them. These commands are operator setup instructions; the systemd service does not install dependencies or preload models.
+
+```bash
+python3.11 -m venv .venv
+./.venv/bin/python -m pip install "torch==2.10.0+cpu" "torchaudio==2.10.0+cpu" --index-url https://download.pytorch.org/whl/cpu
+./.venv/bin/python -m pip install -e ".[ml]"
+```
+
+The CPU index follows the [official PyTorch 2.10 installation instructions](https://pytorch.org/get-started/previous-versions/#v2100); the version matches this project's `[ml]` constraints. On a CPU-only environment always pass the existing `-SkipEnsureCUDA` flag when invoking `run.ps1` or `build.ps1`, since their default CUDA repair replaces CPU wheels. Those wrappers currently use the Windows venv layout; on Linux invoke `.venv/bin/python` directly as above and in the unit. Use `--device cpu` in the bot's external transcription calls.
 
 If using a virtual environment on Windows:
 

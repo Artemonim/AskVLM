@@ -1,0 +1,2 @@
+# * systemd units use LF on every checkout.
+deploy/systemd/*.service text eol=lf

@@ -1,0 +1,32 @@
+# * Adapt the example account and SSD paths before installation; see the CLI guide.
+[Unit]
+Description=AskVLM external transcription supervisor
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/srv/askvlm /var/lib/askvlm /var/cache/askvlm
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=askvlm
+Group=askvlm
+WorkingDirectory=/srv/askvlm
+Environment=HOME=/var/lib/askvlm
+Environment=ASKVLM_EXTERNAL_SUPERVISOR_MANAGED=1
+Environment=ASKVLM_EXTERNAL_QUEUE_DIR=/var/lib/askvlm/external_queue
+Environment=ASKVLM_STT_POOL_CONFIG=/etc/askvlm/stt_pool.json
+Environment=ASKVLM_CACHE_DIR=/var/cache/askvlm
+EnvironmentFile=-/etc/askvlm/external-transcriber.env
+ExecStart=/srv/askvlm/.venv/bin/python -X utf8 /srv/askvlm/cli.py external-transcribe-daemon
+UMask=0077
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=90
+KillMode=control-group
+Delegate=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

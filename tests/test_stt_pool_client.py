@@ -9,12 +9,17 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from functools import partial
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
+from typer.testing import CliRunner
 
+import cli
+from core import settings as core_settings
+from core.diarization_models import default_cache_dir
 from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
 from core.stt_pool.client import run_client, spawn_supervisor
 from core.stt_pool.queue import (
@@ -22,6 +27,7 @@ from core.stt_pool.queue import (
     SupervisorLock,
     is_cancel_requested,
     read_heartbeat,
+    resolve_queue_root,
     write_heartbeat,
     write_result,
 )
@@ -42,6 +48,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.xdist_group(name="pool_superv
 @pytest.fixture
 def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[ClientHarness]:
     """Own only temporary queues and fake workers for every client scenario."""
+    monkeypatch.delenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", raising=False)
     harness = ClientHarness(tmp_path, monkeypatch)
     try:
         yield harness
@@ -53,15 +60,27 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[ClientHa
     ("mode", "text", "status"),
     [("ok", "Привет\nworld", "ok"), ("empty", "", "empty"), ("error", "", "error")],
 )
+@pytest.mark.parametrize("managed", [False, True])
 def test_run_client_transcribe_result_from_real_worker(
-    client: ClientHarness, mode: str, text: str, status: str
+    client: ClientHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    text: str,
+    status: str,
+    *,
+    managed: bool,
 ) -> None:
     """Catch lost transcripts, empty failures or missing worker detail."""
+    if managed:
+        monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", "1")
+        client.pool.start()
+        client.pool.heartbeat(lambda value: value["state"] == "running")
     media = client.media(mode=mode, text=text)
     reported: list[InputOutcome] = []
     result = client.run(client.request(media), on_outcome=reported.append)
     outcome = result.outcomes[0]
     assert outcome.status == status
+    assert client.spawned == (0 if managed else 1)
     assert outcome.text == text
     if mode == "error":
         assert outcome.detail == client.pool.events("emitted")[0]["error_detail"]
@@ -207,10 +226,18 @@ def test_abandoned_call_cancels_its_jobs(
 
 
 @pytest.mark.parametrize("spawn_fails", [False, True])
+@pytest.mark.parametrize("managed_value", [None, "0", "true", " 1 "])
 def test_unavailable_names_supervisor_log_and_respawns_at_ten_seconds(
-    client: ClientHarness, *, spawn_fails: bool
+    client: ClientHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    managed_value: str | None,
+    *,
+    spawn_fails: bool,
 ) -> None:
     """Catch endless startup waits, spawn storms or lost log paths."""
+    monkeypatch.setenv("INVOCATION_ID", "inherited-bot-service")
+    if managed_value is not None:
+        monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", managed_value)
     clock = PolicyClock()
     spawns: list[float] = []
 
@@ -237,6 +264,161 @@ def test_unavailable_names_supervisor_log_and_respawns_at_ten_seconds(
     assert spawns == [1000, 1010, 1020]
     assert clock() == 1030
     assert len(tuple(client.pool.paths.cancel.iterdir())) == 1
+
+
+@pytest.mark.parametrize("timeout_s", [math.inf, 300.0, 7.0])
+@pytest.mark.parametrize("stale", [False, True])
+def test_managed_cli_startup_is_bounded_without_spawning(
+    client: ClientHarness,
+    monkeypatch: pytest.MonkeyPatch,
+    timeout_s: float,
+    *,
+    stale: bool,
+) -> None:
+    """Catch managed spawns, unbounded startup or lost exit 11 and cancellation."""
+    monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", "1")
+    clock = PolicyClock()
+    monkeypatch.setattr("core.stt_pool.queue.time", clock)
+    if stale:
+        write_heartbeat(client.pool.paths, {"state": "running"})
+        clock.sleep(60)
+    started_at = clock()
+    spawns: list[QueuePaths] = []
+    # * Bind external process, probe and time boundaries; keep the CLI/client real.
+    monkeypatch.setattr(
+        cli,
+        "run_client",
+        partial(
+            run_client,
+            spawn=spawns.append,
+            clock=clock,
+            sleeper=clock.sleep,
+            probe_duration=lambda _path, _timeout: None,
+            poll_interval_s=5,
+        ),
+    )
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "external-transcribe",
+            str(client.media()),
+            "--diarization",
+            "--client-timeout",
+            str(timeout_s),
+        ],
+    )
+    assert result.exit_code == 11, (result.exception, result.output)
+    assert result.stdout_bytes == b""
+    assert result.stderr.startswith("ASKVLM_DAEMON_UNAVAILABLE:")
+    for diagnostic in (
+        "ASKVLM_EXTERNAL_SUPERVISOR_MANAGED=1",
+        "systemctl status",
+        "journalctl -u askvlm-external-transcriber.service",
+        str(client.pool.paths.heartbeat_file),
+        str(client.pool.paths.supervisor_log),
+    ):
+        assert diagnostic in result.stderr
+    assert not spawns
+    assert clock() == started_at + min(30.0, timeout_s)
+    jobs = client.jobs()
+    assert {job.kind for job in jobs} == {"stt", "diarize"}
+    assert {job.deadline_at for job in jobs} == {
+        None if math.isinf(timeout_s) else started_at + timeout_s
+    }
+    assert {path.name for path in client.pool.paths.cancel.iterdir()} == {
+        job.job_id for job in jobs
+    }
+
+
+@pytest.mark.parametrize("completes", [False, True])
+def test_managed_heartbeat_loss_leaves_restarts_to_the_service(
+    client: ClientHarness, monkeypatch: pytest.MonkeyPatch, *, completes: bool
+) -> None:
+    """Catch respawning or a startup timeout after managed readiness."""
+    monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", "1")
+    clock = PolicyClock()
+    monkeypatch.setattr("core.stt_pool.queue.time", clock)
+    spawns: list[QueuePaths] = []
+
+    def service_progress(delay: float) -> None:
+        clock.sleep(delay)
+        if clock() == 1005:
+            write_heartbeat(client.pool.paths, {"state": "running"})
+        if completes and clock() == 1040:
+            job = client.jobs()[0]
+            write_result(
+                client.pool.paths,
+                ResultRecord(job.job_id, "ok", "service result", backend="cpu"),
+            )
+
+    result = run_client(
+        client.request(client.media(), client_timeout_s=45),
+        queue_root=client.pool.paths.root,
+        spawn=spawns.append,
+        clock=clock,
+        sleeper=service_progress,
+        probe_duration=lambda _path, _timeout: None,
+        poll_interval_s=5,
+        stale_after_s=2,
+    )
+    assert not spawns
+    outcome = result.outcomes[0]
+    if completes:
+        assert outcome.status == "ok"
+        assert outcome.text == "service result"
+        assert clock() == 1040
+        assert not tuple(client.pool.paths.cancel.iterdir())
+    else:
+        assert outcome.status == "timeout"
+        assert clock() == 1045
+        assert {path.name for path in client.pool.paths.cancel.iterdir()} == {
+            job.job_id for job in client.jobs()
+        }
+
+
+@pytest.mark.parametrize("relative", [False, True])
+def test_model_cache_override_preserves_the_legacy_queue_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, relative: bool
+) -> None:
+    """Catch cache relocation splitting clients from the default queue."""
+    project = Path(__file__).resolve().parents[1]
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ASKVLM_EXTERNAL_QUEUE_DIR", raising=False)
+    monkeypatch.delenv("ASKVLM_CACHE_DIR", raising=False)
+    assert core_settings.get_project_cache_dir() == project / ".cache"
+    for blank in ("", " \t "):
+        monkeypatch.setenv("ASKVLM_CACHE_DIR", blank)
+        assert core_settings.get_project_cache_dir() == project / ".cache"
+    root = tmp_path / "model-cache"
+    configured = "model-cache" if relative else str(root)
+    monkeypatch.setenv("ASKVLM_CACHE_DIR", f"  {configured}  ")
+    vendor_paths = {
+        "HF_HOME": root / "huggingface",
+        "HF_HUB_CACHE": root / "huggingface" / "hub",
+        "TRANSFORMERS_CACHE": root / "huggingface" / "hub",
+        "TORCH_HOME": root / "torch",
+        "WHISPER_CACHE": root / "whisper",
+        "XDG_CACHE_HOME": root,
+    }
+    for variable in (
+        *vendor_paths,
+        "HF_HUB_DISABLE_SYMLINKS",
+        "HF_HUB_DISABLE_SYMLINKS_WARNING",
+    ):
+        monkeypatch.setenv(variable, "")
+        monkeypatch.delenv(variable)
+    assert core_settings.configure_ml_caches() == root
+    settings = core_settings.load_settings(tmp_path / "settings.json")
+    assert settings.models_path == root / "models"
+    assert default_cache_dir() == root / "models" / "sherpa-diarization"
+    for variable, directory in vendor_paths.items():
+        assert os.environ[variable] == str(directory)
+        assert directory.is_dir()
+    assert resolve_queue_root() == project / ".cache" / "external_queue"
+    monkeypatch.setenv("ASKVLM_EXTERNAL_QUEUE_DIR", str(tmp_path / "service-queue"))
+    assert resolve_queue_root() == tmp_path / "service-queue"
+    explicit = tmp_path / "explicit-queue"
+    assert resolve_queue_root(explicit) == explicit
 
 
 def test_infinite_timeout_has_no_job_deadline_and_still_receives_results(
