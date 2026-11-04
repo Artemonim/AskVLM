@@ -25,6 +25,8 @@ from typing import TYPE_CHECKING
 
 import psutil  # type: ignore[import-untyped]
 
+from core.stt_pool.config import is_supervisor_managed
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
@@ -37,7 +39,10 @@ MIB = 1024**2
 # * Sources of a :class:`CommitInfo` reading.
 COMMIT_SOURCE_WINDOWS = "GetPerformanceInfo"
 COMMIT_SOURCE_PSUTIL = "psutil available+swap"
+COMMIT_SOURCE_MEMAVAILABLE = "/proc/meminfo MemAvailable"
 COMMIT_SOURCE_UNAVAILABLE = "unavailable"
+
+_MEMINFO = Path("/proc/meminfo")
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _NVIDIA_SMI_QUERY = "name,memory.used,memory.total"
@@ -101,7 +106,8 @@ class CommitInfo:
 
     Attributes:
         free_bytes: ``(CommitLimit - CommitTotal) * PageSize`` on Windows;
-            available RAM plus free swap elsewhere; ``0`` when no probe works.
+            ``MemAvailable`` on managed Linux, available RAM plus free swap
+            elsewhere; ``0`` when no probe works.
         limit_bytes: Commit limit, when known.
         used_bytes: Current commit charge, when known.
         source: Probe used (``COMMIT_SOURCE_*``).
@@ -136,17 +142,38 @@ def _query_windows_commit() -> CommitInfo | None:
     return CommitInfo(max(0, limit - used), limit, used, COMMIT_SOURCE_WINDOWS)
 
 
+def _query_linux_available() -> CommitInfo:
+    """Read managed admission headroom from RAM only, never adding free swap."""
+    try:
+        for line in _MEMINFO.read_text(encoding="ascii").splitlines():
+            label, sep, value = line.partition(":")
+            if sep and label == "MemAvailable":
+                number, unit = value.split()
+                if unit != "kB" or not number.isascii() or not number.isdecimal():
+                    break
+                return CommitInfo(
+                    int(number) * 1024, None, None, COMMIT_SOURCE_MEMAVAILABLE
+                )
+    except (OSError, UnicodeError, ValueError):
+        return CommitInfo(0, None, None, COMMIT_SOURCE_UNAVAILABLE)
+    return CommitInfo(0, None, None, COMMIT_SOURCE_UNAVAILABLE)
+
+
 def query_commit() -> CommitInfo:
     """Return the free system commit.
 
-    Windows uses Win32 ``GetPerformanceInfo``. Elsewhere, or when that call
-    fails, the free commit is approximated by available RAM plus free swap.
+    Windows uses Win32 ``GetPerformanceInfo``. Managed Linux uses
+    ``/proc/meminfo`` ``MemAvailable`` with no swap fallback. Elsewhere, or
+    when the Windows call fails, free commit is approximated by available RAM
+    plus free swap.
 
     Returns:
         Commit snapshot. When every probe fails, ``free_bytes`` is ``0`` and
         :attr:`CommitInfo.known` is ``False``; callers treat that as unknown.
 
     """
+    if sys.platform == "linux" and is_supervisor_managed():
+        return _query_linux_available()
     reading = _query_windows_commit()
     if reading is not None:
         return reading

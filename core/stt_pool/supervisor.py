@@ -27,10 +27,12 @@ The module imports no ML packages.
 
 from __future__ import annotations
 
+import errno
 import logging
 import logging.handlers
 import os
 import queue
+import sys
 import threading
 import time
 import uuid
@@ -54,7 +56,12 @@ from core.stt_pool.engine_api import (
 )
 from core.stt_pool.estimates import EstimateStore
 from core.stt_pool.keys import device_for_backend, make_key
-from core.stt_pool.procs import WorkerProcess, WorkerSpawnError, default_worker_launch
+from core.stt_pool.procs import (
+    WorkerCgroupBusyError,
+    WorkerProcess,
+    WorkerSpawnError,
+    default_worker_launch,
+)
 from core.stt_pool.queue import (
     ERROR_KIND_INPUT_INVALID,
     JOB_KIND_DIARIZE,
@@ -110,6 +117,7 @@ if TYPE_CHECKING:
 
     from core.stt_pool.config import PoolConfig
     from core.stt_pool.keys import WorkerKey
+    from core.stt_pool.linux_cgroup import MemoryEvents
     from core.stt_pool.procs import WorkerLaunch
     from core.stt_pool.queue import ResultStatus
     from core.stt_pool.scheduler import Action, Reservation, Spawn, WorkerState
@@ -178,6 +186,7 @@ MAX_EVENTS_PER_PUMP = 1000
 _LOADING_STATES: frozenset[str] = frozenset({"spawning", "loading"})
 _IDLE_STOP_STATES: frozenset[str] = frozenset({"ready", "retiring"})
 _GIB = 1024**3
+_POSIX_SIGKILL_EXIT_CODE = -9
 
 CancelReason = Literal["cancelled", "expired"]
 ExitKind = Literal["stopped", "cancel_kill", "load_failed", "crashed"]
@@ -209,7 +218,8 @@ class SupervisorOptions:
         max_plan_jobs: Most pending jobs handed to one planning tick (the
             oldest by admission plus every ``high`` job).
         require_job: Passed to :class:`~core.stt_pool.procs.WorkerProcess`;
-            ``None`` requires a Job Object on Windows.
+            ``None`` requires a Job Object on Windows. Managed Linux caps
+            remain mandatory independently of this Windows setting.
         temp_gc: Startup sweep of stale AskVLM temp directories.
         cuda_absent_grace_s: How long after the start a GPU probe that never
             succeeded keeps the GPU presence ``unknown`` (``cuda`` jobs wait)
@@ -611,6 +621,7 @@ class _Job:
     assignment: Assign | None = None
     cancel_reason: CancelReason | None = None
     cancel_sent_at: float | None = None
+    oom_baseline: MemoryEvents | None = None
 
     @property
     def job_id(self) -> str:
@@ -676,6 +687,7 @@ class _Worker:
     cap_hits_at_raise: int = 0
     pre_raise_attempts: frozenset[str] = frozenset()
     pre_raise_limit_bytes: int = 0
+    oom_baseline: MemoryEvents | None = None
 
 
 @dataclass(slots=True)
@@ -857,7 +869,8 @@ def _cap_failure(
 
     """
     limit_gib = limit_bytes / _GIB
-    note = f"the worker's Job Object reached its memory limit of {limit_gib:.2f} GiB"
+    backend = "cgroup v2" if worker.proc.in_cgroup else "Job Object"
+    note = f"the worker's {backend} reached its memory limit of {limit_gib:.2f} GiB"
     detail = f"{result.error_detail}; {note}" if result.error_detail else note
     logger.warning(
         "error of a capped worker taken as %s: job_id=%s worker_id=%s key=%s "
@@ -1412,7 +1425,11 @@ class _Supervisor:
             else:
                 self._fail_load(worker, "protocol", now)
             return
+        self._note_cgroup_oom(worker, worker.oom_baseline)
         worker.loaded = True
+        events = worker.proc.memory_events()
+        if events is not None:
+            worker.oom_baseline = events
         if worker.state in _LOADING_STATES:
             worker.state = "ready"
             worker.idle_since = now
@@ -1481,6 +1498,16 @@ class _Supervisor:
                 worker.worker_id,
             )
             return
+        if job.cancel_reason is None and result.status != "cancelled":
+            self._note_cgroup_oom(worker, job.oom_baseline or worker.oom_baseline)
+        if (
+            sys.platform != "win32"
+            and job.cancel_reason is not None
+            and result.status == "error"
+            and result.error_kind == ERROR_KIND_MEMORY_LIMIT
+        ):
+            self._on_cancelled(job, worker, result, now)
+            return
         if result.status == "cancelled":
             self._on_cancelled(job, worker, result, now)
         elif result.status == "error" and result.error_kind in {
@@ -1521,6 +1548,28 @@ class _Supervisor:
                 memory=result.memory,
             )
             self._publish(job, outcome, worker=worker, now=now)
+
+    def _note_cgroup_oom(self, worker: _Worker, baseline: MemoryEvents | None) -> None:
+        """Grow on proven Linux OOM, retiring a ready worker and preserving stops."""
+        if (
+            not worker.proc.in_cgroup
+            or worker.stop_reason is not None
+            or worker.kill_reason is not None
+            or self._stop_event.is_set()
+        ):
+            return
+        events = worker.proc.memory_events()
+        if events is None or not events.killed_since(baseline):
+            return
+        logger.warning(
+            "worker cgroup OOM kill: worker_id=%s baseline=%s memory_events=%s",
+            worker.worker_id,
+            baseline,
+            events,
+        )
+        if worker.state == "ready":
+            worker.state = "retiring"
+        self._bump_memory_once(worker, vram=False, reason="cgroup OOM kill")
 
     @staticmethod
     def _parse_result(
@@ -1896,12 +1945,16 @@ class _Supervisor:
                 worker.last_used_at = now
                 if not worker.running:
                     worker.idle_since = now
+                    events = worker.proc.memory_events()
+                    if events is not None:
+                        worker.oom_baseline = events
         job.worker_id = None
         job.attempt_id = None
         job.started_at = None
         job.assignment = None
         job.cancel_reason = None
         job.cancel_sent_at = None
+        job.oom_baseline = None
 
     def _persist_attempts(self, job: _Job) -> bool:
         """Write the job's attempt counter; return whether it was written."""
@@ -2336,6 +2389,7 @@ class _Supervisor:
                 diarize=record.diarize,
             ),
         }
+        job.oom_baseline = worker.proc.memory_events() or worker.oom_baseline
         if not worker.proc.send(message):
             logger.warning(
                 "job send failed; worker treated as dead: job_id=%s worker_id=%s",
@@ -2366,12 +2420,15 @@ class _Supervisor:
     # * Worker processes.
 
     def _spawn(self, action: Spawn, now: float) -> None:
-        """Start a worker for *action*; a failed start counts as a crash.
+        """Start a worker; busy delegation defers, other failed starts count as crashes.
 
         A worker of a key whose failed cold load has not exited yet is not
         started: the failed process still holds its reservation, and a
         load-failure cooldown shorter than its teardown must not let a
         replacement load next to it. The job waits for a later tick.
+        A busy delegated cgroup leaves the job pending without a worker or
+        reservation; the regular serve/tick cadence retries its spawn, with
+        the job's deadline and the model's crash bookkeeping unchanged.
         """
         key = action.key
         if self._load_failure_unconfirmed(key):
@@ -2397,7 +2454,18 @@ class _Supervisor:
             ),
             engine_factory=self._options.engine_factory,
         )
-        proc = self._start_process(spec, action.reservation)
+        try:
+            proc = self._start_process(spec, action.reservation)
+        except WorkerCgroupBusyError as exc:
+            logger.warning(
+                "worker spawn deferred until a later tick: delegated cgroup busy: "
+                "worker_id=%s key=%s reason_job_id=%s error=%s",
+                worker_id,
+                key.label,
+                action.reason_job_id,
+                exc,
+            )
+            return
         if proc is None:
             # * The reservation is released with the action: nothing was added.
             self._record_crash(key, now)
@@ -2410,6 +2478,7 @@ class _Supervisor:
             proc=proc,
             spawned_at=now,
             last_used_at=now,
+            oom_baseline=proc.initial_memory_events,
         )
         if key.backend == "gpu":
             self._last_gpu_change_ts = now
@@ -2428,7 +2497,7 @@ class _Supervisor:
         )
 
     def _job_limit_bytes(self, reservation: Reservation) -> int:
-        """Return the Job Object commit cap of a worker with *reservation*.
+        """Return the platform memory cap of a worker with *reservation*.
 
         The cap is the commit reservation plus ``memory.child_headroom_gib``,
         because child processes such as ffmpeg share the job's cap. The
@@ -2446,11 +2515,15 @@ class _Supervisor:
     def _start_process(
         self, spec: WorkerSpec, reservation: Reservation
     ) -> WorkerProcess | None:
-        """Start a worker process in its Job Object and send its spec.
+        """Start a worker with its platform memory cap and send its spec.
 
         Returns:
             The running handle, or ``None`` when the process could not be
             started safely (everything it created is closed).
+
+        Raises:
+            WorkerCgroupBusyError: Delegation is busy; the caller retries on a
+                later tick without counting a model crash.
 
         """
         key = spec.key
@@ -2478,6 +2551,9 @@ class _Supervisor:
             return None
         try:
             proc.start(spec.to_message())
+        except WorkerCgroupBusyError:
+            proc.close(timeout_s=CLOSE_TIMEOUT_S)
+            raise
         except (WorkerSpawnError, OSError, TypeError, ValueError) as exc:
             logger.warning(
                 "worker spawn failed: worker_id=%s key=%s error=%s",
@@ -2542,7 +2618,7 @@ class _Supervisor:
         if code is None:
             code = proc.poll()
         peak = proc.peak_memory_bytes()
-        limit_hit = self._memory_limit_hit(worker, peak)
+        limit_hit = self._memory_limit_hit(worker, peak, code)
         tail = proc.log_tail(LOG_TAIL_CHARS).replace("\r\n", "\n")
         now = self._clock()
         kind = _exit_kind(worker)
@@ -2629,11 +2705,20 @@ class _Supervisor:
     def _ran_under_reported_cap(self, worker: _Worker, job: _Job) -> bool:
         """Return whether *job*'s attempt ran under a commit cap that was reported.
 
+        Managed Linux requires kill-counter growth after this attempt's
+        baseline; a previous attempt's OOM never qualifies on its own.
         Without a live raise any report of the worker counts. After a raise, a
         report of the raised cap counts for every attempt, and the report
         that led to the raise only for the attempts that ran at the raise
         (the raise does not erase their failure).
         """
+        if worker.proc.in_cgroup:
+            if worker.stop_reason is not None or worker.kill_reason is not None:
+                return False
+            events = worker.proc.memory_events()
+            return events is not None and events.killed_since(
+                job.oom_baseline or worker.oom_baseline
+            )
         hits = self._cap_hits(worker)
         if hits == 0:
             return False
@@ -2641,21 +2726,66 @@ class _Supervisor:
             return True
         return job.attempt_id in worker.pre_raise_attempts
 
-    def _memory_limit_hit(self, worker: _Worker, peak: int | None) -> bool:
-        """Return whether the worker reached its Job Object commit cap.
+    def _memory_limit_hit(
+        self, worker: _Worker, peak: int | None, code: int | None
+    ) -> bool:
+        """Return whether the worker exit has platform memory-failure evidence.
 
-        A report of the current cap (:meth:`_cap_reported`; after a live raise,
+        POSIX uses ENOMEM or SIGKILL with worker-cgroup kill evidence, excluding
+        requested termination. Windows uses a report of the current cap
+        (:meth:`_cap_reported`; after a live raise,
         a report of the raised cap) or a peak at
         :data:`MEMORY_LIMIT_PEAK_RATIO` of the current (raised) cap counts.
         The verdict decides how an exit is classified and whether its
         re-queued jobs are pinned to the worker's backend.
         """
+        if sys.platform != "win32":
+            return self._posix_memory_limit_hit(worker, code)
         if self._cap_reported(worker):
             return True
         limit = self._job_limit_bytes(worker.reservation)
         return (
             peak is not None and limit > 0 and peak >= MEMORY_LIMIT_PEAK_RATIO * limit
         )
+
+    def _posix_memory_limit_hit(self, worker: _Worker, code: int | None) -> bool:
+        """Require per-worker kill evidence for SIGKILL, never for a requested stop."""
+        if (
+            worker.stop_reason is not None
+            or worker.kill_reason is not None
+            or worker.proc.termination_requested
+            or self._stop_event.is_set()
+        ):
+            return False
+        baselines = (
+            [
+                job.oom_baseline or worker.oom_baseline
+                for job_id in worker.running
+                if (job := self._jobs.get(job_id)) is not None
+                and job.cancel_reason is None
+            ]
+            if worker.running
+            else [worker.oom_baseline]
+        )
+        if not baselines:
+            return False
+        if code == -errno.ENOMEM:
+            return True
+        if code != _POSIX_SIGKILL_EXIT_CODE or not worker.proc.in_cgroup:
+            return False
+        events = worker.proc.memory_events()
+        if events is None:
+            return False
+        hit = any(events.killed_since(baseline) for baseline in baselines)
+        if hit:
+            logger.warning(
+                "worker SIGKILL has cgroup OOM evidence: worker_id=%s "
+                "baselines=%s memory_events=%s",
+                worker.worker_id,
+                baselines,
+                events,
+            )
+        return hit
 
     def _bump_memory_once(self, worker: _Worker, *, vram: bool, reason: str) -> None:
         """Grow the key's memory estimates x1.25 at most once per worker.

@@ -292,7 +292,7 @@ def test_prepare_audio_cancellable_path_success(
         ("win32", -1073741801, "STATUS_NO_MEMORY"),
         ("win32", -12, "ENOMEM"),
         ("win32", 1, None),
-        ("linux", -12, None),
+        ("linux", -12, "ENOMEM"),
         ("linux", -9, None),
         ("linux", 137, None),
     ],

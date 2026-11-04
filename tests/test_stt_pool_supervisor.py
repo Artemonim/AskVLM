@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import queue
@@ -35,7 +36,12 @@ from core.stt_pool.queue import (
 )
 from core.stt_pool.supervisor import run_supervisor
 from core.stt_pool.sysprobe import hardware_fingerprint
-from tests.stt_pool_supervisor_support import GIB, SupervisorHarness, configuration
+from tests.stt_pool_supervisor_support import (
+    GIB,
+    LinuxPoolBoundary,
+    SupervisorHarness,
+    configuration,
+)
 from tests.stt_pool_windows_support import JobCapKernel, WinEvent
 
 if TYPE_CHECKING:
@@ -45,6 +51,300 @@ if TYPE_CHECKING:
     from core.stt_pool.procs import WorkerLaunch
 
 pytestmark = [pytest.mark.integration, pytest.mark.xdist_group(name="pool_supervisor")]
+
+
+def _oom_events(kills: int, group_kills: int = 0, pressure: int = 0) -> str:
+    """Describe independently controlled kernel counters, including non-kill pressure."""
+    return (
+        f"high {pressure}\nmax {pressure}\noom {pressure}\n"
+        f"oom_kill {kills}\noom_group_kill {group_kills}\n"
+    )
+
+
+def _learned_commit_factor(pool: SupervisorHarness) -> float:
+    """Read persisted resource learning after the supervisor finishes."""
+    learned = json.loads(pool.paths.estimates_file.read_text(encoding="utf-8"))
+    key = make_key("whisper", "small", "auto", "cpu")
+    return float(learned["keys"][key.label]["commit_factor"])
+
+
+@pytest.fixture
+def linux_boundary(
+    pool: SupervisorHarness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Iterator[LinuxPoolBoundary]:
+    """Replace only cgroup files and OS processes, keeping the supervisor real."""
+    try:
+        yield LinuxPoolBoundary(monkeypatch, tmp_path)
+    finally:
+        pool.cleanup()
+
+
+@pytest.mark.parametrize(
+    ("managed", "code", "counters", "expected"),
+    [
+        (True, -9, (6, 2, 0), "memory_limit"),
+        (True, -9, (5, 3, 0), "memory_limit"),
+        (True, -9, (5, 2, 0), "worker_crashed"),
+        (True, -9, (5, 2, 100), "worker_crashed"),
+        (True, -9, (4, 1, 0), "worker_crashed"),
+        (True, 1, (6, 3, 0), "worker_crashed"),
+        (True, -12, (5, 2, 0), "memory_limit"),
+        (False, -9, (6, 3, 0), "worker_crashed"),
+        (False, -12, (5, 2, 0), "memory_limit"),
+    ],
+)
+def test_posix_worker_exit_requires_sigkill_and_its_own_kill_delta(
+    pool: SupervisorHarness,
+    linux_boundary: LinuxPoolBoundary,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    managed: bool,
+    code: int,
+    counters: tuple[int, int, int],
+    expected: str,
+) -> None:
+    """Catch stale counters, pressure or an arbitrary SIGKILL being blamed on OOM."""
+    pool.config = configuration(scheduling={"max_attempts": 1})
+    linux_boundary.kernel.initial_events = _oom_events(5, 2)
+    if not managed:
+        monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", "0")
+    job = pool.job()
+    pool.start()
+    process, _ = linux_boundary.jobs.get(timeout=8)
+    if managed:
+        group = process.executed_group
+        assert group is not None
+        group.files["memory.events"] = _oom_events(*counters)
+    process.finish(code)
+    result = pool.result(job)
+    assert result.status == "error"
+    assert result.error_kind == expected
+    assert result.attempts == 1
+    pool.finish()
+    assert _learned_commit_factor(pool) == (1.25 if expected == "memory_limit" else 1.0)
+    assert not linux_boundary.kernel.handles
+
+
+@pytest.mark.parametrize("fresh_before_assignment", [False, True])
+def test_failed_cgroup_refresh_preserves_baselines_until_a_fresh_attempt_window(
+    pool: SupervisorHarness,
+    linux_boundary: LinuxPoolBoundary,
+    *,
+    fresh_before_assignment: bool,
+) -> None:
+    """Catch lost load/idle baselines and reuse of an old kill in a fresh attempt."""
+    pool.config = configuration(scheduling={"max_attempts": 1})
+    linux_boundary.kernel.fail_events_after = 1
+    first = pool.job()
+    pool.start()
+    process, packet = linux_boundary.jobs.get(timeout=8)
+    group = process.executed_group
+    assert group is not None
+    process.reply(packet)
+    assert pool.result(first).status == "ok"
+    if fresh_before_assignment:
+        linux_boundary.kernel.fail_events_after = None
+        group.files["memory.events"] = _oom_events(1)
+    following = pool.job(call=2)
+    next_process, _ = linux_boundary.jobs.get(timeout=8)
+    assert next_process is process
+    linux_boundary.kernel.fail_events_after = None
+    group.files["memory.events"] = _oom_events(1)
+    process.finish(-9)
+    result = pool.result(following)
+    expected = "worker_crashed" if fresh_before_assignment else "memory_limit"
+    assert result.error_kind == expected
+    assert result.attempts == 1
+    pool.finish()
+    assert _learned_commit_factor(pool) == (1.0 if fresh_before_assignment else 1.25)
+
+
+def test_cached_cgroup_kill_survives_refresh_failure_without_double_growth(
+    pool: SupervisorHarness,
+    linux_boundary: LinuxPoolBoundary,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Catch a failed second read erasing child-OOM evidence or growing twice."""
+    pool.config = configuration(scheduling={"max_attempts": 1})
+    caplog.set_level(logging.WARNING, logger="core.stt_pool.procs")
+    job = pool.job()
+    pool.start()
+    process, packet = linux_boundary.jobs.get(timeout=8)
+    group = process.executed_group
+    assert group is not None
+    group.files["memory.events"] = _oom_events(1)
+    linux_boundary.kernel.fail_events_after = group.event_reads + 1
+    process.reply(packet, "transcribe_failed")
+    result = pool.result(job)
+    assert result.error_kind == "memory_limit"
+    assert result.attempts == 1
+    pool.finish()
+    assert _learned_commit_factor(pool) == 1.25
+    assert any(
+        record.levelno >= logging.WARNING and str(group.path) in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_cgroup_oom_retries_on_a_fresh_worker_with_one_grown_reservation(
+    pool: SupervisorHarness, linux_boundary: LinuxPoolBoundary
+) -> None:
+    """Catch a proven OOM losing its retry, retaining the old cap or growing twice."""
+    job = pool.job()
+    pool.start()
+    first, _ = linux_boundary.jobs.get(timeout=8)
+    group = first.executed_group
+    assert group is not None
+    assert first.execution_cap is not None
+    group.files["memory.events"] = _oom_events(1)
+    first.finish(-9)
+    replacement, packet = linux_boundary.jobs.get(timeout=8)
+    assert replacement is not first
+    assert replacement.execution_cap is not None
+    headroom = pool.config.memory.child_headroom_bytes
+    assert int(replacement.execution_cap) - headroom == pytest.approx(
+        1.25 * (int(first.execution_cap) - headroom)
+    )
+    replacement.reply(packet)
+    result = pool.result(job)
+    assert result.status == "ok"
+    assert result.attempts == 2
+    assert result.backend == "cpu"
+    pool.finish()
+    assert _learned_commit_factor(pool) == 1.25
+
+
+@pytest.mark.parametrize("reason", ["cancelled", "expired"])
+@pytest.mark.parametrize("reply", ["exit", "memory_limit"])
+def test_requested_cancel_or_deadline_wins_over_cgroup_oom_evidence(
+    pool: SupervisorHarness,
+    linux_boundary: LinuxPoolBoundary,
+    reason: str,
+    reply: str,
+) -> None:
+    """Catch a requested cancel/timeout becoming a memory retry or estimate growth."""
+    pool.config = configuration(scheduling={"max_attempts": 1})
+    job = pool.job(deadline=pool.clock.peek() + 10 if reason == "expired" else None)
+    pool.start()
+    process, packet = linux_boundary.jobs.get(timeout=8)
+    group = process.executed_group
+    assert group is not None
+    if reason == "cancelled":
+        request_cancel(pool.paths, job.job_id)
+    else:
+        pool.clock.advance(11)
+    cancelled_process, _ = linux_boundary.cancels.get(timeout=8)
+    assert cancelled_process is process
+    group.files["memory.events"] = _oom_events(1)
+    if reply == "exit":
+        process.finish(-9)
+    else:
+        process.reply(packet, "memory_limit")
+    result = pool.result(job)
+    assert result.status == reason
+    assert result.error_kind == reason
+    assert result.attempts == 1
+    pool.finish()
+    assert _learned_commit_factor(pool) == 1.0
+
+
+def test_requested_stop_preserves_attempt_without_learning_cgroup_oom(
+    pool: SupervisorHarness, linux_boundary: LinuxPoolBoundary
+) -> None:
+    """Catch stop-induced SIGKILL charging an attempt or inflating memory estimates."""
+    job = pool.job()
+    pool.start()
+    process, _ = linux_boundary.jobs.get(timeout=8)
+    group = process.executed_group
+    assert group is not None
+    group.files["memory.events"] = _oom_events(1)
+    linux_boundary.shutdown_code = -9
+    pool.stop_event.set()
+    pool.finish(request_stop=False)
+    assert read_result(pool.paths, job.job_id) is None
+    assert pool.paths.incoming_file(job.job_id).exists()
+    assert read_attempts(pool.paths, job.job_id) == 0
+    assert _learned_commit_factor(pool) == 1.0
+
+
+def test_busy_delegation_preserves_pending_attempt_and_recovers_without_cooldown(
+    pool: SupervisorHarness, linux_boundary: LinuxPoolBoundary
+) -> None:
+    """Catch EBUSY consuming retries/reservations or creating a model crash cooldown."""
+    kernel = linux_boundary.kernel
+    kernel.service.files["cgroup.procs"] = "42\n77\n"
+    job = pool.job()
+    pool.start()
+    pool.until(lambda: kernel.busy_reads, lambda count: count >= 4)
+    heartbeat = pool.heartbeat(lambda value: value["queue"]["pending"] == 1)
+    assert not heartbeat["workers"]
+    assert read_attempts(pool.paths, job.job_id) == 0
+    assert read_result(pool.paths, job.job_id) is None
+    assert not kernel.moves
+    assert not linux_boundary.processes
+    kernel.service.files["cgroup.procs"] = "42\n"
+    process, packet = linux_boundary.jobs.get(timeout=8)
+    process.reply(packet)
+    result = pool.result(job)
+    assert result.status == "ok"
+    assert result.attempts == 1
+    assert all(pid != 77 for pid, _ in kernel.moves)
+    pool.finish()
+    assert _learned_commit_factor(pool) == 1.0
+
+
+@pytest.mark.parametrize("reason", ["cancelled", "expired"])
+def test_persistently_busy_delegation_still_obeys_pending_cancel_and_deadline(
+    pool: SupervisorHarness, linux_boundary: LinuxPoolBoundary, reason: str
+) -> None:
+    """Catch delegation busy bypassing a deadline or launching an uncapped fallback."""
+    kernel = linux_boundary.kernel
+    kernel.service.files["cgroup.procs"] = "42\n77\n"
+    job = pool.job(deadline=pool.clock.peek() + 10 if reason == "expired" else None)
+    pool.start()
+    pool.until(lambda: kernel.busy_reads, lambda count: count >= 4)
+    if reason == "cancelled":
+        request_cancel(pool.paths, job.job_id)
+    else:
+        pool.clock.advance(11)
+    result = pool.result(job)
+    assert result.status == reason
+    assert result.attempts == 0
+    assert not kernel.moves
+    assert not linux_boundary.processes
+    pool.finish()
+
+
+def test_linux_cgroup_cap_adds_child_headroom_outside_the_admission_budget(
+    pool: SupervisorHarness, linux_boundary: LinuxPoolBoundary
+) -> None:
+    """Catch wrong memory.max units or charging child headroom to the pool budget."""
+    pool.config = configuration(memory={"child_headroom_gib": 0})
+    first = pool.job()
+    pool.start()
+    process, packet = linux_boundary.jobs.get(timeout=8)
+    heartbeat = pool.heartbeat(lambda value: value["queue"]["running"] == 1)
+    reservation = heartbeat["workers"][0]["commit_bytes"]
+    assert int(process.execution_cap or "0") == reservation
+    process.reply(packet)
+    assert pool.result(first).status == "ok"
+    pool.finish()
+    pool.config = configuration(
+        memory={
+            "commit_budget_gib": reservation / GIB,
+            "child_headroom_gib": 0.5,
+        }
+    )
+    following = pool.job(call=2)
+    pool.start()
+    replacement, next_packet = linux_boundary.jobs.get(timeout=8)
+    heartbeat = pool.heartbeat(lambda value: value["queue"]["running"] == 1)
+    assert heartbeat["workers"][0]["commit_bytes"] == reservation
+    assert int(replacement.execution_cap or "0") == reservation + GIB // 2
+    assert heartbeat["workers"][0]["job_limit_bytes"] == reservation + GIB // 2
+    replacement.reply(next_packet)
+    assert pool.result(following).status == "ok"
+    pool.finish()
 
 
 @pytest.fixture

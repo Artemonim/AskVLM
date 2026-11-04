@@ -8,13 +8,14 @@ import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, cast
 
 import pytest
 
 from core.stt_errors import CudaOutOfMemoryError, DeviceUnavailableError
 from core.stt_options import DiarizeOptions, MediaWindow, WhisperDecodeOptions
-from core.stt_pool import fsio, ipc
+from core.stt_pool import fsio, ipc, linux_cgroup, sysprobe
 from core.stt_pool import queue as pool_queue
 from core.stt_pool.config import (
     PoolConfigError,
@@ -32,6 +33,7 @@ from core.stt_pool.keys import (
     normalize_priority,
 )
 from core.stt_pool.queue import JobRecord, JobValidationError, QueuePaths, ResultRecord
+from tests.stt_pool_supervisor_support import LinuxPoolBoundary
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -41,6 +43,70 @@ _JOB_ID = "a" * 32
 _CALL_ID = "b" * 32
 # * A generous test budget detects unbounded retry loops without real waits.
 _RETRY_TEST_BUDGET = 32
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize(
+    ("meminfo", "free_bytes"),
+    [
+        ("MemAvailable: 7340032 kB\nSwapFree: 999999999 kB\n", 7 * _GIB),
+        ("MemAvailable: 0 kB\nSwapFree: 999999999 kB\n", 0),
+        ("SwapFree: 999999999 kB\n", None),
+        ("MemAvailable: -1 kB\n", None),
+        ("MemAvailable: 7 MB\n", None),
+        ("MemAvailable: 7 8 kB\n", None),
+        (None, None),
+    ],
+)
+def test_managed_linux_admission_uses_only_valid_memavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    meminfo: str | None,
+    free_bytes: int | None,
+) -> None:
+    """Catch swap inflating admission or a failed RAM probe becoming known headroom."""
+    path = tmp_path / "meminfo"
+    if meminfo is not None:
+        path.write_text(meminfo, encoding="ascii")
+    monkeypatch.setattr(sysprobe, "_MEMINFO", path)
+    monkeypatch.setattr(sysprobe, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", "1")
+    monkeypatch.setattr(
+        sysprobe,
+        "psutil",
+        SimpleNamespace(
+            virtual_memory=lambda: SimpleNamespace(available=50 * _GIB),
+            swap_memory=lambda: SimpleNamespace(free=60 * _GIB),
+        ),
+    )
+    reading = sysprobe.query_commit()
+    assert reading.known is (free_bytes is not None)
+    assert reading.free_bytes == (0 if free_bytes is None else free_bytes)
+    assert reading.limit_bytes is None
+    assert reading.used_bytes is None
+
+
+@pytest.mark.parametrize("managed", [None, "0", "true"])
+def test_unmanaged_linux_admission_retains_available_ram_plus_swap(
+    monkeypatch: pytest.MonkeyPatch, managed: str | None
+) -> None:
+    """Catch accidental propagation of managed RAM-only policy to standalone clients."""
+    monkeypatch.setattr(sysprobe, "sys", SimpleNamespace(platform="linux"))
+    monkeypatch.setattr(
+        sysprobe,
+        "psutil",
+        SimpleNamespace(
+            virtual_memory=lambda: SimpleNamespace(available=3 * _GIB),
+            swap_memory=lambda: SimpleNamespace(free=2 * _GIB),
+        ),
+    )
+    if managed is None:
+        monkeypatch.delenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", raising=False)
+    else:
+        monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", managed)
+    reading = sysprobe.query_commit()
+    assert reading.known
+    assert reading.free_bytes == 5 * _GIB
 
 
 @pytest.mark.integration
@@ -936,3 +1002,103 @@ def test_malformed_structured_result_is_an_explicit_protocol_error(
     assert result.error_kind == "protocol_error"
     assert result.text == ""
     assert result.data is None
+
+
+@pytest.mark.parametrize("state", ["empty", "populated", "replaced"])
+def test_cgroup_cleanup_only_removes_its_unchanged_empty_leaf(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, state: str
+) -> None:
+    """Catch deletion of a populated worker group or another directory at its path."""
+    boundary = LinuxPoolBoundary(monkeypatch, tmp_path)
+    group = linux_cgroup.WorkerCgroup.create("cleanup-peer", 65536)
+    owned = boundary.kernel.nodes[group.path]
+    if state == "populated":
+        group.assign(123)
+    elif state == "replaced":
+        boundary.kernel.replace(group.path)
+    group.close()
+    group.close()
+    if state == "empty":
+        assert group.path not in boundary.kernel.nodes
+    else:
+        remaining = boundary.kernel.nodes[group.path]
+        assert (remaining is owned) is (state == "populated")
+        if state == "populated":
+            assert remaining.files["cgroup.procs"].strip() == "123"
+    assert boundary.kernel.service_path in boundary.kernel.nodes
+    assert not boundary.kernel.handles
+
+
+@pytest.mark.parametrize(
+    "membership",
+    [
+        "0::/system.slice/../escape.service\n",
+        "0::/system.slice/askvlm-test.service/../foreign\n",
+        "0::/system.slice//askvlm-test.service\n",
+        "0::/system.slice/askvlm-test.service\n0::/other.service\n",
+    ],
+)
+def test_unsafe_cgroup_membership_cannot_escape_the_delegated_service(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, membership: str
+) -> None:
+    """Catch path traversal or ambiguous memberships writing outside the unit."""
+    boundary = LinuxPoolBoundary(monkeypatch, tmp_path)
+    linux_cgroup.SELF_CGROUP.write_text(membership, encoding="ascii")
+    with pytest.raises(ValueError, match="membership"):
+        linux_cgroup.WorkerCgroup.create("unsafe-peer", 65536)
+    assert not boundary.kernel.moves
+    assert not boundary.kernel.handles
+
+
+@pytest.mark.parametrize("target", ["ancestor", "control"])
+def test_cgroup_open_refuses_symlinked_directories_and_control_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, target: str
+) -> None:
+    """Catch symlink traversal redirecting cgroup writes into a foreign group."""
+    boundary = LinuxPoolBoundary(monkeypatch, tmp_path)
+    path = (
+        boundary.kernel.service_path.parent
+        if target == "ancestor"
+        else boundary.kernel.service_path / "cgroup.controllers"
+    )
+    boundary.kernel.symlinks.add(path)
+    with pytest.raises(OSError, match=r"\[Errno 40\]"):
+        linux_cgroup.WorkerCgroup.create("symlink-peer", 65536)
+    assert not boundary.kernel.moves
+    assert not boundary.kernel.handles
+
+
+@pytest.mark.parametrize("gate", [b"\0", b"", b"x"])
+def test_linux_bootstrap_executes_only_after_the_enrollment_gate(
+    monkeypatch: pytest.MonkeyPatch, gate: bytes
+) -> None:
+    """Catch EOF or an invalid gate executing worker code before enrollment."""
+    commands: list[tuple[str, list[str], dict[str, str]]] = []
+
+    def exec_boundary(executable: str, argv: list[str], env: dict[str, str]) -> None:
+        commands.append((executable, argv, env))
+        raise SystemExit(0)
+
+    monkeypatch.setattr(
+        linux_cgroup,
+        "os",
+        SimpleNamespace(
+            read=lambda _fd, _size: gate,
+            execvpe=exec_boundary,
+            environ={"WORKER_TEST": "1"},
+        ),
+    )
+    monkeypatch.setattr(
+        linux_cgroup,
+        "sys",
+        SimpleNamespace(stdin=SimpleNamespace(fileno=lambda: 17), stderr=io.StringIO()),
+    )
+    argv = ["--", "worker-python", "-m", "core.stt_pool.worker"]
+    if gate == b"\0":
+        with pytest.raises(SystemExit) as exit_info:
+            linux_cgroup._main(argv)  # noqa: SLF001 - real bootstrap entry point
+        assert exit_info.value.code == 0
+        assert commands == [("worker-python", argv[1:], {"WORKER_TEST": "1"})]
+    else:
+        assert linux_cgroup._main(argv) == 1  # noqa: SLF001 - real bootstrap entry point
+        assert not commands

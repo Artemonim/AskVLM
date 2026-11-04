@@ -21,6 +21,7 @@ from core.stt_pool.keys import make_key
 from core.stt_pool.procs import WorkerProcess, WorkerSpawnError, default_worker_launch
 from core.stt_pool.queue import QueuePaths, SupervisorLock
 from core.stt_pool.sysprobe import query_gpu
+from tests.stt_pool_supervisor_support import LinuxPoolBoundary
 from tests.stt_pool_windows_support import JobCapKernel, allocation_child
 
 if TYPE_CHECKING:
@@ -448,3 +449,89 @@ def test_pool_imports_in_a_fresh_process_cannot_load_ml_dependencies() -> None:
     )
     assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
     assert json.loads(result.stdout)["imported"] > 0
+
+
+def test_managed_worker_is_capped_and_enrolled_before_exec_and_spec(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Catch worker execution or model input preceding mandatory PID enrollment."""
+    boundary = LinuxPoolBoundary(monkeypatch, tmp_path)
+    instance = Peer(tmp_path)
+    try:
+        instance.start()
+        process = boundary.processes[0]
+        group = process.executed_group
+        assert group is not None
+        assert group.path.parent == boundary.kernel.service_path
+        assert process.execution_cap is not None
+        assert int(process.execution_cap) == _MEMORY_CAP
+        assert not process.spec_before_execution
+        assert instance.worker.in_cgroup
+        assert not instance.worker.in_job
+        assert boundary.kernel.member(process.pid) is group
+        assert not boundary.kernel.service.files["cgroup.procs"].strip()
+        assert boundary.kernel.moves[0][0] == boundary.kernel.getpid()
+        assert all(
+            pid in {boundary.kernel.getpid(), process.pid}
+            for pid, _ in boundary.kernel.moves
+        )
+        process.finish(0)
+        assert instance.events.get(timeout=_TIMEOUT_S) is None
+        instance.worker.close(timeout_s=0)
+        assert group.path not in boundary.kernel.nodes
+        assert not boundary.kernel.handles
+    finally:
+        instance.worker.close(timeout_s=0)
+
+
+@pytest.mark.parametrize("failure", ["controller", "memory.max", "cgroup.procs"])
+def test_managed_cap_failure_never_executes_or_sends_spec_uncapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    """Catch missing delegation or denied writes silently allowing unbounded work."""
+    boundary = LinuxPoolBoundary(monkeypatch, tmp_path)
+    if failure == "controller":
+        boundary.kernel.service.files["cgroup.controllers"] = "pids\n"
+    else:
+        boundary.kernel.refuse_control = failure
+        if failure == "cgroup.procs":
+            boundary.kernel.service.files["cgroup.procs"] = ""
+    instance = Peer(tmp_path)
+    try:
+        with pytest.raises(WorkerSpawnError):
+            instance.start()
+        assert all(not process.executed for process in boundary.processes)
+        assert all(process.spec is None for process in boundary.processes)
+        assert all(process.poll() is not None for process in boundary.processes)
+        assert not boundary.kernel.handles
+        assert not any(
+            path.name.startswith("askvlm-worker-") for path in boundary.kernel.nodes
+        )
+    finally:
+        instance.worker.close(timeout_s=0)
+
+
+@pytest.mark.parametrize("managed", [None, "0", "true"])
+def test_unmanaged_linux_worker_keeps_its_uncapped_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, managed: str | None
+) -> None:
+    """Catch applying service cgroups to a standalone Linux worker."""
+    boundary = LinuxPoolBoundary(monkeypatch, tmp_path)
+    if managed is None:
+        monkeypatch.delenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED")
+    else:
+        monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", managed)
+    monkeypatch.setenv("INVOCATION_ID", "parent-service-invocation")
+    instance = Peer(tmp_path)
+    try:
+        instance.start()
+        process = boundary.processes[0]
+        assert not instance.worker.in_cgroup
+        assert process.executed
+        assert process.executed_group is None
+        assert "core.stt_pool.linux_cgroup" not in process.args
+        assert not boundary.kernel.moves
+        process.finish(0)
+        assert instance.events.get(timeout=_TIMEOUT_S) is None
+    finally:
+        instance.worker.close(timeout_s=0)

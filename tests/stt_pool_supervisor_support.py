@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import contextlib
 import gc
+import io
 import json
 import os
+import queue
+import subprocess
 import threading
 import time
-from pathlib import Path
+from dataclasses import dataclass, field
+from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import psutil  # type: ignore[import-untyped]
 
+from core.stt_pool import linux_cgroup, procs, supervisor
 from core.stt_pool.config import parse_pool_config
 from core.stt_pool.procs import default_worker_launch
 from core.stt_pool.queue import (
@@ -31,6 +37,8 @@ from core.temp_gc import TempGcSummary
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+
+    import pytest
 
     from core.stt_pool.config import PoolConfig
     from core.stt_pool.keys import DeviceRequest, Priority, WorkerKey
@@ -358,3 +366,351 @@ class SupervisorHarness:
                 process.wait(timeout=WAIT_TIMEOUT_S)
         gc.collect()
         assert self.thread is None or not self.thread.is_alive()
+
+
+@dataclass
+class CgroupNode:
+    """Kernel control files and identity of one simulated cgroup directory."""
+
+    path: PurePosixPath
+    inode: int
+    files: dict[str, str] = field(
+        default_factory=lambda: {
+            "cgroup.procs": "",
+            "cgroup.controllers": "memory pids\n",
+            "cgroup.subtree_control": "",
+            "memory.max": "max\n",
+            "memory.events": "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n",
+        }
+    )
+    event_reads: int = 0
+
+
+class CgroupKernel:
+    """Simulate only the Linux descriptor/control-file boundary, on any host.
+
+    Directory handles retain identity across replacement. Enrollment moves
+    one PID and enabling memory enforces the no-internal-process constraint.
+    No method accesses a real cgroup or a real process.
+    """
+
+    O_RDONLY = 0
+    O_WRONLY = 1
+    O_DIRECTORY = 0x10000
+    O_NOFOLLOW = 0x20000
+    O_CLOEXEC = 0x80000
+
+    def __init__(self) -> None:
+        self.root = PurePosixPath("/sys/fs/cgroup")
+        self.service_path = self.root / "system.slice" / "askvlm-test.service"
+        self.nodes: dict[PurePosixPath, CgroupNode] = {}
+        self.handles: dict[int, tuple[CgroupNode, str | None]] = {}
+        self.symlinks: set[PurePosixPath] = set()
+        self.moves: list[tuple[int, PurePosixPath]] = []
+        self.fail_events_after: int | None = None
+        self.refuse_control: str | None = None
+        self.initial_events = CgroupNode(self.service_path, 0).files["memory.events"]
+        self.busy_reads = 0
+        self._next_fd = 100
+        self._next_inode = 0
+        for path in reversed([self.service_path, *self.service_path.parents]):
+            self.replace(path)
+        self.service.files["cgroup.procs"] = f"{self.getpid()}\n"
+
+    @property
+    def service(self) -> CgroupNode:
+        """Return the service root, including any externally changed membership."""
+        return self.nodes[self.service_path]
+
+    @staticmethod
+    def getpid() -> int:
+        """Use a synthetic supervisor identity, never a host PID."""
+        return 42
+
+    def replace(self, path: PurePosixPath) -> CgroupNode:
+        """Model a directory replacement without changing already-open handles."""
+        self._next_inode += 1
+        node = CgroupNode(path, self._next_inode)
+        self.nodes[path] = node
+        return node
+
+    def _path(self, path: object, dir_fd: int | None) -> PurePosixPath:
+        resolved = PurePosixPath(str(path))
+        if dir_fd is not None:
+            resolved = self.handles[dir_fd][0].path / resolved
+        return resolved
+
+    def open(self, path: object, flags: int, *, dir_fd: int | None = None) -> int:
+        """Open a virtual directory or existing control file, honoring no-follow."""
+        target = self._path(path, dir_fd)
+        name: str | None
+        if target in self.symlinks and flags & self.O_NOFOLLOW:
+            raise OSError(40, "symlink refused")
+        if flags & self.O_DIRECTORY:
+            node, name = self.nodes[target], None
+        else:
+            node, name = self.nodes[target.parent], target.name
+            if name not in node.files:
+                raise FileNotFoundError(str(target))
+            if name == "memory.events" and not flags & self.O_WRONLY:
+                node.event_reads += 1
+                if (
+                    self.fail_events_after is not None
+                    and node.event_reads > self.fail_events_after
+                ):
+                    raise PermissionError(str(target))
+        self._next_fd += 1
+        self.handles[self._next_fd] = (node, name)
+        return self._next_fd
+
+    def fdopen(self, fd: int, *, encoding: str) -> io.StringIO:
+        """Read a control snapshot and close its virtual descriptor with the stream."""
+        node, name = self.handles.pop(fd)
+        assert encoding == "ascii"
+        assert name is not None
+        if node is self.service and name == "cgroup.procs":
+            self.busy_reads += 1
+        return io.StringIO(node.files[name])
+
+    def close(self, fd: int) -> None:
+        """Release a descriptor without changing the group's lifetime."""
+        del self.handles[fd]
+
+    def mkdir(self, name: str, *, mode: int, dir_fd: int) -> None:
+        """Create a fresh group with the kernel's control files already present."""
+        assert mode == 0o700
+        path = self._path(name, dir_fd)
+        if path in self.nodes:
+            raise FileExistsError(str(path))
+        node = self.replace(path)
+        node.files["memory.events"] = self.initial_events
+
+    def write(self, fd: int, data: bytes) -> int:
+        """Apply a control write or a deterministic permission failure."""
+        node, name = self.handles[fd]
+        assert name is not None
+        if name == self.refuse_control:
+            raise PermissionError(str(node.path / name))
+        value = data.decode("ascii")
+        if name == "cgroup.procs":
+            pid = int(value)
+            for group in self.nodes.values():
+                members = group.files["cgroup.procs"].split()
+                group.files["cgroup.procs"] = "\n".join(
+                    member for member in members if member != str(pid)
+                )
+            self.moves.append((pid, node.path))
+        if name == "cgroup.subtree_control":
+            if node.files["cgroup.procs"].strip():
+                raise OSError(16, "populated root")
+            value = value.replace("+", "")
+        node.files[name] = value
+        return len(data)
+
+    def fstat(self, fd: int) -> SimpleNamespace:
+        """Return the identity captured by an open directory descriptor."""
+        return SimpleNamespace(st_dev=1, st_ino=self.handles[fd][0].inode)
+
+    def stat(self, name: str, *, dir_fd: int, follow_symlinks: bool) -> SimpleNamespace:
+        """Observe the current directory identity without following links."""
+        assert not follow_symlinks
+        return SimpleNamespace(
+            st_dev=1, st_ino=self.nodes[self._path(name, dir_fd)].inode
+        )
+
+    def rmdir(self, name: str, *, dir_fd: int) -> None:
+        """Remove an empty leaf only, as cgroupfs does despite virtual files."""
+        path = self._path(name, dir_fd)
+        node = self.nodes[path]
+        if node.files["cgroup.procs"].strip() or any(
+            other.parent == path for other in self.nodes
+        ):
+            raise OSError(16, "group is populated")
+        del self.nodes[path]
+
+    def member(self, pid: int) -> CgroupNode | None:
+        """Find a simulated process's current group."""
+        return next(
+            (
+                node
+                for node in self.nodes.values()
+                if str(pid) in node.files["cgroup.procs"].split()
+            ),
+            None,
+        )
+
+    def departed(self, pid: int) -> None:
+        """Model process exit without moving it to another group."""
+        node = self.member(pid)
+        if node is not None:
+            node.files["cgroup.procs"] = "\n".join(
+                member
+                for member in node.files["cgroup.procs"].split()
+                if member != str(pid)
+            )
+
+
+class _ScriptedOutput:
+    """A blocking byte pipe with explicit peer messages and EOF."""
+
+    def __init__(self) -> None:
+        self.lines: queue.Queue[bytes] = queue.Queue()
+
+    def readline(self, _size: int = -1) -> bytes:
+        """Synchronize on protocol effects rather than a scheduling sleep."""
+        return self.lines.get(timeout=WAIT_TIMEOUT_S)
+
+    def close(self) -> None:
+        """Satisfy the stream owner without touching an OS handle."""
+
+
+class _ScriptedInput:
+    """Receive the gate and JSON-lines at the external stdin boundary."""
+
+    def __init__(self, process: ScriptedPoolProcess) -> None:
+        self.process = process
+
+    def write(self, data: bytes) -> int:
+        """Observe membership at execution and feed protocol responses."""
+        process = self.process
+        if data == b"\0":
+            process.executed_group = process.boundary.kernel.member(process.pid)
+            if process.executed_group is not None:
+                process.execution_cap = process.executed_group.files["memory.max"]
+            process.executed = True
+        else:
+            message = json.loads(data)
+            kind = message["type"]
+            if kind == "spec":
+                process.spec_before_execution = not process.executed
+                process.spec = message
+                process.emit({"type": "hello", "protocol": 2, "pid": process.pid})
+                process.loaded()
+            elif kind == "job":
+                process.boundary.jobs.put((process, message))
+            elif kind == "cancel":
+                process.boundary.cancels.put((process, message))
+            elif kind == "shutdown":
+                process.emit({"type": "bye"})
+                process.finish(process.boundary.shutdown_code)
+        return len(data)
+
+    def flush(self) -> None:
+        """Make writes immediately visible to the pipe boundary."""
+
+    def close(self) -> None:
+        """Satisfy the stdin owner after shutdown or a failed enrollment."""
+
+
+class ScriptedPoolProcess:
+    """A subprocess boundary with explicit exit codes, never a host process."""
+
+    def __init__(self, boundary: LinuxPoolBoundary, argv: list[str]) -> None:
+        self.boundary = boundary
+        self.args = argv
+        self.pid = 1000000 + len(boundary.processes)
+        self.stdout = _ScriptedOutput()
+        self.stdin = _ScriptedInput(self)
+        self.spec: dict[str, Any] | None = None
+        self.returncode: int | None = None
+        self.exited = threading.Event()
+        self.executed = "core.stt_pool.linux_cgroup" not in argv
+        self.executed_group: CgroupNode | None = None
+        self.execution_cap: str | None = None
+        self.spec_before_execution = False
+
+    def emit(self, message: dict[str, object]) -> None:
+        """Send a complete worker JSON-line to the real protocol reader."""
+        self.stdout.lines.put((json.dumps(message) + "\n").encode("utf-8"))
+
+    def loaded(self) -> None:
+        """Publish readiness after the parent's gate and spec."""
+        self.emit({"type": "loaded", "device": "cpu", "load_s": 0, "details": {}})
+
+    def reply(self, job: dict[str, Any], error: str | None = None) -> None:
+        """Report a result at the protocol boundary, preserving its attempt identity."""
+        self.emit(
+            {
+                "type": "result",
+                "job_id": job["job_id"],
+                "attempt_id": job["attempt_id"],
+                "status": "error" if error else "ok",
+                "text": "" if error else "recognized",
+                "error_kind": error,
+                "error_detail": "decoder failed" if error else None,
+                "backend": "cpu",
+                "run_s": 0.01,
+                "audio_s": job["duration_s"],
+            }
+        )
+
+    def finish(self, code: int) -> None:
+        """Exit only the simulated PID and close its stdout exactly once."""
+        if self.returncode is None:
+            self.returncode = code
+            self.boundary.kernel.departed(self.pid)
+            self.exited.set()
+            self.stdout.lines.put(b"")
+
+    def poll(self) -> int | None:
+        """Return the externally controlled exit status."""
+        return self.returncode
+
+    def wait(self, *, timeout: float) -> int:
+        """Bound hangs without simulating elapsed policy time."""
+        if not self.exited.wait(timeout):
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        assert self.returncode is not None
+        return self.returncode
+
+    def kill(self) -> None:
+        """Simulate SIGKILL without sending any signal."""
+        self.finish(-9)
+
+
+class LinuxPoolBoundary:
+    """Keep production supervisor, scheduler, process handle and adapter real."""
+
+    def __init__(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+        self.kernel = CgroupKernel()
+        self.processes: list[ScriptedPoolProcess] = []
+        self.jobs: queue.Queue[tuple[ScriptedPoolProcess, dict[str, Any]]] = (
+            queue.Queue()
+        )
+        self.cancels: queue.Queue[tuple[ScriptedPoolProcess, dict[str, Any]]] = (
+            queue.Queue()
+        )
+        self.shutdown_code = 0
+        membership = tmp_path / "self-cgroup"
+        membership.write_text(
+            "0::/system.slice/askvlm-test.service\n", encoding="ascii"
+        )
+        monkeypatch.setenv("ASKVLM_EXTERNAL_SUPERVISOR_MANAGED", "1")
+        monkeypatch.setattr(linux_cgroup, "SELF_CGROUP", membership)
+        monkeypatch.setattr(linux_cgroup, "CGROUP_ROOT", self.kernel.root)
+        monkeypatch.setattr(linux_cgroup, "os", self.kernel)
+        for module in (linux_cgroup, procs, supervisor):
+            monkeypatch.setattr(module, "sys", SimpleNamespace(platform="linux"))
+        monkeypatch.setattr(
+            procs,
+            "subprocess",
+            SimpleNamespace(
+                Popen=self.popen,
+                PIPE=subprocess.PIPE,
+                TimeoutExpired=subprocess.TimeoutExpired,
+            ),
+        )
+        monkeypatch.setattr(
+            procs,
+            "psutil",
+            SimpleNamespace(
+                Process=lambda _pid: SimpleNamespace(children=lambda **_kwargs: []),
+                Error=psutil.Error,
+            ),
+        )
+
+    def popen(self, argv: list[str], **_kwargs: object) -> ScriptedPoolProcess:
+        """Create an inert process and retain its external observations."""
+        process = ScriptedPoolProcess(self, argv)
+        self.processes.append(process)
+        return process

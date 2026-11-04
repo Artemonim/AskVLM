@@ -2,11 +2,11 @@
 
 :class:`WorkerProcess` owns one worker process of the pool: it starts the
 process with piped stdin/stdout and stderr in a per-worker log, puts it into
-its own :class:`~core.stt_pool.winjob.WorkerJob` (kill-on-close plus the
-worker's commit cap) BEFORE the ``spec`` line is sent, forwards decoded worker
-messages to a callback from a reader thread, writes supervisor messages from a
-writer thread, and tears everything down without leaking processes, threads,
-pipes or handles.
+its own :class:`~core.stt_pool.winjob.WorkerJob` on Windows, or a capped
+delegated cgroup v2 leaf on managed Linux, BEFORE the ``spec`` line is sent,
+forwards decoded worker messages to a callback from a reader thread, writes
+supervisor messages from a writer thread, and tears everything down without
+leaking processes, threads, pipes or handles.
 
 :func:`spawn_detached` starts the supervisor itself as a headless background
 process that outlives its spawning client. The module imports no ML packages.
@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import errno
 import logging
 import os
 import queue
@@ -30,12 +31,15 @@ from typing import IO, TYPE_CHECKING
 import psutil  # type: ignore[import-untyped]
 
 from core.stt_pool import ipc
+from core.stt_pool.linux_cgroup import START_GATE, WorkerCgroup, managed_linux
 from core.stt_pool.sysprobe import child_interpreter
 from core.stt_pool.winjob import WorkerJob, detached_creationflags
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
     from pathlib import Path
+
+    from core.stt_pool.linux_cgroup import MemoryEvents
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +50,7 @@ EventCallback = Callable[[str, dict[str, object] | None], None]
 
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 _THREAD_JOIN_TIMEOUT_S = 5.0
-# * Wait after killing a worker that could not join its Job Object.
+# * Wait after killing a worker that could not join its memory-cap backend.
 _ABORT_WAIT_S = 5.0
 # * Bytes read from the end of a log per requested character (UTF-8 worst case).
 _LOG_TAIL_BYTES_PER_CHAR = 4
@@ -62,6 +66,10 @@ _LINGERING: list[subprocess.Popen[bytes]] = []
 
 class WorkerSpawnError(RuntimeError):
     """A worker process could not be started safely."""
+
+
+class WorkerCgroupBusyError(WorkerSpawnError):
+    """A busy delegated cgroup defers startup without a model crash."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -179,8 +187,9 @@ class WorkerProcess:
             worker_id: Supervisor-assigned worker identifier.
             launch: Command line, environment and working directory.
             log_path: File that receives the worker's stderr (appended).
-            memory_limit_bytes: Commit cap of the worker's Job Object, or
-                ``None`` for no cap.
+            memory_limit_bytes: Reservation plus child headroom, enforced by
+                a Windows Job Object or a managed Linux cgroup; ``None`` for
+                no cap. Unmanaged Linux keeps its uncapped behavior.
             on_event: Called from the reader thread with ``(worker_id,
                 message)`` for each decoded worker message and once with
                 ``(worker_id, None)`` at EOF.
@@ -189,6 +198,7 @@ class WorkerProcess:
                 once more after each :meth:`raise_memory_limit`.
             require_job: Refuse to run a worker outside its Job Object;
                 defaults to ``True`` on Windows and ``False`` elsewhere.
+                This flag never disables mandatory managed Linux cgroup caps.
 
         Raises:
             ValueError: When *memory_limit_bytes* is not positive.
@@ -209,6 +219,9 @@ class WorkerProcess:
         self._lock = threading.Lock()
         self._proc: subprocess.Popen[bytes] | None = None
         self._job: WorkerJob | None = None
+        self._cgroup: WorkerCgroup | None = None
+        self._cgroup_events: MemoryEvents | None = None
+        self._termination_requested = False
         self._in_job = False
         self._log_handle: IO[bytes] | None = None
         self._reader: threading.Thread | None = None
@@ -307,6 +320,45 @@ class WorkerProcess:
         """Return whether the process was assigned to its Job Object."""
         return self._in_job
 
+    @property
+    def in_cgroup(self) -> bool:
+        """Return whether a managed Linux worker owns a capped cgroup."""
+        return self._cgroup is not None
+
+    @property
+    def initial_memory_events(self) -> MemoryEvents | None:
+        """Return the OOM baseline captured before this worker was spawned."""
+        group = self._cgroup
+        return group.baseline if group is not None else None
+
+    @property
+    def termination_requested(self) -> bool:
+        """Return whether this handle killed a live process, including at teardown."""
+        return self._termination_requested
+
+    def memory_events(self) -> MemoryEvents | None:
+        """Read the worker's OOM counters, preserving the final reading after close.
+
+        A failed refresh preserves the last valid reading, or ``None`` when
+        none is available. Each attempt captures its baseline before sending
+        work, so returning a cached counter does not create a new kill delta.
+        """
+        group = self._cgroup
+        if group is None or group.closed:
+            return self._cgroup_events
+        try:
+            self._cgroup_events = group.memory_events()
+        except (OSError, UnicodeError, ValueError) as exc:
+            logger.warning(
+                "worker cgroup OOM counter refresh failed: worker_id=%s path=%s "
+                "last_events=%s error=%s",
+                self.worker_id,
+                group.path,
+                self._cgroup_events,
+                exc,
+            )
+        return self._cgroup_events
+
     def poll(self) -> int | None:
         """Return the exit code, or ``None`` while running or before a spawn."""
         proc = self._proc
@@ -364,12 +416,13 @@ class WorkerProcess:
     # * Start.
 
     def start(self, spec_message: Mapping[str, object]) -> None:
-        """Spawn the worker, put it into its Job Object, then send the spec.
+        """Spawn the worker, apply its platform memory cap, then send the spec.
 
-        The ``spec`` line is the worker's first input, so the worker allocates
-        its model only once the commit cap and kill-on-close apply. A worker
-        that cannot join its Job Object while one is required is killed before
-        it receives anything (fail closed). A handle can be started once.
+        The ``spec`` line is the worker's first protocol input. Windows
+        applies its Job Object before sending it; a gated Linux bootstrap
+        waits for cgroup enrollment before executing the worker at all.
+        Failed required enrollment kills the process before it receives the
+        spec (fail closed). A handle can be started once.
 
         Args:
             spec_message: The ``spec`` protocol message.
@@ -379,8 +432,9 @@ class WorkerProcess:
             TypeError: When *spec_message* is not JSON-serializable (raised
                 before anything is spawned).
             WorkerSpawnError: When the handle is closed, the Job Object cannot
-                be created or assigned while required, or the process cannot
-                be started. Everything created so far is released first.
+                be created or assigned while required, a managed Linux cap
+                cannot be established, or the process cannot be started.
+                Everything created so far is released first.
 
         """
         spec_line = ipc.encode_message(spec_message).encode("utf-8")
@@ -392,45 +446,72 @@ class WorkerProcess:
                 msg = f"worker {self.worker_id} is closed"
                 raise WorkerSpawnError(msg)
             self._started = True
-            job = self._create_job()
-            log_handle = self._open_log(job)
-            proc = self._spawn(job, log_handle)
-            self._proc, self._job, self._log_handle = proc, job, log_handle
-            self._assign_or_abort(proc, job)
-            stdout, stdin = proc.stdout, proc.stdin
-            if stdout is None or stdin is None:
-                # ! Unreachable with PIPE; guards the type of the streams.
-                self._closed = True
-                self._teardown(timeout_s=_ABORT_WAIT_S)
-                msg = f"worker {self.worker_id} has no protocol pipes"
-                raise WorkerSpawnError(msg)
-            self._reader = threading.Thread(
-                target=self._read_events,
-                args=(stdout,),
-                name=f"stt-worker-reader-{self.worker_id}",
-                daemon=True,
-            )
-            self._writer = threading.Thread(
-                target=self._write_messages,
-                args=(stdin,),
-                name=f"stt-worker-writer-{self.worker_id}",
-                daemon=True,
-            )
-            self._reader.start()
-            self._writer.start()
-        if not self._enqueue(spec_line):
+            self._cgroup = self._create_cgroup()
+            try:
+                self._start_capped(spec_line)
+            except (WorkerSpawnError, OSError, ValueError):
+                if self._cgroup is not None:
+                    self._cgroup.close()
+                raise
+
+    def _start_capped(self, spec_line: bytes) -> None:
+        """Apply the cap and queue the spec while the caller holds the lock."""
+        # * Linux executes only a gated bootstrap until cgroup enrollment succeeds.
+        # * Windows keeps its Job Object assignment before the spec is sent.
+        job = self._create_job()
+        log_handle = self._open_log(job)
+        proc = self._spawn(job, log_handle)
+        self._proc, self._job, self._log_handle = proc, job, log_handle
+        self._assign_or_abort(proc, job)
+        stdout, stdin = proc.stdout, proc.stdin
+        if stdout is None or stdin is None:
+            # ! Unreachable with PIPE; guards the type of the streams.
+            self._closed = True
+            self._teardown(timeout_s=_ABORT_WAIT_S)
+            msg = f"worker {self.worker_id} has no protocol pipes"
+            raise WorkerSpawnError(msg)
+        self._reader = threading.Thread(
+            target=self._read_events,
+            args=(stdout,),
+            name=f"stt-worker-reader-{self.worker_id}",
+            daemon=True,
+        )
+        self._writer = threading.Thread(
+            target=self._write_messages,
+            args=(stdin,),
+            name=f"stt-worker-writer-{self.worker_id}",
+            daemon=True,
+        )
+        self._reader.start()
+        self._writer.start()
+        self._outbox.put(spec_line)
+        if self._pipe_broken.is_set():
             logger.warning(
                 "worker spec not sent (pipe closed): worker_id=%s pid=%s",
                 self.worker_id,
                 proc.pid,
             )
         logger.info(
-            "worker started: worker_id=%s pid=%s in_job=%s memory_limit_bytes=%s",
+            "worker started: worker_id=%s pid=%s in_job=%s memory_limit_bytes=%s "
+            "cgroup=%s",
             self.worker_id,
             proc.pid,
             self._in_job,
             self._memory_limit_bytes,
+            self._cgroup.path if self._cgroup is not None else None,
         )
+
+    def _create_cgroup(self) -> WorkerCgroup | None:
+        """Require a cap for managed Linux reservations; fail closed on any error."""
+        if not managed_linux() or self._memory_limit_bytes is None:
+            return None
+        try:
+            return WorkerCgroup.create(self.worker_id, self._memory_limit_bytes)
+        except (OSError, UnicodeError, ValueError) as exc:
+            msg = f"worker {self.worker_id}: delegated cgroup v2 memory cap unavailable: {exc}"
+            if isinstance(exc, OSError) and exc.errno == errno.EBUSY:
+                raise WorkerCgroupBusyError(msg) from exc
+            raise WorkerSpawnError(msg) from exc
 
     def _handle_memory_limit(self, pid: int) -> None:
         """Forward a Job Object memory-limit report (monitor thread)."""
@@ -455,6 +536,10 @@ class WorkerProcess:
             WorkerSpawnError: When the job is required but unavailable.
 
         """
+        if self._cgroup is not None or (
+            sys.platform != "win32" and not self._require_job
+        ):
+            return None
         job = WorkerJob(
             memory_limit_bytes=self._memory_limit_bytes,
             on_memory_limit=self._handle_memory_limit,
@@ -506,9 +591,21 @@ class WorkerProcess:
 
         """
         launch = self._launch
+        argv = list(launch.argv)
+        if self._cgroup is not None:
+            interpreter, _env = child_interpreter()
+            argv = [
+                interpreter,
+                "-X",
+                "utf8",
+                "-m",
+                "core.stt_pool.linux_cgroup",
+                "--",
+                *argv,
+            ]
         try:
             return subprocess.Popen(  # noqa: S603 - supervisor-built argv, no shell
-                list(launch.argv),
+                argv,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=log_handle,
@@ -536,6 +633,9 @@ class WorkerProcess:
             WorkerSpawnError: When the assignment fails while a job is required.
 
         """
+        if self._cgroup is not None:
+            self._assign_cgroup_or_abort(proc)
+            return
         if job is None:
             return
         if job.assign(proc.pid):
@@ -557,6 +657,22 @@ class WorkerProcess:
             f"Job Object: {detail}"
         )
         raise WorkerSpawnError(msg)
+
+    def _assign_cgroup_or_abort(self, proc: subprocess.Popen[bytes]) -> None:
+        """Enroll the waiting bootstrap before releasing it to execute worker code."""
+        group = self._cgroup
+        if group is None or proc.stdin is None:
+            msg = "capped Linux worker has no cgroup or bootstrap input"
+            raise WorkerSpawnError(msg)
+        try:
+            group.assign(proc.pid)
+            proc.stdin.write(START_GATE)
+            proc.stdin.flush()
+        except (OSError, ValueError) as exc:
+            self._closed = True
+            self._teardown(timeout_s=_ABORT_WAIT_S)
+            msg = f"worker {self.worker_id}: process {proc.pid} could not join cgroup: {exc}"
+            raise WorkerSpawnError(msg) from exc
 
     # * Pipes.
 
@@ -671,6 +787,8 @@ class WorkerProcess:
 
     def _kill_now(self, proc: subprocess.Popen[bytes], job: WorkerJob | None) -> None:
         """Terminate the job, or fall back to a process-tree kill."""
+        if proc.poll() is None:
+            self._termination_requested = True
         if job is not None and job.terminate():
             logger.info(
                 "worker job terminated: worker_id=%s pid=%s", self.worker_id, proc.pid
@@ -729,6 +847,9 @@ class WorkerProcess:
         self._stop_threads(proc)
         if job is not None:
             job.close()
+        if self._cgroup is not None:
+            self.memory_events()
+            self._cgroup.close()
         log_handle, self._log_handle = self._log_handle, None
         if log_handle is not None:
             with contextlib.suppress(OSError):

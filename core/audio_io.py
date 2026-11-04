@@ -1,6 +1,7 @@
 # Placeholder for audio_io.py
 
 import contextlib
+import errno
 import logging
 import sys
 import time
@@ -63,9 +64,10 @@ class FfmpegOutOfMemoryError(MemoryError, RuntimeError):
 def _ffmpeg_exit_error(code: int) -> RuntimeError:
     """Return the exception for ffmpeg's non-zero exit *code*.
 
-    Windows reports exit codes as unsigned 32-bit values, so a code is
-    compared in that form there; elsewhere a negative code is a signal
-    number and never means "out of memory".
+    Windows reports exit codes as unsigned 32-bit values. POSIX ``-ENOMEM``
+    also denotes a memory failure by the external transcriber contract.
+    SIGKILL alone supplies no OOM evidence: only the pool's worker cgroup
+    counters can attribute such a failure to memory exhaustion.
 
     Args:
         code: Non-zero exit code of the ffmpeg process.
@@ -76,7 +78,11 @@ def _ffmpeg_exit_error(code: int) -> RuntimeError:
 
     """
     lookup = code & 0xFFFFFFFF if sys.platform == "win32" else code
-    status = _FFMPEG_MEMORY_EXIT_CODES.get(lookup)
+    status = (
+        "ENOMEM"
+        if sys.platform != "win32" and code == -errno.ENOMEM
+        else _FFMPEG_MEMORY_EXIT_CODES.get(lookup)
+    )
     if status is not None:
         return FfmpegOutOfMemoryError(code, status)
     return RuntimeError(f"ffmpeg exited with code {code}")
